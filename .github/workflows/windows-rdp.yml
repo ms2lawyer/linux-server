@@ -2,20 +2,23 @@ name: Windows Cloud RDP
 
 on:
   schedule:
-    # GitHub Actions scheduled workflows cannot run every 2 minutes.
+    # GitHub Actions scheduled workflows cannot reliably run every 2 minutes.
     # 5 minutes is the minimum cron interval.
     - cron: '*/5 * * * *'
 
-  # Allow manual execution
   workflow_dispatch:
 
 jobs:
   rdp-server:
+
     runs-on: windows-latest
 
-    # We only need approximately 2 minutes of server lifetime,
-    # but allow enough time for installation/setup.
-    timeout-minutes: 5
+    # Setup + RDP lifetime + workspace save need more than 5 minutes.
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      actions: write
 
     steps:
 
@@ -23,27 +26,27 @@ jobs:
       # 1. Checkout Repository
       # ============================================================
       - name: 1. Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
 
       # ============================================================
       # 2. Restore Workspace From Previous Run
       # ============================================================
       - name: 2. Restore Persistent Workspace
-        uses: actions/cache/restore@v4
+        id: restore_workspace
+        uses: actions/cache/restore@v5
         with:
-          # IMPORTANT:
-          # This is a Windows path.
           path: ${{ github.workspace }}\workspace
 
-          # Current run gets its own unique cache key.
-          # This key normally does NOT exist yet.
+          # Unique key for THIS run.
+          #
+          # This key normally does not exist yet.
+          # The restore-keys below finds the newest previous cache.
           key: cynet-rdp-workspace-${{ runner.os }}-${{ github.run_id }}
 
-          # If the current key doesn't exist, GitHub searches
-          # for the newest previous cache beginning with this prefix.
           restore-keys: |
             cynet-rdp-workspace-${{ runner.os }}-
+
 
       # ============================================================
       # 3. Prepare Workspace
@@ -51,16 +54,21 @@ jobs:
       - name: 3. Prepare Workspace
         shell: powershell
         run: |
-          $Workspace = "${{ github.workspace }}\workspace"
+          $ErrorActionPreference = 'Stop'
 
-          Write-Host "=============================================="
-          Write-Host "Workspace"
-          Write-Host "=============================================="
-          Write-Host $Workspace
+          $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "WORKSPACE"
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "Path: $Workspace"
           Write-Host ""
 
-          if (-not (Test-Path $Workspace)) {
-              Write-Host "Workspace does not exist. Creating it..."
+          if (-not (Test-Path -LiteralPath $Workspace)) {
+
+              Write-Host "Workspace does not exist."
+              Write-Host "Creating workspace..."
 
               New-Item `
                 -ItemType Directory `
@@ -68,20 +76,26 @@ jobs:
                 -Force | Out-Null
           }
           else {
-              Write-Host "Workspace restored successfully."
+
+              Write-Host "Workspace restored."
           }
 
           Write-Host ""
+          Write-Host "Restore cache result:"
+          Write-Host "Cache hit: ${{ steps.restore_workspace.outputs.cache-hit }}"
+
+          Write-Host ""
           Write-Host "Workspace contents:"
-          Write-Host "----------------------------------------------"
+          Write-Host "--------------------------------------------------"
 
           Get-ChildItem `
-            -Path $Workspace `
+            -LiteralPath $Workspace `
             -Force `
             -ErrorAction SilentlyContinue |
-            Select-Object Name, Length, LastWriteTime, Mode
+            Select-Object Mode, Length, LastWriteTime, Name |
+            Format-Table -AutoSize
 
-          Write-Host "----------------------------------------------"
+          Write-Host "--------------------------------------------------"
 
 
       # ============================================================
@@ -90,9 +104,11 @@ jobs:
       - name: 4. Enable Remote Desktop
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
+
           Write-Host "Enabling Remote Desktop..."
 
-          # Enable RDP
+          # Enable RDP.
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' `
@@ -104,44 +120,51 @@ jobs:
             -Name 'UserAuthentication' `
             -Value 1
 
-          # Enable Windows Firewall RDP rules.
+          # Enable Remote Desktop firewall rules.
           Enable-NetFirewallRule `
             -DisplayGroup 'Remote Desktop'
 
-          # Make Remote Desktop service automatic.
+          # Make sure TermService is running.
           Set-Service `
             -Name 'TermService' `
             -StartupType Automatic
 
-          # Start Remote Desktop service.
           Start-Service `
             -Name 'TermService' `
             -ErrorAction SilentlyContinue
 
-          Write-Host "Remote Desktop enabled."
+          Start-Sleep -Seconds 2
+
+          $Service = Get-Service -Name 'TermService'
 
           Write-Host ""
-          Write-Host "Remote Desktop service:"
-          Get-Service -Name 'TermService' |
-            Select-Object Name, Status, StartType
+          Write-Host "Remote Desktop service status: $($Service.Status)"
+
+          if ($Service.Status -ne 'Running') {
+              throw "Remote Desktop service is not running."
+          }
+
+          Write-Host "Remote Desktop enabled successfully."
 
 
       # ============================================================
-      # 5. Create RDP Administrator Account
+      # 5. Create RDP Administrator
       # ============================================================
-      - name: 5. Create RDP Administrator Account
+      - name: 5. Create RDP Administrator
         shell: powershell
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
+          $ErrorActionPreference = 'Stop'
+
           $Username = 'CynetAdmin'
 
-          if ([string]::IsNullOrWhiteSpace($Env:RDP_PASSWORD)) {
-              throw "RDP_PASSWORD GitHub Secret is not configured."
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "GitHub Secret RDP_PASSWORD is not configured."
           }
 
-          $Password = ConvertTo-SecureString `
-            $Env:RDP_PASSWORD `
+          $SecurePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
             -AsPlainText `
             -Force
 
@@ -153,47 +176,41 @@ jobs:
 
           if ($null -eq $ExistingUser) {
 
-              Write-Host "Creating user..."
+              Write-Host "Creating local user..."
 
               New-LocalUser `
                 -Name $Username `
-                -Password $Password `
+                -Password $SecurePassword `
                 -PasswordNeverExpires `
                 -AccountNeverExpires `
-                -Description 'GitHub Actions RDP Administrator'
-
+                -Description 'GitHub Actions RDP Administrator' |
+                Out-Null
           }
           else {
 
               Write-Host "User already exists."
 
-              # Update password in case the secret changed.
               Set-LocalUser `
                 -Name $Username `
-                -Password $Password
+                -Password $SecurePassword
 
               Enable-LocalUser `
                 -Name $Username
           }
 
-          # Add to Administrators.
+          # Administrator privileges.
           Add-LocalGroupMember `
             -Group 'Administrators' `
             -Member $Username `
             -ErrorAction SilentlyContinue
 
-          # Add to Remote Desktop Users.
+          # RDP access.
           Add-LocalGroupMember `
             -Group 'Remote Desktop Users' `
             -Member $Username `
             -ErrorAction SilentlyContinue
 
-          Write-Host "User configured successfully."
-
-          Write-Host ""
-          Write-Host "Account:"
-          Get-LocalUser -Name $Username |
-            Select-Object Name, Enabled, PasswordNeverExpires
+          Write-Host "RDP user configured."
 
 
       # ============================================================
@@ -202,6 +219,8 @@ jobs:
       - name: 6. Install Tailscale
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
+
           $Installer = 'C:\tailscale.msi'
           $Tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
 
@@ -211,13 +230,13 @@ jobs:
             -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
             -OutFile $Installer
 
-          if (-not (Test-Path $Installer)) {
-              throw "Tailscale installer was not downloaded."
+          if (-not (Test-Path -LiteralPath $Installer)) {
+              throw "Tailscale installer download failed."
           }
 
           Write-Host "Installing Tailscale..."
 
-          $Process = Start-Process `
+          $InstallProcess = Start-Process `
             -FilePath 'msiexec.exe' `
             -ArgumentList @(
               '/i',
@@ -228,25 +247,25 @@ jobs:
             -Wait `
             -PassThru
 
-          if ($Process.ExitCode -ne 0) {
-              throw "Tailscale installation failed with exit code $($Process.ExitCode)"
+          if ($InstallProcess.ExitCode -ne 0) {
+              throw "Tailscale installation failed. Exit code: $($InstallProcess.ExitCode)"
           }
 
           Write-Host "Tailscale MSI installation completed."
 
-          # Wait for tailscale.exe.
-          $Timeout = 60
-          $Elapsed = 0
+          # Wait for executable.
+          $TimeoutSeconds = 60
+          $ElapsedSeconds = 0
 
-          while (-not (Test-Path $Tailscale)) {
+          while (-not (Test-Path -LiteralPath $Tailscale)) {
 
-              if ($Elapsed -ge $Timeout) {
-                  throw "Tailscale executable was not found after $Timeout seconds."
+              if ($ElapsedSeconds -ge $TimeoutSeconds) {
+                  throw "Tailscale executable was not found."
               }
 
               Start-Sleep -Seconds 2
 
-              $Elapsed += 2
+              $ElapsedSeconds += 2
           }
 
           Write-Host "Tailscale executable found."
@@ -260,10 +279,12 @@ jobs:
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY_WIN_1 }}
         run: |
+          $ErrorActionPreference = 'Stop'
+
           $Tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
 
-          if ([string]::IsNullOrWhiteSpace($Env:TAILSCALE_AUTHKEY)) {
-              throw "TAILSCALE_AUTHKEY_WIN_1 GitHub Secret is not configured."
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              throw "GitHub Secret TAILSCALE_AUTHKEY_WIN_1 is not configured."
           }
 
           Write-Host "Starting Tailscale service..."
@@ -277,23 +298,32 @@ jobs:
           Write-Host "Connecting to Tailscale..."
 
           & $Tailscale up `
-            --authkey="$Env:TAILSCALE_AUTHKEY" `
+            --authkey="$env:TAILSCALE_AUTHKEY" `
             --hostname='github-rdp-server' `
             --accept-dns=true
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Tailscale connection failed with exit code $LASTEXITCODE"
+              throw "Tailscale up failed. Exit code: $LASTEXITCODE"
           }
 
-          Write-Host "Waiting for Tailscale..."
+          Write-Host "Tailscale connection established."
 
-          Start-Sleep -Seconds 8
+          # Wait for IP.
+          $TailscaleIP = ''
 
-          # Get Tailscale IPv4 address.
-          $ts_ip = (& $Tailscale ip -4).Trim()
+          for ($i = 1; $i -le 15; $i++) {
 
-          if ([string]::IsNullOrWhiteSpace($ts_ip)) {
-              throw "Unable to obtain Tailscale IPv4 address."
+              $TailscaleIP = (& $Tailscale ip -4 2>$null).Trim()
+
+              if (-not [string]::IsNullOrWhiteSpace($TailscaleIP)) {
+                  break
+              }
+
+              Start-Sleep -Seconds 2
+          }
+
+          if ([string]::IsNullOrWhiteSpace($TailscaleIP)) {
+              throw "Tailscale did not provide an IPv4 address."
           }
 
           Write-Host ""
@@ -301,12 +331,12 @@ jobs:
           Write-Host "             RDP SERVER IS READY" -ForegroundColor Green
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host ""
-          Write-Host "Tailscale IP : $ts_ip" -ForegroundColor Yellow
+          Write-Host "Tailscale IP : $TailscaleIP" -ForegroundColor Yellow
           Write-Host "Hostname     : github-rdp-server" -ForegroundColor Yellow
           Write-Host "Username     : CynetAdmin" -ForegroundColor Yellow
           Write-Host ""
           Write-Host "RDP command:" -ForegroundColor Cyan
-          Write-Host "mstsc /v:$ts_ip" -ForegroundColor Magenta
+          Write-Host "mstsc /v:$TailscaleIP" -ForegroundColor Magenta
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host ""
@@ -321,64 +351,65 @@ jobs:
       - name: 8. Verify RDP
         shell: powershell
         run: |
-          Write-Host "Checking RDP configuration..."
+          $ErrorActionPreference = 'Stop'
 
-          $RdpDisabled = Get-ItemPropertyValue `
+          Write-Host "Checking RDP..."
+
+          $RdpDenied = Get-ItemPropertyValue `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections'
 
-          if ($RdpDisabled -ne 0) {
+          if ($RdpDenied -ne 0) {
               throw "RDP is disabled."
           }
-
-          Write-Host "RDP registry configuration: OK"
 
           $TermService = Get-Service `
             -Name 'TermService'
 
           if ($TermService.Status -ne 'Running') {
-              throw "Remote Desktop service is not running."
+              throw "TermService is not running."
           }
 
-          Write-Host "Remote Desktop service: RUNNING"
+          Write-Host "RDP registry: OK"
+          Write-Host "TermService: RUNNING"
 
           Write-Host ""
-          Write-Host "Enabled RDP firewall rules:"
+          Write-Host "Remote Desktop firewall rules:"
 
           Get-NetFirewallRule `
             -DisplayGroup 'Remote Desktop' `
             -ErrorAction SilentlyContinue |
             Where-Object Enabled -eq 'True' |
-            Select-Object DisplayName, Enabled, Profile
+            Select-Object DisplayName, Enabled, Profile |
+            Format-Table -AutoSize
 
 
       # ============================================================
-      # 9. Keep Server Alive For 2 Minutes
+      # 9. Keep RDP Server Alive For 2 Minutes
       # ============================================================
-      - name: 9. Keep Server Alive For 2 Minutes
+      - name: 9. Keep RDP Server Alive For 2 Minutes
         shell: powershell
         run: |
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "        WINDOWS RDP SERVER IS RUNNING" -ForegroundColor Green
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host ""
-
           $TotalSeconds = 120
-          $Interval = 10
+          $IntervalSeconds = 10
 
-          for ($Elapsed = 0; $Elapsed -lt $TotalSeconds; $Elapsed += $Interval) {
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "       RDP SERVER IS NOW AVAILABLE" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host ""
+
+          for ($Elapsed = 0; $Elapsed -lt $TotalSeconds; $Elapsed += $IntervalSeconds) {
 
               $Remaining = $TotalSeconds - $Elapsed
 
-              Write-Host "Server running - $Remaining seconds remaining..."
+              Write-Host "RDP server running - $Remaining seconds remaining..."
 
-              Start-Sleep -Seconds $Interval
+              Start-Sleep -Seconds $IntervalSeconds
           }
 
           Write-Host ""
-          Write-Host "2 minutes completed."
-          Write-Host "Workflow will now save the workspace."
+          Write-Host "2-minute RDP session completed."
 
 
       # ============================================================
@@ -386,11 +417,17 @@ jobs:
       # ============================================================
       - name: 10. Save Workspace For Next Run
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}\workspace
 
           # IMPORTANT:
-          # Every run has a unique key because GitHub caches are immutable.
-          # The next run's Step 2 will find this cache using restore-keys.
+          # GitHub cache entries are immutable.
+          # Therefore every run receives a unique key.
+          #
+          # The NEXT run's restore step searches using:
+          #
+          # cynet-rdp-workspace-Windows-
+          #
+          # and restores the newest matching cache.
           key: cynet-rdp-workspace-${{ runner.os }}-${{ github.run_id }}
