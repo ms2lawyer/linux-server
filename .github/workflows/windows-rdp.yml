@@ -9,14 +9,26 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Enable Remote Desktop and Firewall
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+      
+	  # بازیابی هارد ابری دائمی
+      - name: 2. Restore Persistent Workspace
+        uses: actions/cache@v4
+        with:
+          path: /home/cynetadmin/workspace
+          key: cynet-ssh-workspace-${{ github.run_id }}
+          restore-keys: |
+            cynet-ssh-workspace-
+
+      - name: 3. Enable Remote Desktop and Firewall
         shell: powershell
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
 
-      - name: Create Admin Account
+      - name: 4. Create Admin Account
         shell: powershell
         run: |
           $Password = ConvertTo-SecureString 'Cynet@2026' -AsPlainText -Force
@@ -34,7 +46,7 @@ jobs:
 
           net user runneradmin 'Cynet@2026'
 
-      - name: Install and Connect Tailscale
+      - name: 5. Install and Connect Tailscale
         shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY_WIN_1 }}
@@ -76,7 +88,7 @@ jobs:
           Write-Host "Connect with : mstsc /v:$ts_ip" -ForegroundColor Magenta
           Write-Host '==================================================' -ForegroundColor Green
 
-      - name: Keep Server Alive
+      - name: 6. Keep Server Alive
         shell: powershell
         run: |
           for ($i = 1; $i -le 360; $i++) {
