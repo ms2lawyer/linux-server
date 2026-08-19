@@ -37,7 +37,7 @@ jobs:
       - name: Install and Connect Tailscale
         shell: powershell
         env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY_WIN_1 }}
         run: |
           Write-Host 'Downloading Tailscale...'
 
