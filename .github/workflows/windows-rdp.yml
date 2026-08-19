@@ -1,7 +1,9 @@
 name: Windows Cloud RDP
 
 on:
-  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # روشن شدن خودکار هر ۶ ساعت یک‌بار (۲۴/۷)
+  workflow_dispatch:        # استارت دستی با دکمه Run
 
 jobs:
   build:
