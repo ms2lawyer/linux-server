@@ -95,3 +95,10 @@ jobs:
             Start-Sleep -Seconds 60
             Write-Host "[$i/360] Server running..."
           }
+      # ذخیره خودکار فایل‌های پوشه دائمی قبل از ری‌استارت
+      - name: 7. Save Workspace to Cloud
+        uses: actions/cache@v4
+        if: always()
+        with:
+          path: /home/cynetadmin/workspace
+          key: cynet-ssh-workspace-${{ github.run_id }}
