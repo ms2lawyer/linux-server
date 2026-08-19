@@ -129,6 +129,7 @@ jobs:
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
+          BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -200,8 +201,7 @@ jobs:
 
           Write-Host "Restored image: $imagePath"
           Write-Host "Restored image size: $((Get-Item $imagePath).Length) bytes"
-        env:
-          BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
+        
 
       # ======================================================================
       # 5. Install QEMU for Restored Image Boot
