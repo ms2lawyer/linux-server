@@ -1,59 +1,44 @@
-# ================================================================
-# Windows Cloud RDP — Persistent Application/User State
+# ==============================================================
+# Windows Cloud RDP — Persistent Desktop
 #
-# Persistence strategy:
+# Runtime:
+#   350 minutes
 #
-#   NOT a full Windows image restore.
+# Keep-alive:
+#   Check every 60 seconds
 #
-#   Instead persists:
+# User notification:
+#   Every 5 minutes
 #
-#     - Installed application manifest
-#     - winget application export
-#     - Windows application registry
-#     - selected HKLM registry settings
-#     - selected HKCU registry settings
-#     - CynetAdmin profile
-#     - Desktop
-#     - Documents
-#     - Downloads
-#     - AppData\Roaming
-#     - selected AppData\Local
-#     - ProgramData application configuration
-#     - environment variables
-#     - PowerShell profile
-#     - Git configuration
-#     - SSH configuration
+# Persistence:
+#   GitHub Actions Cache
 #
-#   On the next runner:
-#
-#     1. Windows Server Backup is installed
-#     2. Persistent state is restored
-#     3. Applications are reinstalled using winget
-#     4. Registry/configuration is restored
-#     5. RDP is enabled
-#     6. Tailscale is connected
-#
-# IMPORTANT:
-#
-# This does NOT perform bare-metal Windows recovery.
-# The GitHub runner always starts from Microsoft's fresh image.
-#
-# The goal is to reconstruct the user's working environment.
-# ================================================================
+# RDP:
+#   Tailscale + Windows Remote Desktop
+# ==============================================================
 
 name: Windows Cloud RDP
-
 
 on:
 
   schedule:
-
-    # GitHub Actions cron does not guarantee exact execution time.
-    # Run approximately every 5 minutes.
-
+    # GitHub Actions cron does not support every 2 minutes.
+    # Run every 5 minutes.
     - cron: '*/5 * * * *'
 
   workflow_dispatch:
+
+
+# ==============================================================
+# Prevent multiple RDP sessions from running simultaneously
+#
+# IMPORTANT:
+# Without this, the */5 cron can create overlapping runners.
+# ==============================================================
+
+concurrency:
+  group: windows-cloud-rdp
+  cancel-in-progress: false
 
 
 jobs:
@@ -62,227 +47,182 @@ jobs:
 
     runs-on: windows-latest
 
-    timeout-minutes: 15
+    # 350 minutes requested.
+    # 360 minutes gives approximately 10 minutes for workflow
+    # startup/shutdown and other steps.
+    timeout-minutes: 360
 
     permissions:
-
       contents: read
-
       actions: write
 
 
     steps:
 
-
-      # ============================================================
+      # ==========================================================
       # 1. Checkout Repository
-      # ============================================================
-      - name: 1. Checkout Repository
+      # ==========================================================
 
+      - name: 1. Checkout Repository
         uses: actions/checkout@v5
 
 
-      # ============================================================
-      # 2. Restore Previous Persistent State
-      #
-      # This must happen before Windows Server Backup installation
-      # because this is where our persistent state package lives.
-      # ============================================================
-      - name: 2. Restore Previous Persistent State
+      # ==========================================================
+      # 2. Restore Previous Persistent Workspace
+      # ==========================================================
 
-        id: restore_state
+      - name: 2. Restore Previous Workspace
+        id: restore_workspace
 
         uses: actions/cache/restore@v5
 
         with:
 
-          path: ${{ github.workspace }}\persistent-state
+          path: ${{ github.workspace }}\workspace
 
-          key: cynet-rdp-state-${{ runner.os }}-${{ github.run_id }}
+          key: cynet-rdp-workspace-${{ runner.os }}-${{ github.run_id }}
 
           restore-keys: |
-            cynet-rdp-state-${{ runner.os }}-
+            cynet-rdp-workspace-${{ runner.os }}-
 
 
-      # ============================================================
-      # 3. Install Windows Server Backup
+      # ==========================================================
+      # 3. Restore CynetAdmin Desktop
       #
-      # This is intentionally BEFORE state restore.
+      # The previous workspace cache contains:
       #
-      # We use Windows Server Backup tools for:
+      # workspace/
+      #   Desktop/
       #
-      #   - System State inspection
-      #   - registry/state backup support
-      #   - wbadmin availability
-      #
-      # We do NOT attempt bare-metal recovery.
-      # ============================================================
-      - name: 3. Install Windows Server Backup
+      # We restore this into the new runner's
+      # C:\Users\CynetAdmin\Desktop later.
+      # ==========================================================
 
+      - name: 3. Display Restored Workspace
         shell: powershell
 
         run: |
 
           $ErrorActionPreference = 'Stop'
 
+          $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
+          $DesktopBackup = Join-Path $Workspace 'Desktop'
 
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "INSTALLING WINDOWS SERVER BACKUP"
+          Write-Host "RESTORED PERSISTENT WORKSPACE"
           Write-Host "==================================================" -ForegroundColor Cyan
           Write-Host ""
 
+          Write-Host "Workspace      : $Workspace"
+          Write-Host "Desktop Backup : $DesktopBackup"
+          Write-Host ""
 
-          $Feature = Get-WindowsFeature `
-            -Name Windows-Server-Backup `
-            -ErrorAction Stop
+          Write-Host "Cache restore information:"
+          Write-Host "--------------------------------------------------"
 
+          Write-Host "Exact cache hit : ${{ steps.restore_workspace.outputs.cache-hit }}"
+          Write-Host "Matched cache   : ${{ steps.restore_workspace.outputs.cache-matched-key }}"
 
-          if (-not $Feature.Installed) {
+          Write-Host "--------------------------------------------------"
+          Write-Host ""
 
-              Write-Host "Installing Windows Server Backup..."
+          if (-not (Test-Path -LiteralPath $Workspace)) {
 
+              Write-Host "No previous workspace found."
 
-              Install-WindowsFeature `
-                -Name Windows-Server-Backup `
-                -IncludeManagementTools `
-                -ErrorAction Stop |
-                Format-List
-
-          }
-          else {
-
-              Write-Host `
-                "Windows Server Backup is already installed."
-          }
-
-
-          $Wbadmin = Get-Command `
-            wbadmin.exe `
-            -ErrorAction SilentlyContinue
-
-
-          if ($null -eq $Wbadmin) {
-
-              throw `
-                "wbadmin.exe was not found."
+              New-Item `
+                -ItemType Directory `
+                -Path $Workspace `
+                -Force |
+                Out-Null
           }
 
+          if (-not (Test-Path -LiteralPath $DesktopBackup)) {
 
-          Write-Host ""
-          Write-Host `
-            "wbadmin path: $($Wbadmin.Source)"
+              Write-Host "No previous Desktop backup found."
 
-          Write-Host ""
-          Write-Host `
-            "Windows Server Backup installation completed."
-
-
-      # ============================================================
-      # 4. Prepare Persistent State
-      #
-      # At this point the Windows Server Backup tools exist.
-      #
-      # We DO NOT restore the entire Windows image.
-      #
-      # We restore application/user state instead.
-      # ============================================================
-      - name: 4. Prepare Persistent State
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Stop'
-
-
-          $StateRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state'
-
-
-          $ProfileBackup = Join-Path `
-            $StateRoot `
-            'CynetAdmin'
-
-
-          $RegistryBackup = Join-Path `
-            $StateRoot `
-            'Registry'
-
-
-          $ApplicationsBackup = Join-Path `
-            $StateRoot `
-            'Applications'
-
-
-          $ConfigBackup = Join-Path `
-            $StateRoot `
-            'Configuration'
-
-
-          $ProgramDataBackup = Join-Path `
-            $StateRoot `
-            'ProgramData'
-
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "PERSISTENT STATE"
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host ""
-
-
-          Write-Host "State root       : $StateRoot"
-          Write-Host "Profile backup   : $ProfileBackup"
-          Write-Host "Registry backup  : $RegistryBackup"
-          Write-Host "Applications     : $ApplicationsBackup"
-          Write-Host "Configuration    : $ConfigBackup"
-          Write-Host "ProgramData      : $ProgramDataBackup"
-          Write-Host ""
-
-
-          foreach ($Directory in @(
-              $StateRoot,
-              $ProfileBackup,
-              $RegistryBackup,
-              $ApplicationsBackup,
-              $ConfigBackup,
-              $ProgramDataBackup
-          )) {
-
-              if (-not (Test-Path -LiteralPath $Directory)) {
-
-                  New-Item `
-                    -ItemType Directory `
-                    -Path $Directory `
-                    -Force |
-                    Out-Null
-              }
+              New-Item `
+                -ItemType Directory `
+                -Path $DesktopBackup `
+                -Force |
+                Out-Null
           }
 
-
           Write-Host ""
-          Write-Host "Previous persistent state:"
-
+          Write-Host "Restored workspace contents:"
+          Write-Host "--------------------------------------------------"
 
           Get-ChildItem `
-            -LiteralPath $StateRoot `
+            -LiteralPath $Workspace `
             -Force `
             -Recurse `
             -ErrorAction SilentlyContinue |
-            Select-Object `
-              FullName,
-              Length,
-              LastWriteTime |
+            Select-Object FullName, Length, LastWriteTime |
             Format-Table -AutoSize
 
+          Write-Host "--------------------------------------------------"
 
-      # ============================================================
+          $global:LASTEXITCODE = 0
+
+
+      # ==========================================================
+      # 4. Enable Remote Desktop
+      # ==========================================================
+
+      - name: 4. Enable Remote Desktop
+        shell: powershell
+
+        run: |
+
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "Enabling Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          # Keep Network Level Authentication enabled.
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1
+
+          Enable-NetFirewallRule `
+            -DisplayGroup 'Remote Desktop'
+
+          Set-Service `
+            -Name 'TermService' `
+            -StartupType Automatic
+
+          Start-Service `
+            -Name 'TermService' `
+            -ErrorAction SilentlyContinue
+
+          Start-Sleep -Seconds 2
+
+          $Service = Get-Service -Name 'TermService'
+
+          Write-Host "TermService status: $($Service.Status)"
+
+          if ($Service.Status -ne 'Running') {
+
+              throw "Remote Desktop service is not running."
+          }
+
+          Write-Host "Remote Desktop enabled successfully."
+
+          $global:LASTEXITCODE = 0
+
+
+      # ==========================================================
       # 5. Create / Configure CynetAdmin
-      # ============================================================
-      - name: 5. Create RDP Administrator Account
+      # ==========================================================
 
+      - name: 5. Create RDP Administrator Account
         shell: powershell
 
         env:
@@ -293,32 +233,27 @@ jobs:
 
           $ErrorActionPreference = 'Stop'
 
-
           $Username = 'CynetAdmin'
-
 
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
 
-              throw `
-                "GitHub Secret RDP_PASSWORD is not configured."
+              throw "GitHub Secret RDP_PASSWORD is not configured."
           }
-
 
           $SecurePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD `
             -AsPlainText `
             -Force
 
+          Write-Host "Configuring user: $Username"
 
           $ExistingUser = Get-LocalUser `
             -Name $Username `
             -ErrorAction SilentlyContinue
 
-
           if ($null -eq $ExistingUser) {
 
-              Write-Host "Creating CynetAdmin..."
-
+              Write-Host "Creating local user..."
 
               New-LocalUser `
                 -Name $Username `
@@ -330,47 +265,45 @@ jobs:
           }
           else {
 
-              Write-Host `
-                "CynetAdmin already exists."
-
+              Write-Host "User already exists."
 
               Set-LocalUser `
                 -Name $Username `
                 -Password $SecurePassword
 
-
               Enable-LocalUser `
                 -Name $Username
           }
-
 
           Add-LocalGroupMember `
             -Group 'Administrators' `
             -Member $Username `
             -ErrorAction SilentlyContinue
 
-
           Add-LocalGroupMember `
             -Group 'Remote Desktop Users' `
             -Member $Username `
             -ErrorAction SilentlyContinue
 
+          Write-Host ""
+          Write-Host "User information:"
 
           Get-LocalUser `
             -Name $Username |
-            Select-Object `
-              Name,
-              Enabled,
-              SID,
-              LastLogon |
+            Select-Object Name, Enabled, SID, LastLogon |
             Format-List
 
+          Write-Host ""
+          Write-Host "RDP user configured successfully."
 
-      # ============================================================
-      # 6. Initialize CynetAdmin Profile
-      # ============================================================
+          $global:LASTEXITCODE = 0
+
+
+      # ==========================================================
+      # 6. Initialize CynetAdmin Windows Profile
+      # ==========================================================
+
       - name: 6. Initialize CynetAdmin Windows Profile
-
         shell: powershell
 
         env:
@@ -381,15 +314,17 @@ jobs:
 
           $ErrorActionPreference = 'Stop'
 
-
           $Username = 'CynetAdmin'
 
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+
+              throw "RDP_PASSWORD is empty."
+          }
 
           $SecurePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD `
             -AsPlainText `
             -Force
-
 
           $Credential = New-Object `
             System.Management.Automation.PSCredential(
@@ -397,28 +332,31 @@ jobs:
               $SecurePassword
             )
 
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "INITIALIZING CynetAdmin WINDOWS PROFILE"
+          Write-Host "==================================================" -ForegroundColor Cyan
 
-          $User = Get-LocalUser `
-            -Name $Username `
-            -ErrorAction Stop
-
-
-          $Sid = $User.SID.Value
-
-
-          $Profile = Get-CimInstance `
-            Win32_UserProfile |
+          $ExistingProfile = Get-CimInstance Win32_UserProfile |
             Where-Object {
-              $_.SID -eq $Sid
+
+              $_.SID -eq (
+                Get-LocalUser -Name $Username
+              ).SID.Value
+
             } |
             Select-Object -First 1
 
+          if ($null -ne $ExistingProfile) {
 
-          if ($null -eq $Profile) {
+              Write-Host "Profile already exists:"
+              Write-Host $ExistingProfile.LocalPath
 
-              Write-Host `
-                "Creating CynetAdmin Windows profile..."
+          }
+          else {
 
+              Write-Host "Profile does not exist."
+              Write-Host "Creating Windows user profile..."
 
               $Process = Start-Process `
                 -FilePath "$env:SystemRoot\System32\cmd.exe" `
@@ -429,749 +367,173 @@ jobs:
                 -Wait `
                 -PassThru
 
+              Write-Host "Profile initialization exit code: $($Process.ExitCode)"
 
               if ($Process.ExitCode -ne 0) {
 
-                  throw `
-                    "Profile initialization failed."
+                  throw "CynetAdmin profile initialization failed. Exit code: $($Process.ExitCode)"
               }
           }
-
 
           Start-Sleep -Seconds 2
 
-
-          $Profile = Get-CimInstance `
-            Win32_UserProfile |
-            Where-Object {
-              $_.SID -eq $Sid
-            } |
-            Select-Object -First 1
-
-
-          if ($null -eq $Profile) {
-
-              throw `
-                "CynetAdmin profile was not created."
-          }
-
-
-          Write-Host ""
-          Write-Host "CynetAdmin profile:"
-          Write-Host $Profile.LocalPath
-
-
-      # ============================================================
-      # 7. Restore User Profile
-      #
-      # Restore:
-      #
-      #   Desktop
-      #   Documents
-      #   Downloads
-      #   AppData\Roaming
-      #   selected AppData\Local
-      #
-      # We intentionally DO NOT blindly overwrite all of C:\Users
-      # because that can overwrite files currently in use.
-      # ============================================================
-      - name: 7. Restore CynetAdmin User Profile
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Stop'
-
-
-          $StateRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state'
-
-
-          $ProfileBackup = Join-Path `
-            $StateRoot `
-            'CynetAdmin'
-
-
           $User = Get-LocalUser `
-            -Name 'CynetAdmin' `
+            -Name $Username `
             -ErrorAction Stop
 
-
           $Sid = $User.SID.Value
 
-
-          $Profile = Get-CimInstance `
-            Win32_UserProfile |
+          $Profile = Get-CimInstance Win32_UserProfile |
             Where-Object {
               $_.SID -eq $Sid
             } |
             Select-Object -First 1
 
-
           if ($null -eq $Profile) {
 
-              throw `
-                "CynetAdmin profile does not exist."
+              throw "Windows did not create a profile for CynetAdmin."
           }
-
-
-          $UserProfile = $Profile.LocalPath
-
 
           Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "RESTORING USER PROFILE"
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host ""
-          Write-Host "Target: $UserProfile"
-
-
-          $Directories = @(
-              'Desktop',
-              'Documents',
-              'Downloads',
-              'AppData\Roaming',
-              'AppData\Local\Microsoft\Windows\PowerShell'
-          )
-
-
-          foreach ($RelativePath in $Directories) {
-
-              $Source = Join-Path `
-                $ProfileBackup `
-                $RelativePath
-
-
-              $Target = Join-Path `
-                $UserProfile `
-                $RelativePath
-
-
-              if (-not (Test-Path -LiteralPath $Source)) {
-
-                  Write-Host `
-                    "No persistent data: $RelativePath"
-
-                  continue
-              }
-
-
-              if (-not (Test-Path -LiteralPath $Target)) {
-
-                  New-Item `
-                    -ItemType Directory `
-                    -Path $Target `
-                    -Force |
-                    Out-Null
-              }
-
-
-              Write-Host ""
-              Write-Host `
-                "Restoring: $RelativePath"
-
-
-              robocopy `
-                $Source `
-                $Target `
-                /E `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:2 `
-                /W:1 `
-                /XJ `
-                /NFL `
-                /NDL
-
-
-              $Code = $LASTEXITCODE
-
-
-              if ($Code -gt 7) {
-
-                  throw `
-                    "Failed to restore $RelativePath. Robocopy code: $Code"
-              }
-
-
-              $global:LASTEXITCODE = 0
-          }
-
-
-          Write-Host ""
-          Write-Host `
-            "User profile restoration completed."
-
-
-      # ============================================================
-      # 8. Restore User Environment Variables
-      # ============================================================
-      - name: 8. Restore User Environment Variables
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Continue'
-
-
-          $StateRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state'
-
-
-          $EnvironmentFile = Join-Path `
-            $StateRoot `
-            'Configuration\UserEnvironment.json'
-
-
-          if (-not (Test-Path -LiteralPath $EnvironmentFile)) {
-
-              Write-Host `
-                "No previous user environment found."
-
-              return
-          }
-
-
-          $Variables = Get-Content `
-            -LiteralPath $EnvironmentFile `
-            -Raw |
-            ConvertFrom-Json
-
-
-          foreach ($Property in $Variables.PSObject.Properties) {
-
-              $Name = $Property.Name
-
-              $Value = [string]$Property.Value
-
-
-              if ($Name -eq 'Path') {
-
-                  Write-Host `
-                    "Restoring PATH..."
-
-                  [Environment]::SetEnvironmentVariable(
-                    'Path',
-                    $Value,
-                    'User'
-                  )
-
-                  continue
-              }
-
-
-              Write-Host `
-                "Restoring environment variable: $Name"
-
-
-              [Environment]::SetEnvironmentVariable(
-                $Name,
-                $Value,
-                'User'
-              )
-          }
-
-
-          Write-Host `
-            "User environment restoration completed."
-
-
-      # ============================================================
-      # 9. Restore Registry
-      #
-      # We restore application/user configuration rather than the
-      # entire SYSTEM registry.
-      #
-      # SYSTEM hive replacement is deliberately avoided because it
-      # can corrupt the fresh runner.
-      # ============================================================
-      - name: 9. Restore Application And User Registry
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Continue'
-
-
-          $RegistryRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state\Registry'
-
-
-          if (-not (Test-Path -LiteralPath $RegistryRoot)) {
-
-              Write-Host `
-                "No previous registry backup found."
-
-              return
-          }
-
-
-          $RegistryFiles = @(
-              'HKCU-Software.reg',
-              'HKCU-Environment.reg',
-              'HKCU-Explorer.reg',
-              'HKCU-Terminal.reg',
-              'HKLM-Software-Applications.reg'
-          )
-
-
-          foreach ($FileName in $RegistryFiles) {
-
-              $File = Join-Path `
-                $RegistryRoot `
-                $FileName
-
-
-              if (-not (Test-Path -LiteralPath $File)) {
-
-                  Write-Host `
-                    "Registry backup not found: $FileName"
-
-                  continue
-              }
-
-
-              Write-Host ""
-              Write-Host `
-                "Importing registry: $FileName"
-
-
-              reg.exe import `
-                $File `
-                /reg:64
-
-
-              $Code = $LASTEXITCODE
-
-
-              if ($Code -ne 0) {
-
-                  Write-Warning `
-                    "Registry import returned code $Code for $FileName"
-              }
-
-
-              $global:LASTEXITCODE = 0
-          }
-
-
-          Write-Host ""
-          Write-Host `
-            "Registry restoration completed."
-
-
-      # ============================================================
-      # 10. Restore Application Configuration
-      #
-      # Selected ProgramData is restored.
-      #
-      # This is configuration only. It does NOT pretend that copying
-      # Program Files is equivalent to installing the application.
-      # ============================================================
-      - name: 10. Restore Application Configuration
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Continue'
-
-
-          $StateRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state'
-
-
-          $SourceRoot = Join-Path `
-            $StateRoot `
-            'ProgramData'
-
-
-          if (-not (Test-Path -LiteralPath $SourceRoot)) {
-
-              Write-Host `
-                "No ProgramData backup found."
-
-              return
-          }
-
-
-          $TargetRoot = 'C:\ProgramData'
-
-
-          Get-ChildItem `
-            -LiteralPath $SourceRoot `
-            -Directory `
-            -ErrorAction SilentlyContinue |
-            ForEach-Object {
-
-                $Source = $_.FullName
-
-                $Target = Join-Path `
-                  $TargetRoot `
-                  $_.Name
-
-
-                Write-Host ""
-                Write-Host `
-                  "Restoring ProgramData: $($_.Name)"
-
-
-                if (-not (Test-Path -LiteralPath $Target)) {
-
-                    New-Item `
-                      -ItemType Directory `
-                      -Path $Target `
-                      -Force |
-                      Out-Null
-                }
-
-
-                robocopy `
-                  $Source `
-                  $Target `
-                  /E `
-                  /COPY:DAT `
-                  /DCOPY:DAT `
-                  /R:1 `
-                  /W:1 `
-                  /XJ `
-                  /NFL `
-                  /NDL
-
-
-                $Code = $LASTEXITCODE
-
-
-                if ($Code -gt 7) {
-
-                    Write-Warning `
-                      "ProgramData restore failed for $($_.Name). Code: $Code"
-                }
-
-
-                $global:LASTEXITCODE = 0
-            }
-
-
-          Write-Host ""
-          Write-Host `
-            "Application configuration restoration completed."
-
-
-      # ============================================================
-      # 11. Restore Git / SSH / PowerShell Configuration
-      # ============================================================
-      - name: 11. Restore Developer Configuration
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Continue'
-
-
-          $StateRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state'
-
-
-          $User = Get-LocalUser `
-            -Name 'CynetAdmin'
-
-
-          $Sid = $User.SID.Value
-
-
-          $Profile = Get-CimInstance `
-            Win32_UserProfile |
-            Where-Object {
-              $_.SID -eq $Sid
-            } |
-            Select-Object -First 1
-
-
-          if ($null -eq $Profile) {
-
-              throw `
-                "CynetAdmin profile not found."
-          }
-
-
-          $UserProfile = $Profile.LocalPath
-
-
-          $DeveloperRoot = Join-Path `
-            $StateRoot `
-            'CynetAdmin\Developer'
-
-
-          if (-not (Test-Path -LiteralPath $DeveloperRoot)) {
-
-              Write-Host `
-                "No developer configuration found."
-
-              return
-          }
-
-
-          $Mappings = @(
-              @{
-                  Name = 'GitConfig'
-                  Source = Join-Path $DeveloperRoot '.gitconfig'
-                  Target = Join-Path $UserProfile '.gitconfig'
-              },
-              @{
-                  Name = 'SSH'
-                  Source = Join-Path $DeveloperRoot '.ssh'
-                  Target = Join-Path $UserProfile '.ssh'
-              },
-              @{
-                  Name = 'PowerShellProfile'
-                  Source = Join-Path $DeveloperRoot 'PowerShell'
-                  Target = Join-Path $UserProfile 'Documents\WindowsPowerShell'
-              }
-          )
-
-
-          foreach ($Mapping in $Mappings) {
-
-              $Source = $Mapping.Source
-
-              $Target = $Mapping.Target
-
-
-              if (-not (Test-Path -LiteralPath $Source)) {
-
-                  continue
-              }
-
-
-              Write-Host ""
-              Write-Host `
-                "Restoring $($Mapping.Name)"
-
-
-              if (-not (Test-Path -LiteralPath $Target)) {
-
-                  New-Item `
-                    -ItemType Directory `
-                    -Path $Target `
-                    -Force |
-                    Out-Null
-              }
-
-
-              if ((Get-Item -LiteralPath $Source).PSIsContainer) {
-
-                  robocopy `
-                    $Source `
-                    $Target `
-                    /E `
-                    /COPY:DAT `
-                    /DCOPY:DAT `
-                    /R:1 `
-                    /W:1 `
-                    /XJ `
-                    /NFL `
-                    /NDL
-              }
-              else {
-
-                  Copy-Item `
-                    -LiteralPath $Source `
-                    -Destination $Target `
-                    -Force
-              }
-
-
-              $global:LASTEXITCODE = 0
-          }
-
-
-      # ============================================================
-      # 12. Reinstall Applications
-      #
-      # winget restores the APPLICATIONS, rather than copying
-      # C:\Program Files.
-      #
-      # This is the correct approach for an ephemeral runner.
-      # ============================================================
-      - name: 12. Reinstall Applications From Persistent Manifest
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Continue'
-
-
-          $ApplicationsRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state\Applications'
-
-
-          $WingetExport = Join-Path `
-            $ApplicationsRoot `
-            'winget-export.json'
-
-
-          if (-not (Test-Path -LiteralPath $WingetExport)) {
-
-              Write-Host ""
-              Write-Host `
-                "No previous winget application export found."
-
-              return
-          }
-
-
-          $Winget = Get-Command `
-            winget.exe `
-            -ErrorAction SilentlyContinue
-
-
-          if ($null -eq $Winget) {
-
-              Write-Warning `
-                "winget.exe is not available."
-
-              return
-          }
-
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "RESTORING APPLICATIONS"
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host ""
-          Write-Host `
-            "Export: $WingetExport"
-
-
-          winget import `
-            --import-file "$WingetExport" `
-            --accept-source-agreements `
-            --accept-package-agreements `
-            --ignore-unavailable
-
-
-          $Code = $LASTEXITCODE
-
-
-          Write-Host ""
-          Write-Host `
-            "winget import exit code: $Code"
-
-
-          # winget can return non-zero when an application from the
-          # previous runner is no longer available.
-          #
-          # Do not destroy the whole RDP workflow because one package
-          # could not be installed.
+          Write-Host "CynetAdmin profile successfully initialized."
+          Write-Host "SID       : $Sid"
+          Write-Host "Profile   : $($Profile.LocalPath)"
+          Write-Host "Loaded    : $($Profile.Loaded)"
 
           $global:LASTEXITCODE = 0
 
 
-      # ============================================================
-      # 13. Enable Remote Desktop
-      # ============================================================
-      - name: 13. Enable Remote Desktop
+      # ==========================================================
+      # 7. Restore CynetAdmin Desktop
+      # ==========================================================
 
+      - name: 7. Restore CynetAdmin Desktop
         shell: powershell
 
         run: |
 
           $ErrorActionPreference = 'Stop'
 
+          $Username = 'CynetAdmin'
 
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' `
-            -Value 0
+          $User = Get-LocalUser `
+            -Name $Username `
+            -ErrorAction Stop
 
+          $Sid = $User.SID.Value
 
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' `
-            -Value 1
+          $Profile = Get-CimInstance Win32_UserProfile |
+            Where-Object {
+              $_.SID -eq $Sid
+            } |
+            Select-Object -First 1
 
+          if ($null -eq $Profile) {
 
-          Enable-NetFirewallRule `
-            -DisplayGroup 'Remote Desktop'
-
-
-          Set-Service `
-            -Name 'TermService' `
-            -StartupType Automatic
-
-
-          Start-Service `
-            -Name 'TermService' `
-            -ErrorAction SilentlyContinue
-
-
-          Start-Sleep -Seconds 2
-
-
-          $Service = Get-Service `
-            -Name 'TermService'
-
-
-          if ($Service.Status -ne 'Running') {
-
-              throw `
-                "Remote Desktop service is not running."
+              throw "CynetAdmin profile does not exist."
           }
 
+          $UserProfile = $Profile.LocalPath
+          $Desktop = Join-Path $UserProfile 'Desktop'
 
-          Write-Host `
-            "Remote Desktop enabled successfully."
+          $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
+          $DesktopBackup = Join-Path $Workspace 'Desktop'
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "RESTORING CynetAdmin DESKTOP"
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host ""
+
+          Write-Host "Profile : $UserProfile"
+          Write-Host "Source  : $DesktopBackup"
+          Write-Host "Target  : $Desktop"
+          Write-Host ""
+
+          if (-not (Test-Path -LiteralPath $Desktop)) {
+
+              New-Item `
+                -ItemType Directory `
+                -Path $Desktop `
+                -Force |
+                Out-Null
+          }
+
+          if (-not (Test-Path -LiteralPath $DesktopBackup)) {
+
+              New-Item `
+                -ItemType Directory `
+                -Path $DesktopBackup `
+                -Force |
+                Out-Null
+          }
+
+          robocopy `
+            $DesktopBackup `
+            $Desktop `
+            /MIR `
+            /COPY:DAT `
+            /DCOPY:DAT `
+            /R:2 `
+            /W:1 `
+            /XJ
+
+          $RobocopyExitCode = $LASTEXITCODE
+
+          Write-Host ""
+          Write-Host "Robocopy restore exit code: $RobocopyExitCode"
+
+          if ($RobocopyExitCode -gt 7) {
+
+              throw "Desktop restore failed. Robocopy exit code: $RobocopyExitCode"
+          }
+
+          $global:LASTEXITCODE = 0
+
+          Write-Host ""
+          Write-Host "Desktop restore completed successfully."
+
+          Write-Host ""
+          Write-Host "Current CynetAdmin Desktop:"
+          Write-Host "--------------------------------------------------"
+
+          Get-ChildItem `
+            -LiteralPath $Desktop `
+            -Force `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+
+          Write-Host "--------------------------------------------------"
 
 
-      # ============================================================
-      # 14. Install Tailscale
-      # ============================================================
-      - name: 14. Install Tailscale
+      # ==========================================================
+      # 8. Install Tailscale
+      # ==========================================================
 
+      - name: 8. Install Tailscale
         shell: powershell
 
         run: |
 
           $ErrorActionPreference = 'Stop'
 
-
           $Installer = 'C:\tailscale.msi'
+          $Tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
 
-          $Tailscale = `
-            'C:\Program Files\Tailscale\tailscale.exe'
-
-
-          Write-Host `
-            "Downloading Tailscale..."
-
+          Write-Host "Downloading Tailscale..."
 
           Invoke-WebRequest `
             -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
             -OutFile $Installer
 
-
           if (-not (Test-Path -LiteralPath $Installer)) {
 
-              throw `
-                "Tailscale installer download failed."
+              throw "Tailscale installer download failed."
           }
 
-
-          Write-Host `
-            "Installing Tailscale..."
-
+          Write-Host "Installing Tailscale..."
 
           $InstallProcess = Start-Process `
             -FilePath 'msiexec.exe' `
@@ -1184,43 +546,37 @@ jobs:
             -Wait `
             -PassThru
 
-
           if ($InstallProcess.ExitCode -ne 0) {
 
-              throw `
-                "Tailscale installation failed. Exit code: $($InstallProcess.ExitCode)"
+              throw "Tailscale installation failed. Exit code: $($InstallProcess.ExitCode)"
           }
 
+          Write-Host "Tailscale installation completed."
 
           $TimeoutSeconds = 60
-
           $ElapsedSeconds = 0
-
 
           while (-not (Test-Path -LiteralPath $Tailscale)) {
 
               if ($ElapsedSeconds -ge $TimeoutSeconds) {
 
-                  throw `
-                    "Tailscale executable was not found."
+                  throw "Tailscale executable was not found."
               }
 
-
               Start-Sleep -Seconds 2
-
               $ElapsedSeconds += 2
           }
 
+          Write-Host "Tailscale executable found."
 
-          Write-Host `
-            "Tailscale executable found."
+          $global:LASTEXITCODE = 0
 
 
-      # ============================================================
-      # 15. Connect Tailscale
-      # ============================================================
-      - name: 15. Connect Tailscale
+      # ==========================================================
+      # 9. Connect Tailscale
+      # ==========================================================
 
+      - name: 9. Connect Tailscale
         shell: powershell
 
         env:
@@ -1231,29 +587,25 @@ jobs:
 
           $ErrorActionPreference = 'Stop'
 
-
-          $Tailscale = `
-            'C:\Program Files\Tailscale\tailscale.exe'
-
+          $Tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
 
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
 
-              throw `
-                "TAILSCALE_AUTHKEY_WIN_1 is not configured."
+              throw "GitHub Secret TAILSCALE_AUTHKEY_WIN_1 is not configured."
           }
 
+          Write-Host "Starting Tailscale service..."
 
           Start-Service `
             -Name 'Tailscale' `
             -ErrorAction SilentlyContinue
 
-
           Start-Sleep -Seconds 5
 
+          $Hostname = "github-rdp-$env:GITHUB_RUN_ID"
 
-          $Hostname = `
-            "github-rdp-$env:GITHUB_RUN_ID"
-
+          Write-Host "Tailscale hostname: $Hostname"
+          Write-Host "Connecting to Tailscale..."
 
           & $Tailscale up `
             --auth-key="$env:TAILSCALE_AUTHKEY" `
@@ -1261,881 +613,336 @@ jobs:
             --accept-dns=true `
             --unattended=true
 
+          $TailscaleExitCode = $LASTEXITCODE
 
-          if ($LASTEXITCODE -ne 0) {
+          if ($TailscaleExitCode -ne 0) {
 
-              throw `
-                "Tailscale connection failed."
+              throw "Tailscale connection failed. Exit code: $TailscaleExitCode"
           }
-
 
           $global:LASTEXITCODE = 0
 
+          Write-Host "Tailscale connection established."
 
           $TailscaleIP = ''
 
-
           for ($i = 1; $i -le 15; $i++) {
 
-              $TailscaleIP = `
-                (& $Tailscale ip -4 2>$null).Trim()
-
+              $TailscaleIP = (
+                & $Tailscale ip -4 2>$null
+              ).Trim()
 
               if (-not [string]::IsNullOrWhiteSpace($TailscaleIP)) {
 
                   break
               }
 
-
               Start-Sleep -Seconds 2
           }
 
-
           if ([string]::IsNullOrWhiteSpace($TailscaleIP)) {
 
-              throw `
-                "Tailscale did not provide an IPv4 address."
+              throw "Tailscale did not provide an IPv4 address."
           }
 
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "             RDP SERVER IS READY" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host ""
+
+          Write-Host "Tailscale IP : $TailscaleIP" -ForegroundColor Yellow
+          Write-Host "Hostname     : $Hostname" -ForegroundColor Yellow
+          Write-Host "Username     : CynetAdmin" -ForegroundColor Yellow
+
+          Write-Host ""
+          Write-Host "RDP command:" -ForegroundColor Cyan
+          Write-Host "mstsc /v:$TailscaleIP" -ForegroundColor Magenta
 
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "             RDP SERVER IS READY"
-          Write-Host "==================================================" -ForegroundColor Green
           Write-Host ""
 
-          Write-Host `
-            "Tailscale IP : $TailscaleIP" `
-            -ForegroundColor Yellow
-
-          Write-Host `
-            "Hostname     : $Hostname" `
-            -ForegroundColor Yellow
-
-          Write-Host `
-            "Username     : CynetAdmin" `
-            -ForegroundColor Yellow
-
-          Write-Host ""
-
-          Write-Host `
-            "mstsc /v:$TailscaleIP" `
-            -ForegroundColor Magenta
-
-          Write-Host ""
-
+          Write-Host "Tailscale status:"
 
           & $Tailscale status
-
 
           $global:LASTEXITCODE = 0
 
 
-      # ============================================================
-      # 16. Verify RDP
-      # ============================================================
-      - name: 16. Verify RDP
+      # ==========================================================
+      # 10. Verify RDP
+      # ==========================================================
 
+      - name: 10. Verify RDP
         shell: powershell
 
         run: |
 
           $ErrorActionPreference = 'Stop'
 
+          Write-Host "Checking RDP configuration..."
 
           $RdpDenied = Get-ItemPropertyValue `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections'
 
-
           if ($RdpDenied -ne 0) {
 
-              throw `
-                "RDP is disabled."
+              throw "RDP is disabled."
           }
-
 
           $TermService = Get-Service `
             -Name 'TermService'
 
-
           if ($TermService.Status -ne 'Running') {
 
-              throw `
-                "TermService is not running."
+              throw "TermService is not running."
           }
 
-
-          Write-Host `
-            "RDP registry : OK"
-
-          Write-Host `
-            "TermService  : RUNNING"
-
-
-      # ============================================================
-      # 17. Keep RDP Server Alive
-      # ============================================================
-      - name: 17. Keep RDP Server Alive
-
-        id: keep_alive
-
-        shell: powershell
-
-        run: |
-
-          $TotalSeconds = 200
-
-          $IntervalSeconds = 10
-
+          Write-Host "RDP registry : OK"
+          Write-Host "TermService  : RUNNING"
 
           Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "       RDP SERVER IS NOW AVAILABLE"
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host ""
-
-
-          for (
-            $Elapsed = 0;
-            $Elapsed -lt $TotalSeconds;
-            $Elapsed += $IntervalSeconds
-          ) {
-
-              $Remaining = `
-                $TotalSeconds - $Elapsed
-
-
-              Write-Host `
-                "RDP server running - $Remaining seconds remaining..."
-
-
-              Start-Sleep `
-                -Seconds $IntervalSeconds
-          }
-
-
-          Write-Host ""
-          Write-Host `
-            "RDP session window completed."
-
-
-      # ============================================================
-      # 18. Capture Current Application Manifest
-      #
-      # This happens AFTER the RDP session because you may have
-      # installed software during the session.
-      # ============================================================
-      - name: 18. Capture Installed Applications
-
-        if: steps.keep_alive.outcome == 'success'
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Continue'
-
-
-          $ApplicationsRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state\Applications'
-
-
-          if (-not (Test-Path -LiteralPath $ApplicationsRoot)) {
-
-              New-Item `
-                -ItemType Directory `
-                -Path $ApplicationsRoot `
-                -Force |
-                Out-Null
-          }
-
-
-          $Winget = Get-Command `
-            winget.exe `
-            -ErrorAction SilentlyContinue
-
-
-          if ($null -ne $Winget) {
-
-              Write-Host ""
-              Write-Host `
-                "Exporting installed applications with winget..."
-
-
-              winget export `
-                --output "$ApplicationsRoot\winget-export.json" `
-                --include-versions `
-                --accept-source-agreements
-
-
-              $global:LASTEXITCODE = 0
-          }
-          else {
-
-              Write-Warning `
-                "winget.exe is not available."
-          }
-
-
-          Write-Host ""
-          Write-Host `
-            "Capturing installed-program registry..."
-
-
-          $UninstallFile = Join-Path `
-            $ApplicationsRoot `
-            'installed-programs.json'
-
-
-          $Programs = @()
-
-
-          foreach ($RegistryPath in @(
-              'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
-              'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
-              'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
-          )) {
-
-              $Programs += `
-                Get-ItemProperty `
-                  $RegistryPath `
-                  -ErrorAction SilentlyContinue |
-                Where-Object {
-                  -not [string]::IsNullOrWhiteSpace($_.DisplayName)
-                } |
-                Select-Object `
-                  DisplayName,
-                  DisplayVersion,
-                  Publisher,
-                  InstallLocation,
-                  UninstallString
-          }
-
-
-          $Programs |
-            Sort-Object DisplayName, DisplayVersion -Unique |
-            ConvertTo-Json -Depth 5 |
-            Set-Content `
-              -LiteralPath $UninstallFile `
-              -Encoding UTF8
-
-
-          Write-Host `
-            "Application manifest captured."
-
-
-      # ============================================================
-      # 19. Backup User Profile
-      # ============================================================
-      - name: 19. Backup CynetAdmin Profile
-
-        if: steps.keep_alive.outcome == 'success'
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Continue'
-
-
-          $StateRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state'
-
-
-          $ProfileBackup = Join-Path `
-            $StateRoot `
-            'CynetAdmin'
-
-
-          $User = Get-LocalUser `
-            -Name 'CynetAdmin' `
-            -ErrorAction Stop
-
-
-          $Sid = $User.SID.Value
-
-
-          $Profile = Get-CimInstance `
-            Win32_UserProfile |
-            Where-Object {
-              $_.SID -eq $Sid
-            } |
-            Select-Object -First 1
-
-
-          if ($null -eq $Profile) {
-
-              Write-Warning `
-                "CynetAdmin profile not found."
-
-              return
-          }
-
-
-          $UserProfile = $Profile.LocalPath
-
-
-          foreach ($RelativePath in @(
-              'Desktop',
-              'Documents',
-              'Downloads',
-              'AppData\Roaming',
-              'AppData\Local\Microsoft\Windows\PowerShell'
-          )) {
-
-              $Source = Join-Path `
-                $UserProfile `
-                $RelativePath
-
-
-              $Target = Join-Path `
-                $ProfileBackup `
-                $RelativePath
-
-
-              if (-not (Test-Path -LiteralPath $Source)) {
-
-                  continue
-              }
-
-
-              if (-not (Test-Path -LiteralPath $Target)) {
-
-                  New-Item `
-                    -ItemType Directory `
-                    -Path $Target `
-                    -Force |
-                    Out-Null
-              }
-
-
-              Write-Host ""
-              Write-Host `
-                "Backing up: $RelativePath"
-
-
-              robocopy `
-                $Source `
-                $Target `
-                /MIR `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:1 `
-                /W:1 `
-                /XJ `
-                /NFL `
-                /NDL
-
-
-              if ($LASTEXITCODE -gt 7) {
-
-                  Write-Warning `
-                    "Backup failed for $RelativePath."
-              }
-
-
-              $global:LASTEXITCODE = 0
-          }
-
-
-      # ============================================================
-      # 20. Backup Developer Configuration
-      # ============================================================
-      - name: 20. Backup Developer Configuration
-
-        if: steps.keep_alive.outcome == 'success'
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Continue'
-
-
-          $StateRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state'
-
-
-          $DeveloperRoot = Join-Path `
-            $StateRoot `
-            'CynetAdmin\Developer'
-
-
-          if (-not (Test-Path -LiteralPath $DeveloperRoot)) {
-
-              New-Item `
-                -ItemType Directory `
-                -Path $DeveloperRoot `
-                -Force |
-                Out-Null
-          }
-
-
-          $User = Get-LocalUser `
-            -Name 'CynetAdmin'
-
-
-          $Sid = $User.SID.Value
-
-
-          $Profile = Get-CimInstance `
-            Win32_UserProfile |
-            Where-Object {
-              $_.SID -eq $Sid
-            } |
-            Select-Object -First 1
-
-
-          $UserProfile = $Profile.LocalPath
-
-
-          # Git
-
-          $GitConfig = Join-Path `
-            $UserProfile `
-            '.gitconfig'
-
-
-          if (Test-Path -LiteralPath $GitConfig) {
-
-              Copy-Item `
-                -LiteralPath $GitConfig `
-                -Destination (
-                  Join-Path $DeveloperRoot '.gitconfig'
-                ) `
-                -Force
-          }
-
-
-          # SSH
-
-          $SSHSource = Join-Path `
-            $UserProfile `
-            '.ssh'
-
-
-          $SSHTarget = Join-Path `
-            $DeveloperRoot `
-            '.ssh'
-
-
-          if (Test-Path -LiteralPath $SSHSource) {
-
-              if (Test-Path -LiteralPath $SSHTarget) {
-
-                  Remove-Item `
-                    -LiteralPath $SSHTarget `
-                    -Recurse `
-                    -Force
-              }
-
-
-              robocopy `
-                $SSHSource `
-                $SSHTarget `
-                /MIR `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:1 `
-                /W:1 `
-                /XJ `
-                /NFL `
-                /NDL
-
-
-              $global:LASTEXITCODE = 0
-          }
-
-
-          # PowerShell profile
-
-          $PowerShellSource = Join-Path `
-            $UserProfile `
-            'Documents\WindowsPowerShell'
-
-
-          $PowerShellTarget = Join-Path `
-            $DeveloperRoot `
-            'PowerShell'
-
-
-          if (Test-Path -LiteralPath $PowerShellSource) {
-
-              if (-not (Test-Path -LiteralPath $PowerShellTarget)) {
-
-                  New-Item `
-                    -ItemType Directory `
-                    -Path $PowerShellTarget `
-                    -Force |
-                    Out-Null
-              }
-
-
-              robocopy `
-                $PowerShellSource `
-                $PowerShellTarget `
-                /MIR `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:1 `
-                /W:1 `
-                /XJ `
-                /NFL `
-                /NDL
-
-
-              $global:LASTEXITCODE = 0
-          }
-
-
-      # ============================================================
-      # 21. Backup User Environment
-      # ============================================================
-      - name: 21. Backup User Environment Variables
-
-        if: steps.keep_alive.outcome == 'success'
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Continue'
-
-
-          $StateRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state'
-
-
-          $ConfigRoot = Join-Path `
-            $StateRoot `
-            'Configuration'
-
-
-          if (-not (Test-Path -LiteralPath $ConfigRoot)) {
-
-              New-Item `
-                -ItemType Directory `
-                -Path $ConfigRoot `
-                -Force |
-                Out-Null
-          }
-
-
-          $Variables = @{}
-
-          $UserEnvironment = `
-            [Environment]::GetEnvironmentVariables('User')
-
-
-          foreach ($Key in $UserEnvironment.Keys) {
-
-              $Variables[$Key] = `
-                [string]$UserEnvironment[$Key]
-          }
-
-
-          $Variables |
-            ConvertTo-Json -Depth 5 |
-            Set-Content `
-              -LiteralPath (
-                Join-Path `
-                  $ConfigRoot `
-                  'UserEnvironment.json'
-              ) `
-              -Encoding UTF8
-
-
-          Write-Host `
-            "User environment variables backed up."
-
-
-      # ============================================================
-      # 22. Backup Registry
-      #
-      # We deliberately export configuration rather than SYSTEM hive.
-      # ============================================================
-      - name: 22. Backup Application And User Registry
-
-        if: steps.keep_alive.outcome == 'success'
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Continue'
-
-
-          $RegistryRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state\Registry'
-
-
-          if (-not (Test-Path -LiteralPath $RegistryRoot)) {
-
-              New-Item `
-                -ItemType Directory `
-                -Path $RegistryRoot `
-                -Force |
-                Out-Null
-          }
-
-
-          Write-Host ""
-          Write-Host `
-            "Exporting HKCU Software..."
-
-
-          reg.exe export `
-            'HKCU\Software' `
-            (
-              Join-Path `
-                $RegistryRoot `
-                'HKCU-Software.reg'
-            ) `
-            /y
-
-
-          Write-Host ""
-          Write-Host `
-            "Exporting HKCU Environment..."
-
-
-          reg.exe export `
-            'HKCU\Environment' `
-            (
-              Join-Path `
-                $RegistryRoot `
-                'HKCU-Environment.reg'
-            ) `
-            /y
-
-
-          Write-Host ""
-          Write-Host `
-            "Exporting HKCU Explorer..."
-
-
-          reg.exe export `
-            'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer' `
-            (
-              Join-Path `
-                $RegistryRoot `
-                'HKCU-Explorer.reg'
-            ) `
-            /y
-
-
-          Write-Host ""
-          Write-Host `
-            "Exporting Windows Terminal settings..."
-
-
-          reg.exe export `
-            'HKCU\Software\Microsoft\Windows Terminal' `
-            (
-              Join-Path `
-                $RegistryRoot `
-                'HKCU-Terminal.reg'
-            ) `
-            /y
-
-
-          Write-Host ""
-          Write-Host `
-            "Exporting application-related HKLM registry..."
-
-
-          reg.exe export `
-            'HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall' `
-            (
-              Join-Path `
-                $RegistryRoot `
-                'HKLM-Software-Applications.reg'
-            ) `
-            /y
-
+          Write-Host "Remote Desktop firewall rules:"
+
+          Get-NetFirewallRule `
+            -DisplayGroup 'Remote Desktop' `
+            -ErrorAction SilentlyContinue |
+            Where-Object Enabled -eq 'True' |
+            Select-Object DisplayName, Enabled, Profile |
+            Format-Table -AutoSize
 
           $global:LASTEXITCODE = 0
 
 
-          Write-Host ""
-          Write-Host `
-            "Registry backup completed."
+      # ==========================================================
+      # 11. Inspect Before RDP
+      # ==========================================================
 
-
-      # ============================================================
-      # 23. Backup Selected ProgramData
-      #
-      # Only configuration directories are copied.
-      #
-      # We intentionally avoid copying huge/binary runtime data.
-      # ============================================================
-      - name: 23. Backup Application Configuration
-
-        if: steps.keep_alive.outcome == 'success'
-
+      - name: 11. Inspect Before RDP Session
         shell: powershell
 
         run: |
 
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'Stop'
 
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "BEFORE RDP SESSION"
+          Write-Host "==================================================" -ForegroundColor Cyan
 
-          $StateRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state'
+          Write-Host ""
+          Write-Host "Windows profiles:"
+          Write-Host "--------------------------------------------------"
 
+          Get-CimInstance Win32_UserProfile |
+            Where-Object {
+              $_.LocalPath -like 'C:\Users\*'
+            } |
+            Select-Object SID, LocalPath, Loaded, Special |
+            Format-Table -AutoSize
 
-          $ProgramDataBackup = Join-Path `
-            $StateRoot `
-            'ProgramData'
+          Write-Host ""
+          Write-Host "Logged-on sessions:"
+          Write-Host "--------------------------------------------------"
 
+          quser 2>&1
 
-          if (-not (Test-Path -LiteralPath $ProgramDataBackup)) {
+          $global:LASTEXITCODE = 0
 
-              New-Item `
-                -ItemType Directory `
-                -Path $ProgramDataBackup `
-                -Force |
-                Out-Null
+          Write-Host ""
+          Write-Host "CynetAdmin Desktop:"
+          Write-Host "--------------------------------------------------"
+
+          if (Test-Path 'C:\Users\CynetAdmin\Desktop') {
+
+              Get-ChildItem `
+                'C:\Users\CynetAdmin\Desktop' `
+                -Force `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+                Select-Object FullName, Length, LastWriteTime |
+                Format-Table -AutoSize
+
+          }
+          else {
+
+              Write-Host "CynetAdmin Desktop does not exist."
           }
 
-
-          # --------------------------------------------------------
-          # Add application-specific ProgramData directories here.
-          #
-          # Example:
-          #
-          # 'C:\ProgramData\SomeApplication'
-          #
-          # Do NOT blindly copy all of C:\ProgramData.
-          # --------------------------------------------------------
-
-          $ProgramDataPaths = @(
-          )
+          Write-Host "--------------------------------------------------"
 
 
-          foreach ($Source in $ProgramDataPaths) {
+      # ==========================================================
+      # 12. Keep RDP Server Alive
+      #
+      # TOTAL:
+      #   350 minutes
+      #
+      # CHECK:
+      #   Every 60 seconds
+      #
+      # NOTIFICATION:
+      #   Every 5 minutes
+      #
+      # 350 minutes = 21,000 seconds
+      # ==========================================================
 
-              if (-not (Test-Path -LiteralPath $Source)) {
+      - name: 12. Keep RDP Server Alive
+        id: keep_alive
+        shell: powershell
 
-                  continue
+        run: |
+
+          $TotalMinutes = 350
+          $TotalSeconds = $TotalMinutes * 60
+
+          $IntervalSeconds = 60
+          $NotificationIntervalSeconds = 300
+
+          $StartTime = Get-Date
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "       RDP SERVER IS NOW AVAILABLE" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host ""
+
+          Write-Host "Session duration : $TotalMinutes minutes"
+          Write-Host "Session seconds  : $TotalSeconds seconds"
+          Write-Host "Check interval   : $IntervalSeconds seconds"
+          Write-Host "Notification     : Every 5 minutes"
+          Write-Host ""
+
+          Write-Host "Started at       : $StartTime"
+          Write-Host "Expected end     : $($StartTime.AddMinutes($TotalMinutes))"
+
+          Write-Host ""
+
+          $ElapsedSeconds = 0
+          $NextNotification = $NotificationIntervalSeconds
+
+          while ($ElapsedSeconds -lt $TotalSeconds) {
+
+              Start-Sleep -Seconds $IntervalSeconds
+
+              $ElapsedSeconds += $IntervalSeconds
+
+              if ($ElapsedSeconds -ge $TotalSeconds) {
+
+                  break
               }
 
+              # --------------------------------------------------
+              # Notify every 5 minutes
+              # --------------------------------------------------
 
-              $Name = Split-Path `
-                $Source `
-                -Leaf
+              if ($ElapsedSeconds -ge $NextNotification) {
 
+                  $RemainingSeconds = $TotalSeconds - $ElapsedSeconds
 
-              $Target = Join-Path `
-                $ProgramDataBackup `
-                $Name
+                  $ElapsedMinutes = [math]::Floor(
+                    $ElapsedSeconds / 60
+                  )
 
+                  $RemainingMinutes = [math]::Ceiling(
+                    $RemainingSeconds / 60
+                  )
 
-              Write-Host ""
-              Write-Host `
-                "Backing up ProgramData: $Name"
+                  $CurrentTime = Get-Date
 
+                  Write-Host ""
+                  Write-Host "==================================================" -ForegroundColor Cyan
+                  Write-Host "RDP SERVER STATUS" -ForegroundColor Cyan
+                  Write-Host "==================================================" -ForegroundColor Cyan
 
-              robocopy `
-                $Source `
-                $Target `
-                /MIR `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:1 `
-                /W:1 `
-                /XJ `
-                /NFL `
-                /NDL
+                  Write-Host ""
+                  Write-Host "Current time       : $CurrentTime"
+                  Write-Host "Elapsed            : $ElapsedMinutes minutes"
+                  Write-Host "Remaining          : $RemainingMinutes minutes"
+                  Write-Host "Total duration     : $TotalMinutes minutes"
 
+                  Write-Host ""
+                  Write-Host "RDP server is still running." -ForegroundColor Green
+                  Write-Host "==================================================" -ForegroundColor Cyan
+                  Write-Host ""
 
-              $global:LASTEXITCODE = 0
+                  $NextNotification += $NotificationIntervalSeconds
+              }
           }
 
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "RDP SESSION WINDOW COMPLETED" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host ""
 
-      # ============================================================
-      # 24. Create State Manifest
-      # ============================================================
-      - name: 24. Create Persistent State Manifest
+          Write-Host "Total requested runtime : $TotalMinutes minutes"
+          Write-Host "Actual elapsed seconds  : $ElapsedSeconds"
+          Write-Host "Finished at             : $(Get-Date)"
+          Write-Host ""
 
+          $global:LASTEXITCODE = 0
+
+
+      # ==========================================================
+      # 13. Inspect After RDP
+      # ==========================================================
+
+      - name: 13. Inspect After RDP Session
         if: steps.keep_alive.outcome == 'success'
-
         shell: powershell
 
         run: |
 
-          $ErrorActionPreference = 'Continue'
-
-
-          $StateRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state'
-
-
-          $Manifest = [ordered]@{
-
-              CreatedUtc = `
-                [DateTime]::UtcNow.ToString('o')
-
-              RunnerOS = `
-                $env:RUNNER_OS
-
-              RunnerImage = `
-                $env:ImageVersion
-
-              WindowsVersion = `
-                (Get-ComputerInfo).WindowsVersion
-
-              WindowsBuild = `
-                (Get-ComputerInfo).OsBuildNumber
-
-              User = `
-                'CynetAdmin'
-
-              RunId = `
-                $env:GITHUB_RUN_ID
-
-              Strategy = `
-                'User/Application State Persistence'
-
-              BareMetalRestore = `
-                $false
-          }
-
-
-          $Manifest |
-            ConvertTo-Json -Depth 10 |
-            Set-Content `
-              -LiteralPath (
-                Join-Path `
-                  $StateRoot `
-                  'manifest.json'
-            ) `
-            -Encoding UTF8
-
+          $ErrorActionPreference = 'Stop'
 
           Write-Host ""
-          Write-Host "Persistent state manifest:"
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "AFTER RDP SESSION"
+          Write-Host "==================================================" -ForegroundColor Cyan
+
           Write-Host ""
+          Write-Host "Logged-on sessions:"
+          Write-Host "--------------------------------------------------"
+
+          quser 2>&1
+
+          $global:LASTEXITCODE = 0
+
+          Write-Host ""
+          Write-Host "Windows profiles:"
+          Write-Host "--------------------------------------------------"
+
+          Get-CimInstance Win32_UserProfile |
+            Where-Object {
+              $_.LocalPath -like 'C:\Users\*'
+            } |
+            Select-Object SID, LocalPath, Loaded, Special |
+            Format-Table -AutoSize
+
+          Write-Host ""
+          Write-Host "All user Desktop files:"
+          Write-Host "--------------------------------------------------"
+
+          Get-ChildItem `
+            'C:\Users\*\Desktop' `
+            -Force `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+
+          Write-Host "--------------------------------------------------"
 
 
-          $Manifest |
-            ConvertTo-Json -Depth 10
+      # ==========================================================
+      # 14. Save CynetAdmin Desktop
+      # ==========================================================
 
-
-      # ============================================================
-      # 25. Verify Persistent State
-      # ============================================================
-      - name: 25. Verify Persistent State
-
-        id: verify_state
+      - name: 14. Save CynetAdmin Desktop
+        id: save_desktop
 
         if: steps.keep_alive.outcome == 'success'
 
@@ -2145,97 +952,238 @@ jobs:
 
           $ErrorActionPreference = 'Stop'
 
+          $Username = 'CynetAdmin'
 
-          $StateRoot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'persistent-state'
+          $User = Get-LocalUser `
+            -Name $Username `
+            -ErrorAction Stop
 
+          $Sid = $User.SID.Value
 
-          if (-not (Test-Path -LiteralPath $StateRoot)) {
+          $Profile = Get-CimInstance Win32_UserProfile |
+            Where-Object {
+              $_.SID -eq $Sid
+            } |
+            Select-Object -First 1
 
-              throw `
-                "Persistent state directory does not exist."
+          $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
+          $DesktopBackup = Join-Path $Workspace 'Desktop'
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "SAVING CynetAdmin DESKTOP"
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host ""
+
+          if ($null -eq $Profile) {
+
+              Write-Host "WARNING: CynetAdmin profile does not exist."
+              Write-Host ""
+              Write-Host "No RDP login appears to have created the profile."
+              Write-Host "Existing persistent backup will be preserved."
+              Write-Host ""
+
+              "PERSISTENCE_UPDATED=false" >> $env:GITHUB_OUTPUT
+
+              $global:LASTEXITCODE = 0
+
+              return
           }
 
+          $UserProfile = $Profile.LocalPath
+          $Desktop = Join-Path $UserProfile 'Desktop'
 
-          $Manifest = Join-Path `
-            $StateRoot `
-            'manifest.json'
+          Write-Host "Profile : $UserProfile"
+          Write-Host "Source  : $Desktop"
+          Write-Host "Target  : $DesktopBackup"
+          Write-Host ""
 
+          if (-not (Test-Path -LiteralPath $Desktop)) {
 
-          if (-not (Test-Path -LiteralPath $Manifest)) {
+              Write-Host "WARNING: CynetAdmin Desktop does not exist."
+              Write-Host "Existing backup will be preserved."
 
-              throw `
-                "Persistent state manifest was not created."
+              "PERSISTENCE_UPDATED=false" >> $env:GITHUB_OUTPUT
+
+              $global:LASTEXITCODE = 0
+
+              return
           }
 
+          if (-not (Test-Path -LiteralPath $DesktopBackup)) {
+
+              New-Item `
+                -ItemType Directory `
+                -Path $DesktopBackup `
+                -Force |
+                Out-Null
+          }
 
           $Files = Get-ChildItem `
-            -LiteralPath $StateRoot `
+            -LiteralPath $Desktop `
             -Force `
             -Recurse `
             -File `
             -ErrorAction SilentlyContinue
 
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "PERSISTENT STATE VERIFICATION"
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host ""
-
-
-          Write-Host `
-            "Persistent files: $($Files.Count)"
-
-
-          Write-Host ""
-
-
-          $Files |
-            Select-Object `
-              FullName,
-              Length,
-              LastWriteTime |
-            Format-Table -AutoSize
-
+          Write-Host "Current CynetAdmin Desktop file count: $($Files.Count)"
 
           if ($Files.Count -eq 0) {
 
-              throw `
-                "Persistent state is empty."
+              Write-Host ""
+              Write-Host "WARNING: CynetAdmin Desktop is EMPTY." -ForegroundColor Yellow
+              Write-Host ""
+              Write-Host "Existing persistent backup will NOT be overwritten."
+
+              "PERSISTENCE_UPDATED=false" >> $env:GITHUB_OUTPUT
+
+              $global:LASTEXITCODE = 0
+
+          }
+          else {
+
+              Write-Host ""
+              Write-Host "Synchronizing Desktop..."
+
+              robocopy `
+                $Desktop `
+                $DesktopBackup `
+                /MIR `
+                /COPY:DAT `
+                /DCOPY:DAT `
+                /R:2 `
+                /W:1 `
+                /XJ
+
+              $RobocopyExitCode = $LASTEXITCODE
+
+              Write-Host ""
+              Write-Host "Robocopy save exit code: $RobocopyExitCode"
+
+              if ($RobocopyExitCode -gt 7) {
+
+                  throw "Desktop backup failed. Robocopy exit code: $RobocopyExitCode"
+              }
+
+              $global:LASTEXITCODE = 0
+
+              Write-Host ""
+              Write-Host "Desktop saved successfully."
+
+              "PERSISTENCE_UPDATED=true" >> $env:GITHUB_OUTPUT
           }
 
+          Write-Host ""
+          Write-Host "FILES CURRENTLY STORED IN PERSISTENT BACKUP:"
+          Write-Host "--------------------------------------------------"
 
-          "STATE_VALID=true" `
-            >> $env:GITHUB_OUTPUT
+          Get-ChildItem `
+            -LiteralPath $DesktopBackup `
+            -Force `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
 
+          Write-Host "--------------------------------------------------"
 
           $global:LASTEXITCODE = 0
 
 
-      # ============================================================
-      # 26. Save Persistent State To GitHub Actions Cache
-      # ============================================================
-      - name: 26. Save Persistent State
+      # ==========================================================
+      # 15. Verify Persistent Backup
+      # ==========================================================
+
+      - name: 15. Verify Persistent Backup
+        id: verify_backup
+
+        if: steps.keep_alive.outcome == 'success'
+
+        shell: powershell
+
+        run: |
+
+          $ErrorActionPreference = 'Stop'
+
+          $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
+          $DesktopBackup = Join-Path $Workspace 'Desktop'
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "PERSISTENCE VERIFICATION"
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host ""
+
+          if (-not (Test-Path -LiteralPath $DesktopBackup)) {
+
+              Write-Host "WARNING: Desktop backup directory does not exist."
+              Write-Host "No new cache will be created."
+
+              "BACKUP_VALID=false" >> $env:GITHUB_OUTPUT
+
+              $global:LASTEXITCODE = 0
+
+              return
+          }
+
+          $Files = Get-ChildItem `
+            -LiteralPath $DesktopBackup `
+            -Force `
+            -Recurse `
+            -File `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Persistent file count: $($Files.Count)"
+          Write-Host ""
+
+          if ($Files.Count -eq 0) {
+
+              Write-Host "WARNING: Persistent Desktop backup is empty." -ForegroundColor Yellow
+              Write-Host "No new cache will be created."
+
+              "BACKUP_VALID=false" >> $env:GITHUB_OUTPUT
+          }
+          else {
+
+              Write-Host "Persisted files:"
+              Write-Host "--------------------------------------------------"
+
+              $Files |
+                Select-Object FullName, Length, LastWriteTime |
+                Format-Table -AutoSize
+
+              Write-Host "--------------------------------------------------"
+
+              "BACKUP_VALID=true" >> $env:GITHUB_OUTPUT
+          }
+
+          $global:LASTEXITCODE = 0
+
+
+      # ==========================================================
+      # 16. Save Workspace To GitHub Actions Cache
+      # ==========================================================
+
+      - name: 16. Save Workspace For Next Run
 
         if: |
           steps.keep_alive.outcome == 'success' &&
-          steps.verify_state.outputs.STATE_VALID == 'true'
+          steps.verify_backup.outputs.BACKUP_VALID == 'true'
 
         uses: actions/cache/save@v5
 
         with:
 
-          path: ${{ github.workspace }}\persistent-state
+          path: ${{ github.workspace }}\workspace
 
-          key: cynet-rdp-state-${{ runner.os }}-${{ github.run_id }}
+          key: cynet-rdp-workspace-${{ runner.os }}-${{ github.run_id }}
 
 
-      # ============================================================
-      # 27. Final Summary
-      # ============================================================
-      - name: 27. Final Summary
+      # ==========================================================
+      # 17. Final Summary
+      # ==========================================================
+
+      - name: 17. Final Persistence Summary
 
         if: always()
 
@@ -2245,50 +1193,27 @@ jobs:
 
           $ErrorActionPreference = 'Continue'
 
-
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "FINAL RDP WORKFLOW SUMMARY"
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host ""
 
-
-          Write-Host `
-            "Run ID                    : $env:GITHUB_RUN_ID"
-
-          Write-Host `
-            "Runner OS                 : $env:RUNNER_OS"
-
-          Write-Host `
-            "RDP User                  : CynetAdmin"
-
+          Write-Host "Run ID              : $env:GITHUB_RUN_ID"
+          Write-Host "Runner OS           : $env:RUNNER_OS"
+          Write-Host "RDP User            : CynetAdmin"
           Write-Host ""
 
-          Write-Host `
-            "RDP Session               : ${{ steps.keep_alive.outcome }}"
-
-          Write-Host `
-            "State Verification        : ${{ steps.verify_state.outcome }}"
-
+          Write-Host "Requested Runtime   : 350 minutes"
+          Write-Host "Keep-Alive Interval  : 60 seconds"
+          Write-Host "Notification        : Every 5 minutes"
           Write-Host ""
 
-          Write-Host "Persistence includes:"
-          Write-Host "  - User profile"
-          Write-Host "  - Desktop"
-          Write-Host "  - Documents"
-          Write-Host "  - Downloads"
-          Write-Host "  - AppData"
-          Write-Host "  - Git configuration"
-          Write-Host "  - SSH configuration"
-          Write-Host "  - PowerShell configuration"
-          Write-Host "  - User environment variables"
-          Write-Host "  - User registry"
-          Write-Host "  - Application registry"
-          Write-Host "  - Installed application manifest"
-          Write-Host "  - Application configuration"
+          Write-Host "RDP Session Result  : ${{ steps.keep_alive.outcome }}"
+          Write-Host "Desktop Save Result : ${{ steps.save_desktop.outcome }}"
+          Write-Host "Backup Verify       : ${{ steps.verify_backup.outcome }}"
           Write-Host ""
 
           Write-Host "==================================================" -ForegroundColor Green
-
 
           $global:LASTEXITCODE = 0
