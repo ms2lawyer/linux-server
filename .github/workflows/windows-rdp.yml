@@ -1,3 +1,4 @@
+# Windows Cloud RDP — Final Workflow
 name: Windows Cloud RDP
 
 on:
@@ -13,6 +14,15 @@ jobs:
 
     runs-on: windows-latest
 
+    # Includes:
+    # checkout
+    # cache restore
+    # RDP setup
+    # Tailscale installation
+    # Tailscale connection
+    # RDP session
+    # desktop backup
+    # cache save
     timeout-minutes: 15
 
     permissions:
@@ -37,10 +47,10 @@ jobs:
         with:
           path: ${{ github.workspace }}\workspace
 
-          # Every run gets an immutable unique cache key.
+          # Every run gets a new immutable cache key.
           key: cynet-rdp-workspace-${{ runner.os }}-${{ github.run_id }}
 
-          # Restore the newest available previous cache.
+          # Restore the newest available previous workspace.
           restore-keys: |
             cynet-rdp-workspace-${{ runner.os }}-
 
@@ -83,8 +93,8 @@ jobs:
           Write-Host "Exact cache hit : ${{ steps.restore_workspace.outputs.cache-hit }}"
           Write-Host "Matched cache   : ${{ steps.restore_workspace.outputs.cache-matched-key }}"
           Write-Host "--------------------------------------------------"
-          Write-Host ""
 
+          Write-Host ""
           Write-Host "Restored workspace:"
           Write-Host "--------------------------------------------------"
 
@@ -207,6 +217,7 @@ jobs:
 
           Write-Host ""
           Write-Host "User information:"
+
           Get-LocalUser -Name $Username |
             Select-Object Name, Enabled, SID, LastLogon |
             Format-List
@@ -216,87 +227,14 @@ jobs:
 
 
       # ============================================================
-      # 6. Resolve CynetAdmin Windows Profile
+      # 6. Restore CynetAdmin Desktop
       #
-      # IMPORTANT:
-      # Do not blindly assume C:\Users\CynetAdmin.
+      # If the profile already exists, restore the saved Desktop.
       #
-      # The profile path is resolved from the actual Windows
-      # profile associated with the user's SID.
+      # If the profile does not exist yet, Windows will create it
+      # during the first RDP login.
       # ============================================================
-      - name: 6. Resolve CynetAdmin Profile
-        id: resolve_profile
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $Username = 'CynetAdmin'
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "RESOLVING CynetAdmin PROFILE"
-          Write-Host "==================================================" -ForegroundColor Cyan
-
-          $User = Get-LocalUser `
-            -Name $Username `
-            -ErrorAction Stop
-
-          $Sid = $User.SID.Value
-
-          Write-Host "Username : $Username"
-          Write-Host "SID      : $Sid"
-          Write-Host ""
-
-          $Profile = Get-CimInstance Win32_UserProfile |
-            Where-Object {
-              $_.SID -eq $Sid
-            } |
-            Select-Object -First 1
-
-          if ($null -eq $Profile) {
-
-              Write-Host ""
-              Write-Host "CynetAdmin does not have a Windows profile yet." -ForegroundColor Yellow
-              Write-Host ""
-              Write-Host "This is normal before the first successful RDP login."
-              Write-Host "The profile should be created automatically when CynetAdmin"
-              Write-Host "logs in through Remote Desktop."
-              Write-Host ""
-
-          }
-          else {
-
-              Write-Host "Profile SID  : $($Profile.SID)"
-              Write-Host "Profile Path : $($Profile.LocalPath)"
-              Write-Host "Loaded       : $($Profile.Loaded)"
-              Write-Host ""
-
-              "PROFILE_PATH=$($Profile.LocalPath)" >> $env:GITHUB_OUTPUT
-          }
-
-          Write-Host ""
-          Write-Host "All Windows profiles:"
-          Write-Host "--------------------------------------------------"
-
-          Get-CimInstance Win32_UserProfile |
-            Where-Object {
-              $_.LocalPath -like 'C:\Users\*'
-            } |
-            Select-Object SID, LocalPath, Loaded, Special |
-            Format-Table -AutoSize
-
-          Write-Host "--------------------------------------------------"
-
-
-      # ============================================================
-      # 7. Restore CynetAdmin Desktop
-      #
-      # If CynetAdmin already has a profile, restore its Desktop.
-      #
-      # If no profile exists yet, do not manufacture a fake profile.
-      # RDP will create the real profile on first login.
-      # ============================================================
-      - name: 7. Restore CynetAdmin Desktop
+      - name: 6. Restore CynetAdmin Desktop
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -308,12 +246,6 @@ jobs:
             -ErrorAction Stop
 
           $Sid = $User.SID.Value
-
-          $Profile = Get-CimInstance Win32_UserProfile |
-            Where-Object {
-              $_.SID -eq $Sid
-            } |
-            Select-Object -First 1
 
           $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
           $DesktopBackup = Join-Path $Workspace 'Desktop'
@@ -332,11 +264,17 @@ jobs:
                 -Force | Out-Null
           }
 
+          $Profile = Get-CimInstance Win32_UserProfile |
+            Where-Object {
+              $_.SID -eq $Sid
+            } |
+            Select-Object -First 1
+
           if ($null -eq $Profile) {
 
               Write-Host "CynetAdmin profile does not exist yet."
               Write-Host "Skipping Desktop restore."
-              Write-Host "The profile will be created by Windows during RDP login."
+              Write-Host "Windows will create the profile during RDP login."
 
           }
           else {
@@ -365,17 +303,28 @@ jobs:
                 /W:1 `
                 /XJ
 
-              $RoboCopyExitCode = $LASTEXITCODE
+              $RobocopyExitCode = $LASTEXITCODE
 
               Write-Host ""
-              Write-Host "Robocopy restore exit code: $RoboCopyExitCode"
+              Write-Host "Robocopy restore exit code: $RobocopyExitCode"
 
-              if ($RoboCopyExitCode -gt 7) {
-                  throw "Desktop restore failed. Robocopy exit code: $RoboCopyExitCode"
+              # Robocopy:
+              # 0 = Nothing copied
+              # 1 = Files copied successfully
+              # 2-7 = Successful/non-fatal differences
+              # 8+ = Failure
+              if ($RobocopyExitCode -gt 7) {
+                  throw "Desktop restore failed. Robocopy exit code: $RobocopyExitCode"
               }
 
+              # IMPORTANT:
+              # Robocopy exit code 1 is SUCCESS.
+              # Reset LASTEXITCODE so GitHub Actions does not mark
+              # this PowerShell step as failed.
+              $global:LASTEXITCODE = 0
+
               Write-Host ""
-              Write-Host "Desktop restore completed."
+              Write-Host "Desktop restore completed successfully."
 
               Write-Host ""
               Write-Host "Restored Desktop contents:"
@@ -394,9 +343,9 @@ jobs:
 
 
       # ============================================================
-      # 8. Install Tailscale
+      # 7. Install Tailscale
       # ============================================================
-      - name: 8. Install Tailscale
+      - name: 7. Install Tailscale
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -450,13 +399,12 @@ jobs:
 
 
       # ============================================================
-      # 9. Connect Tailscale
+      # 8. Connect Tailscale
       #
       # IMPORTANT:
       # Do NOT use --ephemeral.
-      # The installed Windows Tailscale version may not support it.
       # ============================================================
-      - name: 9. Connect Tailscale
+      - name: 8. Connect Tailscale
         shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY_WIN_1 }}
@@ -477,6 +425,8 @@ jobs:
 
           Start-Sleep -Seconds 5
 
+          # Every GitHub runner is temporary.
+          # Use a unique hostname per workflow run.
           $Hostname = "github-rdp-$env:GITHUB_RUN_ID"
 
           Write-Host "Tailscale hostname: $Hostname"
@@ -488,12 +438,17 @@ jobs:
             --accept-dns=true `
             --unattended=true
 
-          if ($LASTEXITCODE -ne 0) {
-              throw "Tailscale connection failed. Exit code: $LASTEXITCODE"
+          $TailscaleUpExitCode = $LASTEXITCODE
+
+          if ($TailscaleUpExitCode -ne 0) {
+              throw "Tailscale connection failed. Exit code: $TailscaleUpExitCode"
           }
+
+          $global:LASTEXITCODE = 0
 
           Write-Host "Tailscale connection established."
 
+          # Wait for IPv4 address.
           $TailscaleIP = ''
 
           for ($i = 1; $i -le 15; $i++) {
@@ -529,11 +484,15 @@ jobs:
           Write-Host "Tailscale status:"
           & $Tailscale status
 
+          # Tailscale status can return a non-zero code in some
+          # circumstances. Do not let it poison the PowerShell step.
+          $global:LASTEXITCODE = 0
+
 
       # ============================================================
-      # 10. Verify RDP
+      # 9. Verify RDP
       # ============================================================
-      - name: 10. Verify RDP
+      - name: 9. Verify RDP
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -570,12 +529,9 @@ jobs:
 
 
       # ============================================================
-      # 11. Inspect RDP User / Desktop BEFORE Session
-      #
-      # This is important for diagnosing whether the RDP connection
-      # is actually using CynetAdmin.
+      # 10. Inspect Desktop Before RDP Session
       # ============================================================
-      - name: 11. Inspect Desktop Before RDP Session
+      - name: 10. Inspect Desktop Before RDP Session
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -590,6 +546,9 @@ jobs:
           Write-Host "--------------------------------------------------"
 
           quser 2>&1
+
+          # quser is diagnostic only.
+          $global:LASTEXITCODE = 0
 
           Write-Host ""
           Write-Host "All user Desktop files:"
@@ -607,11 +566,11 @@ jobs:
 
 
       # ============================================================
-      # 12. Keep RDP Server Alive
+      # 11. Keep RDP Server Alive
       #
       # 200 seconds = 3 minutes 20 seconds.
       # ============================================================
-      - name: 12. Keep RDP Server Alive
+      - name: 11. Keep RDP Server Alive
         id: keep_alive
         shell: powershell
         run: |
@@ -640,14 +599,11 @@ jobs:
 
 
       # ============================================================
-      # 13. Inspect RDP User / Desktop AFTER Session
+      # 12. Inspect Desktop After RDP Session
       #
-      # This is the critical diagnostic step.
-      #
-      # If a file was created through RDP but does not appear under
-      # C:\Users\CynetAdmin\Desktop, we will see where it actually is.
+      # This proves where files created through RDP actually exist.
       # ============================================================
-      - name: 13. Inspect Desktop After RDP Session
+      - name: 12. Inspect Desktop After RDP Session
         if: steps.keep_alive.outcome == 'success'
         shell: powershell
         run: |
@@ -663,6 +619,7 @@ jobs:
           Write-Host "--------------------------------------------------"
 
           quser 2>&1
+          $global:LASTEXITCODE = 0
 
           Write-Host ""
           Write-Host "All Windows profiles:"
@@ -690,7 +647,7 @@ jobs:
           Write-Host "--------------------------------------------------"
 
           Write-Host ""
-          Write-Host "CynetAdmin Desktop specifically:"
+          Write-Host "CynetAdmin Desktop:"
           Write-Host "--------------------------------------------------"
 
           $CynetUser = Get-LocalUser `
@@ -706,10 +663,7 @@ jobs:
             Select-Object -First 1
 
           if ($null -eq $CynetProfile) {
-
-              Write-Host "ERROR: CynetAdmin Windows profile does not exist."
-              throw "CynetAdmin profile was not created."
-
+              throw "CynetAdmin Windows profile does not exist."
           }
 
           $CynetDesktop = Join-Path $CynetProfile.LocalPath 'Desktop'
@@ -734,20 +688,23 @@ jobs:
 
 
       # ============================================================
-      # 14. Save Actual CynetAdmin Desktop
+      # 13. Save CynetAdmin Desktop
       #
-      # SAFETY:
+      # IMPORTANT:
       #
-      # If CynetAdmin's Desktop is empty, we DO NOT immediately
-      # destroy the previous persistent backup.
+      # Robocopy exit code 1 means SUCCESS.
       #
-      # This prevents a failed/misconfigured RDP login from replacing
-      # a valid backup with an empty Desktop.
+      # We explicitly reset LASTEXITCODE after successful Robocopy
+      # so GitHub Actions does not report:
       #
-      # To intentionally persist an empty Desktop, this behavior can
-      # later be changed after RDP identity is proven.
+      #   Process completed with exit code 1
+      #
+      # Also:
+      #
+      # If the Desktop is unexpectedly empty, do NOT overwrite the
+      # previous persistent backup.
       # ============================================================
-      - name: 14. Save CynetAdmin Desktop
+      - name: 13. Save CynetAdmin Desktop
         id: save_desktop
         if: steps.keep_alive.outcome == 'success'
         shell: powershell
@@ -812,8 +769,8 @@ jobs:
               Write-Host ""
               Write-Host "WARNING: CynetAdmin Desktop is EMPTY." -ForegroundColor Yellow
               Write-Host ""
-              Write-Host "The existing persistent Desktop backup will NOT be overwritten."
-              Write-Host "This protects the previous cache from an incorrect RDP profile."
+              Write-Host "The existing persistent backup will NOT be overwritten."
+              Write-Host "This protects the previous cache from an incorrect RDP session."
               Write-Host ""
 
               $ExistingBackupFiles = Get-ChildItem `
@@ -825,12 +782,13 @@ jobs:
 
               Write-Host "Existing backup file count: $($ExistingBackupFiles.Count)"
 
-              if ($ExistingBackupFiles.Count -eq 0) {
-                  Write-Host "Backup is also empty."
-              }
-
-              # Do not mark this step as a successful persistence update.
+              # The step itself is successful.
+              # We simply tell the next step that no update occurred.
               "PERSISTENCE_UPDATED=false" >> $env:GITHUB_OUTPUT
+
+              # Make absolutely sure no previous native exit code
+              # can escape the PowerShell step.
+              $global:LASTEXITCODE = 0
 
           }
           else {
@@ -848,14 +806,21 @@ jobs:
                 /W:1 `
                 /XJ
 
-              $RoboCopyExitCode = $LASTEXITCODE
+              $RobocopyExitCode = $LASTEXITCODE
 
               Write-Host ""
-              Write-Host "Robocopy save exit code: $RoboCopyExitCode"
+              Write-Host "Robocopy save exit code: $RobocopyExitCode"
 
-              if ($RoboCopyExitCode -gt 7) {
-                  throw "Desktop backup failed. Robocopy exit code: $RoboCopyExitCode"
+              # 0-7 are successful/non-fatal Robocopy results.
+              # 8+ means failure.
+              if ($RobocopyExitCode -gt 7) {
+                  throw "Desktop backup failed. Robocopy exit code: $RobocopyExitCode"
               }
+
+              # CRITICAL:
+              # Robocopy code 1 means files were copied successfully.
+              # Reset it before PowerShell exits.
+              $global:LASTEXITCODE = 0
 
               Write-Host ""
               Write-Host "Desktop saved successfully."
@@ -877,13 +842,20 @@ jobs:
 
           Write-Host "--------------------------------------------------"
 
+          # Explicitly finish with a clean native exit state.
+          $global:LASTEXITCODE = 0
+
 
       # ============================================================
-      # 15. Verify Persistent Backup
+      # 14. Verify Persistent Backup
       #
-      # This happens BEFORE saving the new GitHub cache.
+      # We consider the backup valid when it contains at least one
+      # file.
+      #
+      # desktop.ini counts as a file, so a newly-created Windows
+      # Desktop will normally be considered valid.
       # ============================================================
-      - name: 15. Verify Persistent Backup
+      - name: 14. Verify Persistent Backup
         id: verify_backup
         if: steps.keep_alive.outcome == 'success'
         shell: powershell
@@ -919,6 +891,7 @@ jobs:
               Write-Host "No new cache will be created from this run."
 
               "BACKUP_VALID=false" >> $env:GITHUB_OUTPUT
+
           }
           else {
 
@@ -934,21 +907,15 @@ jobs:
               "BACKUP_VALID=true" >> $env:GITHUB_OUTPUT
           }
 
+          $global:LASTEXITCODE = 0
+
 
       # ============================================================
-      # 16. Save Persistent Workspace To GitHub Cache
+      # 15. Save Persistent Workspace To GitHub Actions Cache
       #
-      # IMPORTANT:
-      # Only save if:
-      #
-      #   - RDP session completed
-      #   - Desktop save step completed
-      #   - Persistent backup contains files
-      #
-      # This prevents an empty/broken runner from becoming the
-      # newest persistent cache.
+      # Only save a valid backup.
       # ============================================================
-      - name: 16. Save Workspace For Next Run
+      - name: 15. Save Workspace For Next Run
         if: |
           steps.keep_alive.outcome == 'success' &&
           steps.verify_backup.outputs.BACKUP_VALID == 'true'
@@ -956,16 +923,19 @@ jobs:
         with:
           path: ${{ github.workspace }}\workspace
 
+          # Cache entries are immutable.
           key: cynet-rdp-workspace-${{ runner.os }}-${{ github.run_id }}
 
 
       # ============================================================
-      # 17. Final Summary
+      # 16. Final Persistence Summary
       # ============================================================
-      - name: 17. Final Persistence Summary
+      - name: 16. Final Persistence Summary
         if: always()
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Continue'
+
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "FINAL RDP WORKFLOW SUMMARY"
@@ -975,9 +945,13 @@ jobs:
           Write-Host "Run ID              : $env:GITHUB_RUN_ID"
           Write-Host "Runner OS           : $env:RUNNER_OS"
           Write-Host "RDP User            : CynetAdmin"
+          Write-Host ""
           Write-Host "RDP Session Result  : ${{ steps.keep_alive.outcome }}"
           Write-Host "Desktop Save Result : ${{ steps.save_desktop.outcome }}"
           Write-Host "Backup Verify       : ${{ steps.verify_backup.outcome }}"
           Write-Host ""
 
           Write-Host "==================================================" -ForegroundColor Green
+
+          # Do not allow diagnostic commands to poison this step.
+          $global:LASTEXITCODE = 0
