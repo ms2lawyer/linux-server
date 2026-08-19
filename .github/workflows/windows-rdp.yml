@@ -2,102 +2,332 @@ name: Windows Cloud RDP
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # روشن شدن خودکار هر ۶ ساعت یک‌بار (۲۴/۷)
-  workflow_dispatch:        # استارت دستی با دکمه Run
+    # Start every 6 hours
+    - cron: '0 */6 * * *'
+
+  # Allow manual start from GitHub Actions
+  workflow_dispatch:
 
 jobs:
-  build:
+  rdp-server:
     runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
+
+      # ============================================================
+      # 1. Checkout Repository
+      # ============================================================
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
+
+
+      # ============================================================
+      # 2. Restore Persistent Workspace
+      # ============================================================
       - name: 2. Restore Persistent Workspace
         uses: actions/cache@v4
         with:
-          path: /home/cynetadmin/workspace
-          key: cynet-ssh-workspace-${{ github.run_id }}
+          path: ${{ github.workspace }}\workspace
+          key: cynet-rdp-workspace-windows-v1
           restore-keys: |
-            cynet-ssh-workspace-
+            cynet-rdp-workspace-windows-
 
-      - name: 3. Enable Remote Desktop and Firewall
+
+      # ============================================================
+      # 3. Create Workspace Directory
+      # ============================================================
+      - name: 3. Prepare Workspace
         shell: powershell
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          $Workspace = "${{ github.workspace }}\workspace"
+
+          Write-Host "Workspace: $Workspace"
+
+          if (-not (Test-Path $Workspace)) {
+              New-Item -ItemType Directory -Path $Workspace -Force | Out-Null
+          }
+
+          Write-Host "Workspace contents:"
+          Get-ChildItem -Path $Workspace -Force -ErrorAction SilentlyContinue
+
+
+      # ============================================================
+      # 4. Enable Remote Desktop
+      # ============================================================
+      - name: 4. Enable Remote Desktop
+        shell: powershell
+        run: |
+          Write-Host "Enabling Remote Desktop..."
+
+          # Enable RDP
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          # Enable Windows Firewall rules for Remote Desktop
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
 
-      - name: 4. Create Admin Account
+          # Keep Network Level Authentication enabled
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1
+
+          # Make sure the Remote Desktop service is running
+          Set-Service -Name TermService -StartupType Automatic
+
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+          Write-Host "Remote Desktop enabled."
+
+
+      # ============================================================
+      # 5. Create Administrator Account
+      # ============================================================
+      - name: 5. Create Administrator Account
         shell: powershell
         run: |
-          $Password = ConvertTo-SecureString 'Cynet@2026' -AsPlainText -Force
+          $Username = 'CynetAdmin'
+          $PasswordPlain = 'Cynet@2026'
 
-          New-LocalUser `
-            -Name 'CynetAdmin' `
-            -Password $Password `
-            -PasswordNeverExpires `
+          $Password = ConvertTo-SecureString `
+            $PasswordPlain `
+            -AsPlainText `
+            -Force
+
+          Write-Host "Creating local user: $Username"
+
+          $ExistingUser = Get-LocalUser `
+            -Name $Username `
             -ErrorAction SilentlyContinue
 
+          if ($null -eq $ExistingUser) {
+
+              New-LocalUser `
+                -Name $Username `
+                -Password $Password `
+                -PasswordNeverExpires `
+                -AccountNeverExpires `
+                -Description 'GitHub Actions RDP Administrator'
+
+              Write-Host "User created."
+
+          }
+          else {
+
+              Write-Host "User already exists."
+
+              Set-LocalUser `
+                -Name $Username `
+                -Password $Password
+
+              Enable-LocalUser -Name $Username
+          }
+
+          # Add user to Administrators group
           Add-LocalGroupMember `
             -Group 'Administrators' `
-            -Member 'CynetAdmin' `
+            -Member $Username `
             -ErrorAction SilentlyContinue
 
-          net user runneradmin 'Cynet@2026'
+          # Also make sure the account is allowed to use RDP
+          Add-LocalGroupMember `
+            -Group 'Remote Desktop Users' `
+            -Member $Username `
+            -ErrorAction SilentlyContinue
 
-      - name: 5. Install and Connect Tailscale
+          Write-Host "Administrator account configured."
+
+          # Show account information
+          Get-LocalUser -Name $Username |
+            Select-Object Name, Enabled, PasswordNeverExpires
+
+
+      # ============================================================
+      # 6. Install Tailscale
+      # ============================================================
+      - name: 6. Install Tailscale
         shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY_WIN_1 }}
         run: |
-          Write-Host 'Downloading Tailscale...'
+          $Installer = 'C:\tailscale.msi'
+          $TailscaleExe = 'C:\Program Files\Tailscale\tailscale.exe'
+
+          Write-Host "Downloading Tailscale..."
 
           Invoke-WebRequest `
             -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
-            -OutFile 'C:\tailscale.msi'
+            -OutFile $Installer
 
-          Write-Host 'Installing Tailscale...'
+          if (-not (Test-Path $Installer)) {
+              throw "Tailscale installer was not downloaded."
+          }
 
-          Start-Process `
+          Write-Host "Installing Tailscale..."
+
+          $Process = Start-Process `
             -FilePath 'msiexec.exe' `
-            -ArgumentList '/i C:\tailscale.msi /quiet /norestart' `
-            -Wait
+            -ArgumentList @(
+              '/i',
+              $Installer,
+              '/quiet',
+              '/norestart'
+            ) `
+            -Wait `
+            -PassThru
+
+          if ($Process.ExitCode -ne 0) {
+              throw "Tailscale installation failed with exit code $($Process.ExitCode)"
+          }
+
+          Write-Host "Tailscale installation completed."
+
+          # Wait for tailscale.exe
+          $Timeout = 60
+          $Elapsed = 0
+
+          while (-not (Test-Path $TailscaleExe)) {
+
+              if ($Elapsed -ge $Timeout) {
+                  throw "Tailscale executable was not found."
+              }
+
+              Start-Sleep -Seconds 2
+              $Elapsed += 2
+          }
+
+          Write-Host "Tailscale executable found."
+
+
+      # ============================================================
+      # 7. Connect Tailscale
+      # ============================================================
+      - name: 7. Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY_WIN_1 }}
+        run: |
+          $Tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+
+          if ([string]::IsNullOrWhiteSpace($Env:TAILSCALE_AUTHKEY)) {
+              throw "TAILSCALE_AUTHKEY_WIN_1 GitHub Secret is empty."
+          }
+
+          Write-Host "Starting Tailscale service..."
+
+          Start-Service -Name Tailscale -ErrorAction SilentlyContinue
 
           Start-Sleep -Seconds 5
 
-          $Tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
-
-          Write-Host 'Connecting to Tailscale...'
+          Write-Host "Connecting to Tailscale..."
 
           & $Tailscale up `
             --authkey="$Env:TAILSCALE_AUTHKEY" `
-            --hostname='github-rdp-server'
+            --hostname='github-rdp-server' `
+            --accept-dns=true
 
-          Start-Sleep -Seconds 8
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale connection failed with exit code $LASTEXITCODE"
+          }
 
-          $ts_ip = & $Tailscale ip -4
+          Write-Host "Waiting for Tailscale connection..."
 
-          Write-Host ''
-          Write-Host '==================================================' -ForegroundColor Green
-          Write-Host '       RDP SERVER IS READY' -ForegroundColor Cyan
-          Write-Host '==================================================' -ForegroundColor Green
+          Start-Sleep -Seconds 10
+
+          $ts_ip = (& $Tailscale ip -4).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($ts_ip)) {
+              throw "Unable to obtain Tailscale IPv4 address."
+          }
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "             RDP SERVER IS READY" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host ""
           Write-Host "Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host 'Username     : CynetAdmin' -ForegroundColor Yellow
-          Write-Host 'Password     : Cynet@2026' -ForegroundColor Yellow
-          Write-Host "Connect with : mstsc /v:$ts_ip" -ForegroundColor Magenta
-          Write-Host '==================================================' -ForegroundColor Green
+          Write-Host "Hostname     : github-rdp-server" -ForegroundColor Yellow
+          Write-Host "Username     : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "Password     : Cynet@2026" -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host "RDP Command:" -ForegroundColor Cyan
+          Write-Host "mstsc /v:$ts_ip" -ForegroundColor Magenta
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host ""
 
-      - name: 6. Keep Server Alive
+          Write-Host "Tailscale Status:"
+          & $Tailscale status
+
+
+      # ============================================================
+      # 8. Verify RDP
+      # ============================================================
+      - name: 8. Verify RDP Configuration
         shell: powershell
         run: |
-          for ($i = 1; $i -le 360; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/360] Server running..."
-          }      
-      - name: 7. Save Workspace to Cloud
-        uses: actions/cache@v4
+          Write-Host "Checking RDP configuration..."
+
+          $RdpDisabled = Get-ItemPropertyValue `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections'
+
+          if ($RdpDisabled -ne 0) {
+              throw "RDP is still disabled."
+          }
+
+          Write-Host "RDP registry configuration: OK"
+
+          Write-Host ""
+          Write-Host "TermService status:"
+          Get-Service -Name TermService |
+            Select-Object Name, Status, StartType
+
+          Write-Host ""
+          Write-Host "RDP firewall rules:"
+          Get-NetFirewallRule `
+            -DisplayGroup 'Remote Desktop' `
+            -ErrorAction SilentlyContinue |
+            Where-Object Enabled -eq 'True' |
+            Select-Object DisplayName, Enabled, Profile
+
+
+      # ============================================================
+      # 9. Keep Server Alive for 6 Hours
+      # ============================================================
+      - name: 9. Keep Server Alive
+        shell: powershell
+        run: |
+          $TotalMinutes = 7
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "        WINDOWS RDP SERVER IS RUNNING" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host ""
+          Write-Host "The runner will remain active for approximately"
+          Write-Host "$TotalMinutes minutes."
+          Write-Host ""
+
+          for ($i = 1; $i -le $TotalMinutes; $i++) {
+
+              Start-Sleep -Seconds 60
+
+              $Remaining = $TotalMinutes - $i
+
+              Write-Host "[$i/$TotalMinutes] Server running - $Remaining minutes remaining..."
+          }
+
+
+      # ============================================================
+      # 10. Save Persistent Workspace
+      # ============================================================
+      - name: 10. Save Workspace to GitHub Actions Cache
+        uses: actions/cache/save@v4
         if: always()
         with:
-          path: /home/cynetadmin/workspace
-          key: cynet-ssh-workspace-${{ github.run_id }}
+          path: ${{ github.workspace }}\workspace
+          key: cynet-rdp-workspace-windows-v1
