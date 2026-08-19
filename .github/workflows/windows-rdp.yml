@@ -1,1219 +1,935 @@
-# ==============================================================
-# Windows Cloud RDP — Persistent Desktop
+# ============================================================================
+# Windows Cloud RDP — Persistent Disk Image via GitHub Release
 #
-# Runtime:
-#   350 minutes
+# Persistence model:
+#   1) First run: configure the GitHub Windows runner and keep RDP alive.
+#   2) Before the run ends, capture the runner system disk to VHDX with Disk2vhd.
+#   3) Encrypt/compress the VHDX with 7-Zip.
+#   4) Split the archive into parts of at most 2,000,000,000 bytes.
+#   5) Store all parts in ONE fixed GitHub Release.
+#   6) Next run: download the manifest + matching parts, rebuild the archive,
+#      decrypt it, boot the restored VHDX in QEMU, and expose guest RDP through
+#      the host's Tailscale connection.
 #
-# Keep-alive:
-#   Check every 60 seconds
-#
-# User notification:
-#   Every 5 minutes
-#
-# Persistence:
-#   GitHub Actions Cache
-#
-# RDP:
-#   Tailscale + Windows Remote Desktop
-# ==============================================================
+# Important:
+#   - GitHub Release assets must be < 2 GiB; this workflow uses 2,000,000,000
+#     bytes per part to stay below that limit.
+#   - Standard GitHub-hosted Windows runners currently have 14 GB SSD storage.
+#     A large VHDX may therefore fail during capture even though Releases can
+#     store much more than 14 GB across multiple assets.
+#   - This captures the Windows runner itself. The first-run image is NOT a
+#     clean Windows Server 2025 image; the source workflow uses windows-latest.
+# ============================================================================
 
-name: Windows Cloud RDP
+name: Windows Cloud RDP - Release Persistence
 
 on:
-
   schedule:
-    # GitHub Actions cron does not support every 2 minutes.
-    # Run every 5 minutes.
     - cron: '*/5 * * * *'
-
   workflow_dispatch:
-
-
-# ==============================================================
-# Prevent multiple RDP sessions from running simultaneously
-#
-# IMPORTANT:
-# Without this, the */5 cron can create overlapping runners.
-# ==============================================================
 
 concurrency:
   group: windows-cloud-rdp
-  cancel-in-progress: false
+  cancel-in-progress: true
 
+permissions:
+  contents: write
+  actions: read
+
+env:
+  BACKUP_RELEASE_TAG: windows-rdp-persistent
+  BACKUP_MANIFEST_NAME: windows-rdp-manifest.json
+  BACKUP_PART_BYTES: '2000000000'
+  BACKUP_ROOT: C:\WindowsRdpPersistence
+  QEMU_RDP_PORT: '33989'
+  QEMU_QMP_PORT: '4444'
+  SESSION_MINUTES: '350'
+  TAILSCALE_HOSTNAME: github-rdp-host
 
 jobs:
-
   rdp-server:
-
     runs-on: windows-latest
-
-    # 350 minutes requested.
-    # 360 minutes gives approximately 10 minutes for workflow
-    # startup/shutdown and other steps.
     timeout-minutes: 360
 
-    permissions:
-      contents: read
-      actions: write
-
-
     steps:
-
-      # ==========================================================
+      # ======================================================================
       # 1. Checkout Repository
-      # ==========================================================
-
+      # ======================================================================
       - name: 1. Checkout Repository
         uses: actions/checkout@v5
 
-
-      # ==========================================================
-      # 2. Restore Previous Persistent Workspace
-      # ==========================================================
-
-      - name: 2. Restore Previous Workspace
-        id: restore_workspace
-
-        uses: actions/cache/restore@v5
-
-        with:
-
-          path: ${{ github.workspace }}\workspace
-
-          key: cynet-rdp-workspace-${{ runner.os }}-${{ github.run_id }}
-
-          restore-keys: |
-            cynet-rdp-workspace-${{ runner.os }}-
-
-
-      # ==========================================================
-      # 3. Restore CynetAdmin Desktop
-      #
-      # The previous workspace cache contains:
-      #
-      # workspace/
-      #   Desktop/
-      #
-      # We restore this into the new runner's
-      # C:\Users\CynetAdmin\Desktop later.
-      # ==========================================================
-
-      - name: 3. Display Restored Workspace
+      # ======================================================================
+      # 2. Prepare Persistence Workspace
+      # ======================================================================
+      - name: 2. Prepare Persistence Workspace
         shell: powershell
-
         run: |
-
           $ErrorActionPreference = 'Stop'
 
-          $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
-          $DesktopBackup = Join-Path $Workspace 'Desktop'
+          New-Item -ItemType Directory -Path $env:BACKUP_ROOT -Force | Out-Null
+          New-Item -ItemType Directory -Path "$env:BACKUP_ROOT\download" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$env:BACKUP_ROOT\parts" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$env:BACKUP_ROOT\image" -Force | Out-Null
 
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "RESTORED PERSISTENT WORKSPACE"
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host ""
+          Write-Host "Persistence root: $env:BACKUP_ROOT"
+          Write-Host "Current free space:"
+          Get-PSDrive -Name C | Select-Object Name, Used, Free
 
-          Write-Host "Workspace      : $Workspace"
-          Write-Host "Desktop Backup : $DesktopBackup"
-          Write-Host ""
+      # ======================================================================
+      # 3. Detect and Restore Latest Release Backup
+      # ======================================================================
+      - name: 3. Detect Latest GitHub Release Backup
+        id: detect_backup
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
 
-          Write-Host "Cache restore information:"
-          Write-Host "--------------------------------------------------"
+          $manifestPath = "$env:BACKUP_ROOT\download\$env:BACKUP_MANIFEST_NAME"
+          $hasBackup = $false
 
-          Write-Host "Exact cache hit : ${{ steps.restore_workspace.outputs.cache-hit }}"
-          Write-Host "Matched cache   : ${{ steps.restore_workspace.outputs.cache-matched-key }}"
+          gh release view $env:BACKUP_RELEASE_TAG --json isDraft,isPrerelease,assets |
+            Out-File -FilePath "$env:BACKUP_ROOT\release.json" -Encoding utf8
 
-          Write-Host "--------------------------------------------------"
-          Write-Host ""
+          if ($LASTEXITCODE -eq 0) {
+              $release = Get-Content "$env:BACKUP_ROOT\release.json" -Raw | ConvertFrom-Json
+              $manifestAsset = $release.assets | Where-Object { $_.name -eq $env:BACKUP_MANIFEST_NAME } | Select-Object -First 1
 
-          if (-not (Test-Path -LiteralPath $Workspace)) {
-
-              Write-Host "No previous workspace found."
-
-              New-Item `
-                -ItemType Directory `
-                -Path $Workspace `
-                -Force |
-                Out-Null
+              if ($null -ne $manifestAsset) {
+                  $hasBackup = $true
+              }
           }
 
-          if (-not (Test-Path -LiteralPath $DesktopBackup)) {
+          "HAS_BACKUP=$($hasBackup.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          Write-Host "Existing persistent release backup: $hasBackup"
 
-              Write-Host "No previous Desktop backup found."
+          if ($hasBackup) {
+              gh release download $env:BACKUP_RELEASE_TAG `
+                --pattern $env:BACKUP_MANIFEST_NAME `
+                --dir "$env:BACKUP_ROOT\download" `
+                --clobber
 
-              New-Item `
-                -ItemType Directory `
-                -Path $DesktopBackup `
-                -Force |
-                Out-Null
+              if (-not (Test-Path -LiteralPath $manifestPath)) {
+                  throw "Release manifest could not be downloaded."
+              }
+
+              $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+              Write-Host "Backup generation : $($manifest.generation)"
+              Write-Host "Part count        : $($manifest.part_count)"
+              Write-Host "Archive size      : $($manifest.archive_bytes) bytes"
+              Write-Host "SHA256            : $($manifest.sha256)"
           }
 
-          Write-Host ""
-          Write-Host "Restored workspace contents:"
-          Write-Host "--------------------------------------------------"
+      # ======================================================================
+      # 4. Download and Reassemble Previous Image
+      # ======================================================================
+      - name: 4. Download and Reassemble Previous Image
+        if: steps.detect_backup.outputs.HAS_BACKUP == 'true'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
 
-          Get-ChildItem `
-            -LiteralPath $Workspace `
-            -Force `
+          $manifestPath = "$env:BACKUP_ROOT\download\$env:BACKUP_MANIFEST_NAME"
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          $generation = [string]$manifest.generation
+          $partCount = [int]$manifest.part_count
+          $prefix = "windows-rdp-$generation-part-"
+          $downloadDir = "$env:BACKUP_ROOT\download"
+          $archivePath = "$env:BACKUP_ROOT\image\windows-rdp.7z"
+          $imagePath = "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
+
+          Get-ChildItem $downloadDir -Filter "$prefix*" -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+
+          gh release download $env:BACKUP_RELEASE_TAG `
+            --pattern "$prefix*" `
+            --dir $downloadDir `
+            --clobber
+
+          $parts = Get-ChildItem $downloadDir -Filter "$prefix*" |
+            Sort-Object { [int](($_.Name -replace '^.*-part-(\d+)$','$1')) }
+
+          if ($parts.Count -ne $partCount) {
+              throw "Expected $partCount backup parts, but downloaded $($parts.Count)."
+          }
+
+          $out = [System.IO.File]::Open($archivePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+          try {
+              foreach ($part in $parts) {
+                  Write-Host "Appending $($part.Name) ($($part.Length) bytes)"
+                  $in = [System.IO.File]::OpenRead($part.FullName)
+                  try {
+                      $in.CopyTo($out)
+                  }
+                  finally {
+                      $in.Dispose()
+                  }
+              }
+          }
+          finally {
+              $out.Dispose()
+          }
+
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+          if ($sha -ne [string]$manifest.sha256) {
+              throw "Archive SHA256 mismatch. Expected $($manifest.sha256), got $sha."
+          }
+
+          choco install 7zip -y --no-progress
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+          if (-not (Test-Path -LiteralPath $sevenZip)) { throw '7-Zip executable was not found.' }
+
+          $backupPassword = $env:BACKUP_ENCRYPTION_PASSWORD
+          if ([string]::IsNullOrWhiteSpace($backupPassword)) {
+              throw "Secret BACKUP_ENCRYPTION_PASSWORD is required for image restore."
+          }
+
+          Write-Host "Extracting encrypted VHDX..."
+          & $sevenZip x $archivePath "-o$($env:BACKUP_ROOT)\image" "-p$backupPassword" -y
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "7-Zip extraction failed."
+          }
+
+          if (-not (Test-Path -LiteralPath $imagePath)) {
+              throw "Restored VHDX was not found: $imagePath"
+          }
+
+          Write-Host "Restored image: $imagePath"
+          Write-Host "Restored image size: $((Get-Item $imagePath).Length) bytes"
+        env:
+          BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
+
+      # ======================================================================
+      # 5. Install QEMU for Restored Image Boot
+      # ======================================================================
+      - name: 5. Install QEMU
+        if: steps.detect_backup.outputs.HAS_BACKUP == 'true'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          choco install qemu -y --no-progress
+
+          $qemu = Get-Command qemu-system-x86_64.exe -ErrorAction Stop
+          Write-Host "QEMU: $($qemu.Source)"
+
+          $ovmf = Get-ChildItem `
+            -Path 'C:\Program Files','C:\ProgramData\chocolatey\lib' `
+            -Filter 'OVMF_CODE*.fd' `
             -Recurse `
             -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length, LastWriteTime |
-            Format-Table -AutoSize
+            Select-Object -First 1
 
-          Write-Host "--------------------------------------------------"
+          if ($null -eq $ovmf) {
+              throw "OVMF_CODE firmware was not found after installing QEMU."
+          }
 
-          $global:LASTEXITCODE = 0
+          "QEMU_PATH=$($qemu.Source)" >> $env:GITHUB_ENV
+          "OVMF_CODE=$($ovmf.FullName)" >> $env:GITHUB_ENV
 
+          Write-Host "OVMF: $($ovmf.FullName)"
 
-      # ==========================================================
-      # 4. Enable Remote Desktop
-      # ==========================================================
-
-      - name: 4. Enable Remote Desktop
+      # ======================================================================
+      # 6. Boot Restored Windows Image in QEMU
+      # ======================================================================
+      - name: 6. Boot Restored Windows Image in QEMU
+        id: boot_vm
+        if: steps.detect_backup.outputs.HAS_BACKUP == 'true'
         shell: powershell
-
         run: |
-
           $ErrorActionPreference = 'Stop'
 
-          Write-Host "Enabling Remote Desktop..."
+          $imagePath = "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
+          $logPath = "$env:BACKUP_ROOT\qemu.log"
+
+          if (-not (Test-Path -LiteralPath $imagePath)) {
+              throw "VHDX not found: $imagePath"
+          }
+
+          Write-Host "Starting restored Windows image..."
+
+          $args = @(
+            '-display','none',
+            '-machine','q35',
+            '-accel','tcg,thread=multi',
+            '-m','4096',
+            '-smp','2',
+            '-bios',"$env:OVMF_CODE",
+            '-drive',"file=$imagePath,format=vhdx,if=ide,cache=writeback",
+            '-netdev',"user,id=n1,hostfwd=tcp:0.0.0.0:$env:QEMU_RDP_PORT-:3389",
+            '-device','e1000,netdev=n1',
+            '-qmp',"tcp:127.0.0.1:$env:QEMU_QMP_PORT,server=on,wait=off",
+            '-nodefaults',
+            '-serial','none',
+            '-monitor','none',
+            '-no-reboot'
+          )
+
+          $process = Start-Process `
+            -FilePath $env:QEMU_PATH `
+            -ArgumentList $args `
+            -RedirectStandardOutput $logPath `
+            -RedirectStandardError "$env:BACKUP_ROOT\qemu-error.log" `
+            -PassThru
+
+          "QEMU_PID=$($process.Id)" >> $env:GITHUB_ENV
+
+          Write-Host "QEMU PID: $($process.Id)"
+          Write-Host "Waiting for guest RDP port $env:QEMU_RDP_PORT..."
+
+          $ready = $false
+          for ($i = 1; $i -le 180; $i++) {
+              Start-Sleep -Seconds 2
+
+              if ($process.HasExited) {
+                  throw "QEMU exited during boot. Exit code: $($process.ExitCode)"
+              }
+
+              $check = Test-NetConnection -ComputerName 127.0.0.1 -Port ([int]$env:QEMU_RDP_PORT) -WarningAction SilentlyContinue
+              if ($check.TcpTestSucceeded) {
+                  $ready = $true
+                  break
+              }
+
+              if (($i % 10) -eq 0) {
+                  Write-Host "Still waiting for guest RDP... elapsed $($i * 2)s"
+              }
+          }
+
+          if (-not $ready) {
+              Get-Content $logPath -Tail 100 -ErrorAction SilentlyContinue
+              Get-Content "$env:BACKUP_ROOT\qemu-error.log" -Tail 100 -ErrorAction SilentlyContinue
+              throw "Guest RDP port did not become available within 360 seconds."
+          }
+
+          Write-Host "Restored Windows guest appears to be online."
+
+      # ======================================================================
+      # 7. Enable / Configure Host RDP for First Run Only
+      # ======================================================================
+      - name: 7. Enable Remote Desktop on First Run Host
+        if: steps.detect_backup.outputs.HAS_BACKUP != 'true'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' `
             -Value 0
 
-          # Keep Network Level Authentication enabled.
-
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' `
             -Value 1
 
-          Enable-NetFirewallRule `
-            -DisplayGroup 'Remote Desktop'
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
 
-          Set-Service `
-            -Name 'TermService' `
-            -StartupType Automatic
+          Set-Service -Name 'TermService' -StartupType Automatic
+          Start-Service -Name 'TermService' -ErrorAction SilentlyContinue
 
-          Start-Service `
-            -Name 'TermService' `
-            -ErrorAction SilentlyContinue
-
-          Start-Sleep -Seconds 2
-
-          $Service = Get-Service -Name 'TermService'
-
-          Write-Host "TermService status: $($Service.Status)"
-
-          if ($Service.Status -ne 'Running') {
-
-              throw "Remote Desktop service is not running."
+          $service = Get-Service -Name 'TermService'
+          if ($service.Status -ne 'Running') {
+              throw 'TermService is not running.'
           }
 
-          Write-Host "Remote Desktop enabled successfully."
+          Write-Host 'Remote Desktop enabled.'
 
-          $global:LASTEXITCODE = 0
-
-
-      # ==========================================================
-      # 5. Create / Configure CynetAdmin
-      # ==========================================================
-
-      - name: 5. Create RDP Administrator Account
+      # ======================================================================
+      # 8. Create / Configure CynetAdmin on First Run Only
+      # ======================================================================
+      - name: 8. Create CynetAdmin on First Run
+        if: steps.detect_backup.outputs.HAS_BACKUP != 'true'
         shell: powershell
-
         env:
-
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-
         run: |
-
           $ErrorActionPreference = 'Stop'
 
-          $Username = 'CynetAdmin'
-
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-
-              throw "GitHub Secret RDP_PASSWORD is not configured."
+              throw 'GitHub Secret RDP_PASSWORD is not configured.'
           }
 
-          $SecurePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
+          $username = 'CynetAdmin'
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
 
-          Write-Host "Configuring user: $Username"
-
-          $ExistingUser = Get-LocalUser `
-            -Name $Username `
-            -ErrorAction SilentlyContinue
-
-          if ($null -eq $ExistingUser) {
-
-              Write-Host "Creating local user..."
-
+          if ($null -eq $existing) {
               New-LocalUser `
-                -Name $Username `
-                -Password $SecurePassword `
+                -Name $username `
+                -Password $securePassword `
                 -PasswordNeverExpires `
                 -AccountNeverExpires `
-                -Description 'GitHub Actions RDP Administrator' |
-                Out-Null
+                -Description 'GitHub Actions RDP Administrator' | Out-Null
           }
           else {
-
-              Write-Host "User already exists."
-
-              Set-LocalUser `
-                -Name $Username `
-                -Password $SecurePassword
-
-              Enable-LocalUser `
-                -Name $Username
+              Set-LocalUser -Name $username -Password $securePassword
+              Enable-LocalUser -Name $username
           }
 
-          Add-LocalGroupMember `
-            -Group 'Administrators' `
-            -Member $Username `
-            -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Administrators' -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $username -ErrorAction SilentlyContinue
 
-          Add-LocalGroupMember `
-            -Group 'Remote Desktop Users' `
-            -Member $Username `
-            -ErrorAction SilentlyContinue
+          Write-Host "Configured local user: $username"
 
-          Write-Host ""
-          Write-Host "User information:"
-
-          Get-LocalUser `
-            -Name $Username |
-            Select-Object Name, Enabled, SID, LastLogon |
-            Format-List
-
-          Write-Host ""
-          Write-Host "RDP user configured successfully."
-
-          $global:LASTEXITCODE = 0
-
-
-      # ==========================================================
-      # 6. Initialize CynetAdmin Windows Profile
-      # ==========================================================
-
-      - name: 6. Initialize CynetAdmin Windows Profile
+      # ======================================================================
+      # 9. Install and Connect Tailscale on First Run Host
+      # ======================================================================
+      - name: 9. Install and Connect Tailscale Host
         shell: powershell
-
         env:
-
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY_WIN_1 }}
         run: |
-
           $ErrorActionPreference = 'Stop'
 
-          $Username = 'CynetAdmin'
-
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-
-              throw "RDP_PASSWORD is empty."
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              throw 'GitHub Secret TAILSCALE_AUTHKEY_WIN_1 is not configured.'
           }
 
-          $SecurePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
-
-          $Credential = New-Object `
-            System.Management.Automation.PSCredential(
-              $Username,
-              $SecurePassword
-            )
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "INITIALIZING CynetAdmin WINDOWS PROFILE"
-          Write-Host "==================================================" -ForegroundColor Cyan
-
-          $ExistingProfile = Get-CimInstance Win32_UserProfile |
-            Where-Object {
-
-              $_.SID -eq (
-                Get-LocalUser -Name $Username
-              ).SID.Value
-
-            } |
-            Select-Object -First 1
-
-          if ($null -ne $ExistingProfile) {
-
-              Write-Host "Profile already exists:"
-              Write-Host $ExistingProfile.LocalPath
-
-          }
-          else {
-
-              Write-Host "Profile does not exist."
-              Write-Host "Creating Windows user profile..."
-
-              $Process = Start-Process `
-                -FilePath "$env:SystemRoot\System32\cmd.exe" `
-                -ArgumentList '/c exit 0' `
-                -Credential $Credential `
-                -LoadUserProfile `
-                -WindowStyle Hidden `
-                -Wait `
-                -PassThru
-
-              Write-Host "Profile initialization exit code: $($Process.ExitCode)"
-
-              if ($Process.ExitCode -ne 0) {
-
-                  throw "CynetAdmin profile initialization failed. Exit code: $($Process.ExitCode)"
-              }
-          }
-
-          Start-Sleep -Seconds 2
-
-          $User = Get-LocalUser `
-            -Name $Username `
-            -ErrorAction Stop
-
-          $Sid = $User.SID.Value
-
-          $Profile = Get-CimInstance Win32_UserProfile |
-            Where-Object {
-              $_.SID -eq $Sid
-            } |
-            Select-Object -First 1
-
-          if ($null -eq $Profile) {
-
-              throw "Windows did not create a profile for CynetAdmin."
-          }
-
-          Write-Host ""
-          Write-Host "CynetAdmin profile successfully initialized."
-          Write-Host "SID       : $Sid"
-          Write-Host "Profile   : $($Profile.LocalPath)"
-          Write-Host "Loaded    : $($Profile.Loaded)"
-
-          $global:LASTEXITCODE = 0
-
-
-      # ==========================================================
-      # 7. Restore CynetAdmin Desktop
-      # ==========================================================
-
-      - name: 7. Restore CynetAdmin Desktop
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Stop'
-
-          $Username = 'CynetAdmin'
-
-          $User = Get-LocalUser `
-            -Name $Username `
-            -ErrorAction Stop
-
-          $Sid = $User.SID.Value
-
-          $Profile = Get-CimInstance Win32_UserProfile |
-            Where-Object {
-              $_.SID -eq $Sid
-            } |
-            Select-Object -First 1
-
-          if ($null -eq $Profile) {
-
-              throw "CynetAdmin profile does not exist."
-          }
-
-          $UserProfile = $Profile.LocalPath
-          $Desktop = Join-Path $UserProfile 'Desktop'
-
-          $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
-          $DesktopBackup = Join-Path $Workspace 'Desktop'
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "RESTORING CynetAdmin DESKTOP"
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host ""
-
-          Write-Host "Profile : $UserProfile"
-          Write-Host "Source  : $DesktopBackup"
-          Write-Host "Target  : $Desktop"
-          Write-Host ""
-
-          if (-not (Test-Path -LiteralPath $Desktop)) {
-
-              New-Item `
-                -ItemType Directory `
-                -Path $Desktop `
-                -Force |
-                Out-Null
-          }
-
-          if (-not (Test-Path -LiteralPath $DesktopBackup)) {
-
-              New-Item `
-                -ItemType Directory `
-                -Path $DesktopBackup `
-                -Force |
-                Out-Null
-          }
-
-          robocopy `
-            $DesktopBackup `
-            $Desktop `
-            /MIR `
-            /COPY:DAT `
-            /DCOPY:DAT `
-            /R:2 `
-            /W:1 `
-            /XJ
-
-          $RobocopyExitCode = $LASTEXITCODE
-
-          Write-Host ""
-          Write-Host "Robocopy restore exit code: $RobocopyExitCode"
-
-          if ($RobocopyExitCode -gt 7) {
-
-              throw "Desktop restore failed. Robocopy exit code: $RobocopyExitCode"
-          }
-
-          $global:LASTEXITCODE = 0
-
-          Write-Host ""
-          Write-Host "Desktop restore completed successfully."
-
-          Write-Host ""
-          Write-Host "Current CynetAdmin Desktop:"
-          Write-Host "--------------------------------------------------"
-
-          Get-ChildItem `
-            -LiteralPath $Desktop `
-            -Force `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length, LastWriteTime |
-            Format-Table -AutoSize
-
-          Write-Host "--------------------------------------------------"
-
-
-      # ==========================================================
-      # 8. Install Tailscale
-      # ==========================================================
-
-      - name: 8. Install Tailscale
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Stop'
-
-          $Installer = 'C:\tailscale.msi'
-          $Tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
-
-          Write-Host "Downloading Tailscale..."
+          $installer = 'C:\tailscale.msi'
+          $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
 
           Invoke-WebRequest `
             -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
-            -OutFile $Installer
+            -OutFile $installer
 
-          if (-not (Test-Path -LiteralPath $Installer)) {
-
-              throw "Tailscale installer download failed."
-          }
-
-          Write-Host "Installing Tailscale..."
-
-          $InstallProcess = Start-Process `
+          $p = Start-Process `
             -FilePath 'msiexec.exe' `
-            -ArgumentList @(
-              '/i',
-              $Installer,
-              '/quiet',
-              '/norestart'
-            ) `
+            -ArgumentList '/i',$installer,'/quiet','/norestart' `
             -Wait `
             -PassThru
 
-          if ($InstallProcess.ExitCode -ne 0) {
-
-              throw "Tailscale installation failed. Exit code: $($InstallProcess.ExitCode)"
+          if ($p.ExitCode -ne 0) {
+              throw "Tailscale install failed: $($p.ExitCode)"
           }
 
-          Write-Host "Tailscale installation completed."
-
-          $TimeoutSeconds = 60
-          $ElapsedSeconds = 0
-
-          while (-not (Test-Path -LiteralPath $Tailscale)) {
-
-              if ($ElapsedSeconds -ge $TimeoutSeconds) {
-
-                  throw "Tailscale executable was not found."
-              }
-
-              Start-Sleep -Seconds 2
-              $ElapsedSeconds += 2
-          }
-
-          Write-Host "Tailscale executable found."
-
-          $global:LASTEXITCODE = 0
-
-
-      # ==========================================================
-      # 9. Connect Tailscale
-      # ==========================================================
-
-      - name: 9. Connect Tailscale
-        shell: powershell
-
-        env:
-
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY_WIN_1 }}
-
-        run: |
-
-          $ErrorActionPreference = 'Stop'
-
-          $Tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
-
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-
-              throw "GitHub Secret TAILSCALE_AUTHKEY_WIN_1 is not configured."
-          }
-
-          Write-Host "Starting Tailscale service..."
-
-          Start-Service `
-            -Name 'Tailscale' `
-            -ErrorAction SilentlyContinue
-
+          Start-Service -Name 'Tailscale' -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 5
 
-          $Hostname = "github-rdp-$env:GITHUB_RUN_ID"
-
-          Write-Host "Tailscale hostname: $Hostname"
-          Write-Host "Connecting to Tailscale..."
-
-          & $Tailscale up `
+          & $tailscale up `
             --auth-key="$env:TAILSCALE_AUTHKEY" `
-            --hostname="$Hostname" `
+            --hostname="$env:TAILSCALE_HOSTNAME-$env:GITHUB_RUN_ID" `
             --accept-dns=true `
             --unattended=true
 
-          $TailscaleExitCode = $LASTEXITCODE
-
-          if ($TailscaleExitCode -ne 0) {
-
-              throw "Tailscale connection failed. Exit code: $TailscaleExitCode"
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale connection failed: $LASTEXITCODE"
           }
 
-          $global:LASTEXITCODE = 0
-
-          Write-Host "Tailscale connection established."
-
-          $TailscaleIP = ''
-
-          for ($i = 1; $i -le 15; $i++) {
-
-              $TailscaleIP = (
-                & $Tailscale ip -4 2>$null
-              ).Trim()
-
-              if (-not [string]::IsNullOrWhiteSpace($TailscaleIP)) {
-
-                  break
-              }
-
+          $ip = ''
+          for ($i = 1; $i -le 20; $i++) {
+              $ip = (& $tailscale ip -4 2>$null).Trim()
+              if (-not [string]::IsNullOrWhiteSpace($ip)) { break }
               Start-Sleep -Seconds 2
           }
 
-          if ([string]::IsNullOrWhiteSpace($TailscaleIP)) {
-
-              throw "Tailscale did not provide an IPv4 address."
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+              throw 'Could not determine Tailscale IPv4 address.'
           }
 
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "             RDP SERVER IS READY" -ForegroundColor Green
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host ""
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $ip"
 
-          Write-Host "Tailscale IP : $TailscaleIP" -ForegroundColor Yellow
-          Write-Host "Hostname     : $Hostname" -ForegroundColor Yellow
-          Write-Host "Username     : CynetAdmin" -ForegroundColor Yellow
-
-          Write-Host ""
-          Write-Host "RDP command:" -ForegroundColor Cyan
-          Write-Host "mstsc /v:$TailscaleIP" -ForegroundColor Magenta
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host ""
-
-          Write-Host "Tailscale status:"
-
-          & $Tailscale status
-
-          $global:LASTEXITCODE = 0
-
-
-      # ==========================================================
-      # 10. Verify RDP
-      # ==========================================================
-
-      - name: 10. Verify RDP
+      # ======================================================================
+      # 10. Verify First-Run Host RDP
+      # ======================================================================
+      - name: 10. Verify First-Run Host RDP
+        if: steps.detect_backup.outputs.HAS_BACKUP != 'true'
         shell: powershell
-
         run: |
-
           $ErrorActionPreference = 'Stop'
 
-          Write-Host "Checking RDP configuration..."
-
-          $RdpDenied = Get-ItemPropertyValue `
+          $rdpDenied = Get-ItemPropertyValue `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections'
 
-          if ($RdpDenied -ne 0) {
+          if ($rdpDenied -ne 0) { throw 'RDP is disabled.' }
 
-              throw "RDP is disabled."
+          if ((Get-Service -Name TermService).Status -ne 'Running') {
+              throw 'TermService is not running.'
           }
 
-          $TermService = Get-Service `
-            -Name 'TermService'
+          Write-Host "First-run RDP is ready at $env:TAILSCALE_IP:3389"
 
-          if ($TermService.Status -ne 'Running') {
-
-              throw "TermService is not running."
-          }
-
-          Write-Host "RDP registry : OK"
-          Write-Host "TermService  : RUNNING"
-
-          Write-Host ""
-          Write-Host "Remote Desktop firewall rules:"
-
-          Get-NetFirewallRule `
-            -DisplayGroup 'Remote Desktop' `
-            -ErrorAction SilentlyContinue |
-            Where-Object Enabled -eq 'True' |
-            Select-Object DisplayName, Enabled, Profile |
-            Format-Table -AutoSize
-
-          $global:LASTEXITCODE = 0
-
-
-      # ==========================================================
-      # 11. Inspect Before RDP
-      # ==========================================================
-
-      - name: 11. Inspect Before RDP Session
+      # ======================================================================
+      # 11. Display Connection Information
+      # ======================================================================
+      - name: 11. Display RDP Connection Information
         shell: powershell
-
         run: |
-
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "BEFORE RDP SESSION"
-          Write-Host "==================================================" -ForegroundColor Cyan
-
-          Write-Host ""
-          Write-Host "Windows profiles:"
-          Write-Host "--------------------------------------------------"
-
-          Get-CimInstance Win32_UserProfile |
-            Where-Object {
-              $_.LocalPath -like 'C:\Users\*'
-            } |
-            Select-Object SID, LocalPath, Loaded, Special |
-            Format-Table -AutoSize
-
-          Write-Host ""
-          Write-Host "Logged-on sessions:"
-          Write-Host "--------------------------------------------------"
-
-          quser 2>&1
-
-          $global:LASTEXITCODE = 0
-
-          Write-Host ""
-          Write-Host "CynetAdmin Desktop:"
-          Write-Host "--------------------------------------------------"
-
-          if (Test-Path 'C:\Users\CynetAdmin\Desktop') {
-
-              Get-ChildItem `
-                'C:\Users\CynetAdmin\Desktop' `
-                -Force `
-                -Recurse `
-                -ErrorAction SilentlyContinue |
-                Select-Object FullName, Length, LastWriteTime |
-                Format-Table -AutoSize
-
-          }
-          else {
-
-              Write-Host "CynetAdmin Desktop does not exist."
-          }
-
-          Write-Host "--------------------------------------------------"
-
-
-      # ==========================================================
-      # 12. Keep RDP Server Alive
-      #
-      # TOTAL:
-      #   350 minutes
-      #
-      # CHECK:
-      #   Every 60 seconds
-      #
-      # NOTIFICATION:
-      #   Every 5 minutes
-      #
-      # 350 minutes = 21,000 seconds
-      # ==========================================================
-
-      - name: 12. Keep RDP Server Alive
-        id: keep_alive
-        shell: powershell
-
-        run: |
-
-          $TotalMinutes = 350
-          $TotalSeconds = $TotalMinutes * 60
-
-          $IntervalSeconds = 60
-          $NotificationIntervalSeconds = 300
-
-          $StartTime = Get-Date
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "       RDP SERVER IS NOW AVAILABLE" -ForegroundColor Green
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host ""
-
-          Write-Host "Session duration : $TotalMinutes minutes"
-          Write-Host "Session seconds  : $TotalSeconds seconds"
-          Write-Host "Check interval   : $IntervalSeconds seconds"
-          Write-Host "Notification     : Every 5 minutes"
-          Write-Host ""
-
-          Write-Host "Started at       : $StartTime"
-          Write-Host "Expected end     : $($StartTime.AddMinutes($TotalMinutes))"
-
-          Write-Host ""
-
-          $ElapsedSeconds = 0
-          $NextNotification = $NotificationIntervalSeconds
-
-          while ($ElapsedSeconds -lt $TotalSeconds) {
-
-              Start-Sleep -Seconds $IntervalSeconds
-
-              $ElapsedSeconds += $IntervalSeconds
-
-              if ($ElapsedSeconds -ge $TotalSeconds) {
-
-                  break
-              }
-
-              # --------------------------------------------------
-              # Notify every 5 minutes
-              # --------------------------------------------------
-
-              if ($ElapsedSeconds -ge $NextNotification) {
-
-                  $RemainingSeconds = $TotalSeconds - $ElapsedSeconds
-
-                  $ElapsedMinutes = [math]::Floor(
-                    $ElapsedSeconds / 60
-                  )
-
-                  $RemainingMinutes = [math]::Ceiling(
-                    $RemainingSeconds / 60
-                  )
-
-                  $CurrentTime = Get-Date
-
-                  Write-Host ""
-                  Write-Host "==================================================" -ForegroundColor Cyan
-                  Write-Host "RDP SERVER STATUS" -ForegroundColor Cyan
-                  Write-Host "==================================================" -ForegroundColor Cyan
-
-                  Write-Host ""
-                  Write-Host "Current time       : $CurrentTime"
-                  Write-Host "Elapsed            : $ElapsedMinutes minutes"
-                  Write-Host "Remaining          : $RemainingMinutes minutes"
-                  Write-Host "Total duration     : $TotalMinutes minutes"
-
-                  Write-Host ""
-                  Write-Host "RDP server is still running." -ForegroundColor Green
-                  Write-Host "==================================================" -ForegroundColor Cyan
-                  Write-Host ""
-
-                  $NextNotification += $NotificationIntervalSeconds
-              }
-          }
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "RDP SESSION WINDOW COMPLETED" -ForegroundColor Green
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host ""
-
-          Write-Host "Total requested runtime : $TotalMinutes minutes"
-          Write-Host "Actual elapsed seconds  : $ElapsedSeconds"
-          Write-Host "Finished at             : $(Get-Date)"
-          Write-Host ""
-
-          $global:LASTEXITCODE = 0
-
-
-      # ==========================================================
-      # 13. Inspect After RDP
-      # ==========================================================
-
-      - name: 13. Inspect After RDP Session
-        if: steps.keep_alive.outcome == 'success'
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "AFTER RDP SESSION"
-          Write-Host "==================================================" -ForegroundColor Cyan
-
-          Write-Host ""
-          Write-Host "Logged-on sessions:"
-          Write-Host "--------------------------------------------------"
-
-          quser 2>&1
-
-          $global:LASTEXITCODE = 0
-
-          Write-Host ""
-          Write-Host "Windows profiles:"
-          Write-Host "--------------------------------------------------"
-
-          Get-CimInstance Win32_UserProfile |
-            Where-Object {
-              $_.LocalPath -like 'C:\Users\*'
-            } |
-            Select-Object SID, LocalPath, Loaded, Special |
-            Format-Table -AutoSize
-
-          Write-Host ""
-          Write-Host "All user Desktop files:"
-          Write-Host "--------------------------------------------------"
-
-          Get-ChildItem `
-            'C:\Users\*\Desktop' `
-            -Force `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length, LastWriteTime |
-            Format-Table -AutoSize
-
-          Write-Host "--------------------------------------------------"
-
-
-      # ==========================================================
-      # 14. Save CynetAdmin Desktop
-      # ==========================================================
-
-      - name: 14. Save CynetAdmin Desktop
-        id: save_desktop
-
-        if: steps.keep_alive.outcome == 'success'
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Stop'
-
-          $Username = 'CynetAdmin'
-
-          $User = Get-LocalUser `
-            -Name $Username `
-            -ErrorAction Stop
-
-          $Sid = $User.SID.Value
-
-          $Profile = Get-CimInstance Win32_UserProfile |
-            Where-Object {
-              $_.SID -eq $Sid
-            } |
-            Select-Object -First 1
-
-          $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
-          $DesktopBackup = Join-Path $Workspace 'Desktop'
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "SAVING CynetAdmin DESKTOP"
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host ""
-
-          if ($null -eq $Profile) {
-
-              Write-Host "WARNING: CynetAdmin profile does not exist."
-              Write-Host ""
-              Write-Host "No RDP login appears to have created the profile."
-              Write-Host "Existing persistent backup will be preserved."
-              Write-Host ""
-
-              "PERSISTENCE_UPDATED=false" >> $env:GITHUB_OUTPUT
-
-              $global:LASTEXITCODE = 0
-
-              return
-          }
-
-          $UserProfile = $Profile.LocalPath
-          $Desktop = Join-Path $UserProfile 'Desktop'
-
-          Write-Host "Profile : $UserProfile"
-          Write-Host "Source  : $Desktop"
-          Write-Host "Target  : $DesktopBackup"
-          Write-Host ""
-
-          if (-not (Test-Path -LiteralPath $Desktop)) {
-
-              Write-Host "WARNING: CynetAdmin Desktop does not exist."
-              Write-Host "Existing backup will be preserved."
-
-              "PERSISTENCE_UPDATED=false" >> $env:GITHUB_OUTPUT
-
-              $global:LASTEXITCODE = 0
-
-              return
-          }
-
-          if (-not (Test-Path -LiteralPath $DesktopBackup)) {
-
-              New-Item `
-                -ItemType Directory `
-                -Path $DesktopBackup `
-                -Force |
-                Out-Null
-          }
-
-          $Files = Get-ChildItem `
-            -LiteralPath $Desktop `
-            -Force `
-            -Recurse `
-            -File `
-            -ErrorAction SilentlyContinue
-
-          Write-Host "Current CynetAdmin Desktop file count: $($Files.Count)"
-
-          if ($Files.Count -eq 0) {
-
-              Write-Host ""
-              Write-Host "WARNING: CynetAdmin Desktop is EMPTY." -ForegroundColor Yellow
-              Write-Host ""
-              Write-Host "Existing persistent backup will NOT be overwritten."
-
-              "PERSISTENCE_UPDATED=false" >> $env:GITHUB_OUTPUT
-
-              $global:LASTEXITCODE = 0
-
-          }
-          else {
-
-              Write-Host ""
-              Write-Host "Synchronizing Desktop..."
-
-              robocopy `
-                $Desktop `
-                $DesktopBackup `
-                /MIR `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:2 `
-                /W:1 `
-                /XJ
-
-              $RobocopyExitCode = $LASTEXITCODE
-
-              Write-Host ""
-              Write-Host "Robocopy save exit code: $RobocopyExitCode"
-
-              if ($RobocopyExitCode -gt 7) {
-
-                  throw "Desktop backup failed. Robocopy exit code: $RobocopyExitCode"
-              }
-
-              $global:LASTEXITCODE = 0
-
-              Write-Host ""
-              Write-Host "Desktop saved successfully."
-
-              "PERSISTENCE_UPDATED=true" >> $env:GITHUB_OUTPUT
-          }
-
-          Write-Host ""
-          Write-Host "FILES CURRENTLY STORED IN PERSISTENT BACKUP:"
-          Write-Host "--------------------------------------------------"
-
-          Get-ChildItem `
-            -LiteralPath $DesktopBackup `
-            -Force `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length, LastWriteTime |
-            Format-Table -AutoSize
-
-          Write-Host "--------------------------------------------------"
-
-          $global:LASTEXITCODE = 0
-
-
-      # ==========================================================
-      # 15. Verify Persistent Backup
-      # ==========================================================
-
-      - name: 15. Verify Persistent Backup
-        id: verify_backup
-
-        if: steps.keep_alive.outcome == 'success'
-
-        shell: powershell
-
-        run: |
-
-          $ErrorActionPreference = 'Stop'
-
-          $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
-          $DesktopBackup = Join-Path $Workspace 'Desktop'
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "PERSISTENCE VERIFICATION"
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host ""
-
-          if (-not (Test-Path -LiteralPath $DesktopBackup)) {
-
-              Write-Host "WARNING: Desktop backup directory does not exist."
-              Write-Host "No new cache will be created."
-
-              "BACKUP_VALID=false" >> $env:GITHUB_OUTPUT
-
-              $global:LASTEXITCODE = 0
-
-              return
-          }
-
-          $Files = Get-ChildItem `
-            -LiteralPath $DesktopBackup `
-            -Force `
-            -Recurse `
-            -File `
-            -ErrorAction SilentlyContinue
-
-          Write-Host "Persistent file count: $($Files.Count)"
-          Write-Host ""
-
-          if ($Files.Count -eq 0) {
-
-              Write-Host "WARNING: Persistent Desktop backup is empty." -ForegroundColor Yellow
-              Write-Host "No new cache will be created."
-
-              "BACKUP_VALID=false" >> $env:GITHUB_OUTPUT
-          }
-          else {
-
-              Write-Host "Persisted files:"
-              Write-Host "--------------------------------------------------"
-
-              $Files |
-                Select-Object FullName, Length, LastWriteTime |
-                Format-Table -AutoSize
-
-              Write-Host "--------------------------------------------------"
-
-              "BACKUP_VALID=true" >> $env:GITHUB_OUTPUT
-          }
-
-          $global:LASTEXITCODE = 0
-
-
-      # ==========================================================
-      # 16. Save Workspace To GitHub Actions Cache
-      # ==========================================================
-
-      - name: 16. Save Workspace For Next Run
-
-        if: |
-          steps.keep_alive.outcome == 'success' &&
-          steps.verify_backup.outputs.BACKUP_VALID == 'true'
-
-        uses: actions/cache/save@v5
-
-        with:
-
-          path: ${{ github.workspace }}\workspace
-
-          key: cynet-rdp-workspace-${{ runner.os }}-${{ github.run_id }}
-
-
-      # ==========================================================
-      # 17. Final Summary
-      # ==========================================================
-
-      - name: 17. Final Persistence Summary
-
-        if: always()
-
-        shell: powershell
-
-        run: |
-
           $ErrorActionPreference = 'Continue'
 
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "FINAL RDP WORKFLOW SUMMARY"
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host ""
+          $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+          $backupExists = '${{ steps.detect_backup.outputs.HAS_BACKUP }}'
 
-          Write-Host "Run ID              : $env:GITHUB_RUN_ID"
-          Write-Host "Runner OS           : $env:RUNNER_OS"
-          Write-Host "RDP User            : CynetAdmin"
-          Write-Host ""
+          Write-Host ''
+          Write-Host '==================================================' -ForegroundColor Green
+          Write-Host '            RDP SERVER IS READY' -ForegroundColor Green
+          Write-Host '==================================================' -ForegroundColor Green
 
-          Write-Host "Requested Runtime   : 350 minutes"
-          Write-Host "Keep-Alive Interval  : 60 seconds"
-          Write-Host "Notification        : Every 5 minutes"
-          Write-Host ""
+          if ($backupExists -eq 'true') {
+              if (-not (Test-Path $tailscale)) {
+                  Write-Host 'Host Tailscale executable is not present; host networking is not configured.' -ForegroundColor Yellow
+              }
+              else {
+                  Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+                  $hostIp = (& $tailscale ip -4 2>$null).Trim()
+                  if (-not [string]::IsNullOrWhiteSpace($hostIp)) {
+                      "TAILSCALE_IP=$hostIp" >> $env:GITHUB_ENV
+                      Write-Host "Tailscale IP : $hostIp" -ForegroundColor Yellow
+                      Write-Host "RDP endpoint : $hostIp`:$env:QEMU_RDP_PORT" -ForegroundColor Yellow
+                      Write-Host "RDP command  : mstsc /v:$hostIp`:$env:QEMU_RDP_PORT" -ForegroundColor Magenta
+                  }
+                  else {
+                      Write-Host 'Tailscale host IP not available.' -ForegroundColor Yellow
+                  }
+              }
+          }
+          else {
+              Write-Host "Tailscale IP : $env:TAILSCALE_IP" -ForegroundColor Yellow
+              Write-Host 'RDP endpoint : ' -NoNewline -ForegroundColor Yellow
+              Write-Host "$env:TAILSCALE_IP`:3389" -ForegroundColor Yellow
+              Write-Host 'RDP command  : ' -NoNewline -ForegroundColor Magenta
+              Write-Host "mstsc /v:$env:TAILSCALE_IP" -ForegroundColor Magenta
+          }
 
-          Write-Host "RDP Session Result  : ${{ steps.keep_alive.outcome }}"
-          Write-Host "Desktop Save Result : ${{ steps.save_desktop.outcome }}"
-          Write-Host "Backup Verify       : ${{ steps.verify_backup.outcome }}"
-          Write-Host ""
+          Write-Host ''
 
-          Write-Host "==================================================" -ForegroundColor Green
+      # ======================================================================
+      # 12. Keep RDP Session Alive
+      # ======================================================================
+      - name: 12. Keep RDP Session Alive
+        id: keep_alive
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
 
+          $totalMinutes = [int]$env:SESSION_MINUTES
+          $intervalSeconds = 60
+          $totalSeconds = $totalMinutes * 60
+          $elapsed = 0
+          $nextNotification = 300
+          $backupExists = '${{ steps.detect_backup.outputs.HAS_BACKUP }}'
+
+          Write-Host "Session runtime: $totalMinutes minutes"
+
+          while ($elapsed -lt $totalSeconds) {
+              Start-Sleep -Seconds $intervalSeconds
+              $elapsed += $intervalSeconds
+
+              if ($elapsed -ge $nextNotification) {
+                  $remaining = [math]::Ceiling(($totalSeconds - $elapsed) / 60)
+                  Write-Host "[$(Get-Date)] RDP still running. Elapsed: $([math]::Floor($elapsed / 60))m; Remaining: $remaining m"
+                  $nextNotification += 300
+              }
+          }
+
+          Write-Host 'RDP session window completed.'
           $global:LASTEXITCODE = 0
+
+      # ======================================================================
+      # 13. Gracefully Shutdown Restored Guest
+      # ======================================================================
+      - name: 13. Gracefully Shutdown Restored Guest
+        if: steps.detect_backup.outputs.HAS_BACKUP == 'true' && steps.keep_alive.outcome == 'success'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          if ([string]::IsNullOrWhiteSpace($env:QEMU_PID)) {
+              throw 'QEMU PID is not available.'
+          }
+
+          Write-Host 'Sending ACPI powerdown to restored guest...'
+
+          try {
+              $client = New-Object System.Net.Sockets.TcpClient('127.0.0.1', [int]$env:QEMU_QMP_PORT)
+              $stream = $client.GetStream()
+              $buffer = New-Object byte[] 4096
+              $null = $stream.Read($buffer, 0, $buffer.Length)
+
+              $command = '{"execute":"system_powerdown"}' + "`n"
+              $bytes = [System.Text.Encoding]::ASCII.GetBytes($command)
+              $stream.Write($bytes, 0, $bytes.Length)
+              $stream.Flush()
+              $stream.Dispose()
+              $client.Dispose()
+          }
+          catch {
+              Write-Host "QMP powerdown request failed: $($_.Exception.Message)" -ForegroundColor Yellow
+          }
+
+          $deadline = (Get-Date).AddSeconds(120)
+          while ((Get-Date) -lt $deadline) {
+              $p = Get-Process -Id ([int]$env:QEMU_PID) -ErrorAction SilentlyContinue
+              if ($null -eq $p) {
+                  Write-Host 'QEMU exited after guest shutdown.'
+                  break
+              }
+              Start-Sleep -Seconds 5
+          }
+
+          $p = Get-Process -Id ([int]$env:QEMU_PID) -ErrorAction SilentlyContinue
+          if ($null -ne $p) {
+              Write-Host 'Guest did not shut down within 120 seconds; stopping QEMU process.' -ForegroundColor Yellow
+              Stop-Process -Id ([int]$env:QEMU_PID) -Force
+              Start-Sleep -Seconds 3
+          }
+
+      # ======================================================================
+      # 14. Prepare Full-System Image on First Run
+      # ======================================================================
+      - name: 14. Capture First-Run System Disk With Disk2vhd
+        id: capture_image
+        if: steps.detect_backup.outputs.HAS_BACKUP != 'true' && steps.keep_alive.outcome == 'success'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $disk2vhdZip = "$env:BACKUP_ROOT\disk2vhd.zip"
+          $disk2vhdDir = "$env:BACKUP_ROOT\disk2vhd"
+          $imagePath = "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
+
+          Write-Host 'Downloading Microsoft Sysinternals Disk2vhd...'
+          Invoke-WebRequest `
+            -Uri 'https://download.sysinternals.com/files/Disk2vhd.zip' `
+            -OutFile $disk2vhdZip
+
+          if (Test-Path $disk2vhdDir) {
+              Remove-Item $disk2vhdDir -Recurse -Force
+          }
+
+          Expand-Archive -Path $disk2vhdZip -DestinationPath $disk2vhdDir -Force
+          $disk2vhd = Get-ChildItem $disk2vhdDir -Filter 'disk2vhd64.exe' -Recurse | Select-Object -First 1
+
+          if ($null -eq $disk2vhd) {
+              throw 'disk2vhd64.exe was not found.'
+          }
+
+          Write-Host 'Checking free disk space before capture...'
+          $free = (Get-PSDrive -Name C).Free
+          Write-Host "Free C: space = $free bytes"
+
+          if ($free -lt 5000000000) {
+              throw 'Less than 5 GB free space is available. A full-system VHDX capture cannot safely proceed.'
+          }
+
+          if (Test-Path $imagePath) {
+              Remove-Item $imagePath -Force
+          }
+
+          Write-Host 'Creating full-system VHDX from all volumes...'
+          & $disk2vhd.FullName '*' $imagePath
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Disk2vhd failed with exit code $LASTEXITCODE"
+          }
+
+          if (-not (Test-Path -LiteralPath $imagePath)) {
+              throw 'Disk2vhd did not create the VHDX.'
+          }
+
+          $imageBytes = (Get-Item $imagePath).Length
+          Write-Host "Captured VHDX size: $imageBytes bytes"
+
+      # ======================================================================
+      # 15. Use Existing Restored VHDX as Current Image
+      # ======================================================================
+      - name: 15. Verify Restored VHDX After Guest Shutdown
+        if: steps.detect_backup.outputs.HAS_BACKUP == 'true' && steps.keep_alive.outcome == 'success'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $imagePath = "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
+          if (-not (Test-Path -LiteralPath $imagePath)) {
+              throw 'Restored VHDX is missing after guest shutdown.'
+          }
+
+          $size = (Get-Item $imagePath).Length
+          Write-Host "Current restored VHDX size: $size bytes"
+
+      # ======================================================================
+      # 16. Encrypt / Compress Image
+      # ======================================================================
+      - name: 16. Encrypt and Compress Image
+        id: pack_image
+        if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+        shell: powershell
+        env:
+          BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:BACKUP_ENCRYPTION_PASSWORD)) {
+              throw 'Secret BACKUP_ENCRYPTION_PASSWORD is required.'
+          }
+
+          choco install 7zip -y --no-progress
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+          if (-not (Test-Path -LiteralPath $sevenZip)) { throw '7-Zip executable was not found.' }
+          $imagePath = "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
+          $archivePath = "$env:BACKUP_ROOT\windows-rdp.vhdx.7z"
+
+          if (-not (Test-Path -LiteralPath $imagePath)) {
+              throw "Image not found: $imagePath"
+          }
+
+          if (Test-Path $archivePath) {
+              Remove-Item $archivePath -Force
+          }
+
+          Write-Host 'Creating AES-256 encrypted archive...'
+          & $sevenZip a -t7z -mx=1 -mhe=on "-p$env:BACKUP_ENCRYPTION_PASSWORD" $archivePath $imagePath
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "7-Zip archive creation failed: $LASTEXITCODE"
+          }
+
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+          $bytes = (Get-Item $archivePath).Length
+
+          "ARCHIVE_SHA256=$sha" >> $env:GITHUB_ENV
+          "ARCHIVE_BYTES=$bytes" >> $env:GITHUB_ENV
+
+          Write-Host "Encrypted archive size: $bytes bytes"
+          Write-Host "Encrypted archive SHA256: $sha"
+
+      # ======================================================================
+      # 17. Split Encrypted Archive Into <= 2 GB Parts
+      # ======================================================================
+      - name: 17. Split Archive Into 2 GB Parts
+        id: split_archive
+        if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $archivePath = "$env:BACKUP_ROOT\windows-rdp.vhdx.7z"
+          $partBytes = [int64]$env:BACKUP_PART_BYTES
+          $generation = "$env:GITHUB_RUN_ID"
+          $partsDir = "$env:BACKUP_ROOT\parts"
+          $prefix = "windows-rdp-$generation-part-"
+
+          if (Test-Path $partsDir) {
+              Remove-Item $partsDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $partsDir -Force | Out-Null
+
+          $input = [System.IO.File]::OpenRead($archivePath)
+          try {
+              $buffer = New-Object byte[] (4MB)
+              $partIndex = 1
+              while ($input.Position -lt $input.Length) {
+                  $partPath = Join-Path $partsDir ("{0}{1:D5}" -f $prefix, $partIndex)
+                  $output = [System.IO.File]::Open($partPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+                  try {
+                      $remaining = $partBytes
+                      while ($remaining -gt 0 -and $input.Position -lt $input.Length) {
+                          $want = [int][Math]::Min($buffer.Length, $remaining)
+                          $read = $input.Read($buffer, 0, $want)
+                          if ($read -le 0) { break }
+                          $output.Write($buffer, 0, $read)
+                          $remaining -= $read
+                      }
+                  }
+                  finally {
+                      $output.Dispose()
+                  }
+                  Write-Host "Created part $partIndex: $partPath ($((Get-Item $partPath).Length) bytes)"
+                  $partIndex++
+              }
+          }
+          finally {
+              $input.Dispose()
+          }
+
+          $parts = Get-ChildItem $partsDir -File | Sort-Object Name
+          if ($parts.Count -lt 1) {
+              throw 'No archive parts were created.'
+          }
+
+          foreach ($part in $parts) {
+              if ($part.Length -gt $partBytes) {
+                  throw "Part exceeds configured maximum: $($part.Name)"
+              }
+          }
+
+          "BACKUP_GENERATION=$generation" >> $env:GITHUB_ENV
+          "BACKUP_PREFIX=$prefix" >> $env:GITHUB_ENV
+          "BACKUP_PART_COUNT=$($parts.Count)" >> $env:GITHUB_ENV
+
+          Write-Host "Total parts: $($parts.Count)"
+
+      # ======================================================================
+      # 18. Build Manifest
+      # ======================================================================
+      - name: 18. Build Backup Manifest
+        if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $partsDir = "$env:BACKUP_ROOT\parts"
+          $parts = Get-ChildItem $partsDir -File | Sort-Object Name
+
+          $manifest = [ordered]@{
+              schema_version   = 1
+              generation       = [string]$env:BACKUP_GENERATION
+              archive_name     = 'windows-rdp.vhdx.7z'
+              archive_bytes    = [int64]$env:ARCHIVE_BYTES
+              sha256           = [string]$env:ARCHIVE_SHA256
+              part_bytes_max   = [int64]$env:BACKUP_PART_BYTES
+              part_count       = [int]$parts.Count
+              created_utc      = (Get-Date).ToUniversalTime().ToString('o')
+              image_name       = 'windows-rdp.vhdx'
+              notes            = 'Full-system VHDX captured from the GitHub-hosted runner on first run, then persisted as a QEMU guest image.'
+          }
+
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content `
+            -LiteralPath "$env:BACKUP_ROOT\$env:BACKUP_MANIFEST_NAME" `
+            -Encoding utf8
+
+          Get-Content "$env:BACKUP_ROOT\$env:BACKUP_MANIFEST_NAME"
+
+      # ======================================================================
+      # 19. Create Fixed Release If Needed
+      # ======================================================================
+      - name: 19. Create Fixed GitHub Release
+        if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          gh release view $env:BACKUP_RELEASE_TAG > $null 2>&1
+          if ($LASTEXITCODE -ne 0) {
+              gh release create $env:BACKUP_RELEASE_TAG `
+                --title 'Windows RDP Persistent Backup' `
+                --notes 'This release stores the latest encrypted Windows disk image split into GitHub Release assets. The workflow replaces the assets on each successful backup.'
+          }
+
+      # ======================================================================
+      # 20. Upload New Parts and Manifest
+      # ======================================================================
+      - name: 20. Upload New Backup Parts
+        if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $partsDir = "$env:BACKUP_ROOT\parts"
+          $manifestPath = "$env:BACKUP_ROOT\$env:BACKUP_MANIFEST_NAME"
+          $parts = Get-ChildItem $partsDir -File | Sort-Object Name
+
+          Write-Host "Uploading $($parts.Count) parts..."
+          foreach ($part in $parts) {
+              gh release upload $env:BACKUP_RELEASE_TAG $part.FullName --clobber
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to upload $($part.Name)"
+              }
+          }
+
+          gh release upload $env:BACKUP_RELEASE_TAG $manifestPath --clobber
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Failed to upload backup manifest.'
+          }
+
+      # ======================================================================
+      # 21. Remove Stale Backup Assets
+      # ======================================================================
+      - name: 21. Remove Stale Backup Assets
+        if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $currentGeneration = [string]$env:BACKUP_GENERATION
+          $release = gh release view $env:BACKUP_RELEASE_TAG --json assets | ConvertFrom-Json
+
+          foreach ($asset in $release.assets) {
+              $name = [string]$asset.name
+
+              if ($name -like 'windows-rdp-*-part-*' -and $name -notlike "windows-rdp-$currentGeneration-part-*") {
+                  Write-Host "Deleting stale asset: $name"
+                  gh release delete-asset $env:BACKUP_RELEASE_TAG $name --yes
+              }
+          }
+
+          # Remove an old manifest only if it is not the current manifest name.
+          # The current manifest is always overwritten using --clobber.
+
+      # ======================================================================
+      # 22. Verify Release Manifest and Parts
+      # ======================================================================
+      - name: 22. Verify Published Backup
+        if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $release = gh release view $env:BACKUP_RELEASE_TAG --json assets | ConvertFrom-Json
+          $manifestAsset = $release.assets | Where-Object { $_.name -eq $env:BACKUP_MANIFEST_NAME }
+
+          if ($null -eq $manifestAsset) {
+              throw 'Published release manifest was not found.'
+          }
+
+          $prefix = [string]$env:BACKUP_PREFIX
+          $parts = $release.assets | Where-Object { $_.name -like "$prefix*" }
+
+          if ($parts.Count -ne [int]$env:BACKUP_PART_COUNT) {
+              throw "Published part count mismatch. Expected $env:BACKUP_PART_COUNT, found $($parts.Count)."
+          }
+
+          Write-Host "Published release verified. Parts: $($parts.Count)"
+
+      # ======================================================================
+      # 23. Cleanup Large Local Files
+      # ======================================================================
+      - name: 23. Cleanup Large Local Files
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          Write-Host 'Cleaning local image/archive files...'
+
+          Remove-Item "$env:BACKUP_ROOT\windows-rdp.vhdx.7z" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:BACKUP_ROOT\image\windows-rdp.vhdx" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:BACKUP_ROOT\download" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:BACKUP_ROOT\parts" -Recurse -Force -ErrorAction SilentlyContinue
+
+      # ======================================================================
+      # 24. Final Summary
+      # ======================================================================
+      - name: 24. Final Summary
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          Write-Host ''
+          Write-Host '==================================================' -ForegroundColor Green
+          Write-Host 'FINAL WINDOWS RDP WORKFLOW SUMMARY' -ForegroundColor Green
+          Write-Host '==================================================' -ForegroundColor Green
+          Write-Host "Run ID             : $env:GITHUB_RUN_ID"
+          Write-Host "Runner              : $env:RUNNER_OS"
+          Write-Host "Existing Backup     : ${{ steps.detect_backup.outputs.HAS_BACKUP }}"
+          Write-Host "Keep Alive          : ${{ steps.keep_alive.outcome }}"
+          Write-Host "Image Capture       : ${{ steps.capture_image.outcome }}"
+          Write-Host "Release Tag         : $env:BACKUP_RELEASE_TAG"
+          Write-Host "Part Size Maximum   : $env:BACKUP_PART_BYTES bytes"
+          Write-Host "Backup Generation   : $env:BACKUP_GENERATION"
+          Write-Host '==================================================' -ForegroundColor Green
