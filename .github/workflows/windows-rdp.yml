@@ -13,7 +13,7 @@ jobs:
 
     runs-on: windows-latest
 
-    # Setup + RDP lifetime + workspace save need more than 5 minutes.
+    # Setup + RDP session + workspace synchronization + cache save.
     timeout-minutes: 15
 
     permissions:
@@ -30,7 +30,7 @@ jobs:
 
 
       # ============================================================
-      # 2. Restore Workspace From Previous Run
+      # 2. Restore Previous Persistent Workspace
       # ============================================================
       - name: 2. Restore Persistent Workspace
         id: restore_workspace
@@ -38,54 +38,58 @@ jobs:
         with:
           path: ${{ github.workspace }}\workspace
 
-          # Unique key for THIS run.
+          # Every workflow run gets a unique cache key.
           #
-          # This key normally does not exist yet.
-          # The restore-keys below finds the newest previous cache.
+          # GitHub Actions caches are immutable, so we CANNOT
+          # reuse the same key when saving.
           key: cynet-rdp-workspace-${{ runner.os }}-${{ github.run_id }}
 
+          # Find the newest previous workspace cache.
           restore-keys: |
             cynet-rdp-workspace-${{ runner.os }}-
 
 
       # ============================================================
-      # 3. Prepare Workspace
+      # 3. Prepare Persistent Workspace
       # ============================================================
-      - name: 3. Prepare Workspace
+      - name: 3. Prepare Persistent Workspace
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
 
           $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
+          $DesktopBackup = Join-Path $Workspace 'Desktop'
 
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "WORKSPACE"
+          Write-Host "PERSISTENT WORKSPACE"
           Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host "Path: $Workspace"
+          Write-Host "Workspace     : $Workspace"
+          Write-Host "Desktop Backup: $DesktopBackup"
           Write-Host ""
 
+          # Create workspace if it does not exist.
           if (-not (Test-Path -LiteralPath $Workspace)) {
-
-              Write-Host "Workspace does not exist."
-              Write-Host "Creating workspace..."
-
               New-Item `
                 -ItemType Directory `
                 -Path $Workspace `
                 -Force | Out-Null
           }
-          else {
 
-              Write-Host "Workspace restored."
+          # Create Desktop backup directory.
+          if (-not (Test-Path -LiteralPath $DesktopBackup)) {
+              New-Item `
+                -ItemType Directory `
+                -Path $DesktopBackup `
+                -Force | Out-Null
           }
 
+          Write-Host "Cache restore result:"
+          Write-Host "Exact cache hit: ${{ steps.restore_workspace.outputs.cache-hit }}"
+          Write-Host "Restored key   : ${{ steps.restore_workspace.outputs.cache-matched-key }}"
           Write-Host ""
-          Write-Host "Restore cache result:"
-          Write-Host "Cache hit: ${{ steps.restore_workspace.outputs.cache-hit }}"
 
-          Write-Host ""
-          Write-Host "Workspace contents:"
+          Write-Host "Persistent workspace contents:"
           Write-Host "--------------------------------------------------"
 
           Get-ChildItem `
@@ -120,11 +124,11 @@ jobs:
             -Name 'UserAuthentication' `
             -Value 1
 
-          # Enable Remote Desktop firewall rules.
+          # Enable RDP firewall rules.
           Enable-NetFirewallRule `
             -DisplayGroup 'Remote Desktop'
 
-          # Make sure TermService is running.
+          # Start Remote Desktop service.
           Set-Service `
             -Name 'TermService' `
             -StartupType Automatic
@@ -137,8 +141,7 @@ jobs:
 
           $Service = Get-Service -Name 'TermService'
 
-          Write-Host ""
-          Write-Host "Remote Desktop service status: $($Service.Status)"
+          Write-Host "TermService status: $($Service.Status)"
 
           if ($Service.Status -ne 'Running') {
               throw "Remote Desktop service is not running."
@@ -148,9 +151,9 @@ jobs:
 
 
       # ============================================================
-      # 5. Create RDP Administrator
+      # 5. Create RDP Administrator Account
       # ============================================================
-      - name: 5. Create RDP Administrator
+      - name: 5. Create RDP Administrator Account
         shell: powershell
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -204,19 +207,112 @@ jobs:
             -Member $Username `
             -ErrorAction SilentlyContinue
 
-          # RDP access.
+          # Explicit RDP permission.
           Add-LocalGroupMember `
             -Group 'Remote Desktop Users' `
             -Member $Username `
             -ErrorAction SilentlyContinue
 
-          Write-Host "RDP user configured."
+          Write-Host "RDP user configured successfully."
 
 
       # ============================================================
-      # 6. Install Tailscale
+      # 6. Prepare CynetAdmin Desktop
       # ============================================================
-      - name: 6. Install Tailscale
+      - name: 6. Prepare CynetAdmin Desktop
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $Username = 'CynetAdmin'
+
+          $UserProfile = Join-Path 'C:\Users' $Username
+          $Desktop = Join-Path $UserProfile 'Desktop'
+
+          $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
+          $DesktopBackup = Join-Path $Workspace 'Desktop'
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "CynetAdmin DESKTOP RESTORE"
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "User profile : $UserProfile"
+          Write-Host "Desktop      : $Desktop"
+          Write-Host "Backup       : $DesktopBackup"
+          Write-Host ""
+
+          # Make sure the user profile directory exists.
+          if (-not (Test-Path -LiteralPath $UserProfile)) {
+              New-Item `
+                -ItemType Directory `
+                -Path $UserProfile `
+                -Force | Out-Null
+          }
+
+          # Make sure Desktop exists.
+          if (-not (Test-Path -LiteralPath $Desktop)) {
+              New-Item `
+                -ItemType Directory `
+                -Path $Desktop `
+                -Force | Out-Null
+          }
+
+          # Make sure backup exists.
+          if (-not (Test-Path -LiteralPath $DesktopBackup)) {
+              New-Item `
+                -ItemType Directory `
+                -Path $DesktopBackup `
+                -Force | Out-Null
+          }
+
+          Write-Host "Restoring Desktop from persistent workspace..."
+
+          # /MIR makes the Desktop match the saved Desktop exactly.
+          #
+          # /E       = copy subdirectories
+          # /COPY:DAT = data, attributes, timestamps
+          # /DCOPY:DAT = directory data, attributes, timestamps
+          # /R:2     = retry twice
+          # /W:1     = wait 1 second between retries
+          #
+          # The backup is ONLY the user's Desktop.
+          # It does not affect the rest of the workspace.
+          robocopy `
+            $DesktopBackup `
+            $Desktop `
+            /MIR `
+            /COPY:DAT `
+            /DCOPY:DAT `
+            /R:2 `
+            /W:1 `
+            /XJ
+
+          # Robocopy exit codes 0-7 are normally successful.
+          if ($LASTEXITCODE -gt 7) {
+              throw "Desktop restore failed. Robocopy exit code: $LASTEXITCODE"
+          }
+
+          Write-Host ""
+          Write-Host "Desktop restored successfully."
+
+          Write-Host ""
+          Write-Host "Current CynetAdmin Desktop:"
+          Write-Host "--------------------------------------------------"
+
+          Get-ChildItem `
+            -LiteralPath $Desktop `
+            -Force `
+            -ErrorAction SilentlyContinue |
+            Select-Object Mode, Length, LastWriteTime, Name |
+            Format-Table -AutoSize
+
+          Write-Host "--------------------------------------------------"
+
+
+      # ============================================================
+      # 7. Install Tailscale
+      # ============================================================
+      - name: 7. Install Tailscale
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -251,9 +347,9 @@ jobs:
               throw "Tailscale installation failed. Exit code: $($InstallProcess.ExitCode)"
           }
 
-          Write-Host "Tailscale MSI installation completed."
+          Write-Host "Tailscale installation completed."
 
-          # Wait for executable.
+          # Wait for tailscale.exe.
           $TimeoutSeconds = 60
           $ElapsedSeconds = 0
 
@@ -264,7 +360,6 @@ jobs:
               }
 
               Start-Sleep -Seconds 2
-
               $ElapsedSeconds += 2
           }
 
@@ -272,9 +367,9 @@ jobs:
 
 
       # ============================================================
-      # 7. Connect Tailscale
+      # 8. Connect Tailscale
       # ============================================================
-      - name: 7. Connect Tailscale
+      - name: 8. Connect Tailscale
         shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY_WIN_1 }}
@@ -297,18 +392,24 @@ jobs:
 
           Write-Host "Connecting to Tailscale..."
 
+          # --ephemeral is important here.
+          #
+          # GitHub-hosted runners are temporary machines.
+          # Without --ephemeral, every new runner can leave a
+          # stale Windows device in your Tailscale network.
           & $Tailscale up `
             --authkey="$env:TAILSCALE_AUTHKEY" `
             --hostname='github-rdp-server' `
-            --accept-dns=true
+            --accept-dns=true `
+            --ephemeral
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Tailscale up failed. Exit code: $LASTEXITCODE"
+              throw "Tailscale connection failed. Exit code: $LASTEXITCODE"
           }
 
           Write-Host "Tailscale connection established."
 
-          # Wait for IP.
+          # Wait for IPv4.
           $TailscaleIP = ''
 
           for ($i = 1; $i -le 15; $i++) {
@@ -346,14 +447,14 @@ jobs:
 
 
       # ============================================================
-      # 8. Verify RDP
+      # 9. Verify RDP
       # ============================================================
-      - name: 8. Verify RDP
+      - name: 9. Verify RDP
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
 
-          Write-Host "Checking RDP..."
+          Write-Host "Checking RDP configuration..."
 
           $RdpDenied = Get-ItemPropertyValue `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
@@ -385,9 +486,9 @@ jobs:
 
 
       # ============================================================
-      # 9. Keep RDP Server Alive For 2 Minutes
+      # 10. Keep RDP Server Alive For 2 Minutes
       # ============================================================
-      - name: 9. Keep RDP Server Alive For 2 Minutes
+      - name: 10. Keep RDP Server Alive For 2 Minutes
         shell: powershell
         run: |
           $TotalSeconds = 120
@@ -413,21 +514,97 @@ jobs:
 
 
       # ============================================================
-      # 10. Save Workspace For Next Run
+      # 11. Save CynetAdmin Desktop To Persistent Workspace
       # ============================================================
-      - name: 10. Save Workspace For Next Run
+      - name: 11. Save Desktop To Persistent Workspace
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $Username = 'CynetAdmin'
+
+          $UserProfile = Join-Path 'C:\Users' $Username
+          $Desktop = Join-Path $UserProfile 'Desktop'
+
+          $Workspace = Join-Path $env:GITHUB_WORKSPACE 'workspace'
+          $DesktopBackup = Join-Path $Workspace 'Desktop'
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "SAVING CynetAdmin DESKTOP"
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "Source : $Desktop"
+          Write-Host "Target : $DesktopBackup"
+          Write-Host ""
+
+          if (-not (Test-Path -LiteralPath $Desktop)) {
+              Write-Host "Desktop does not exist. Creating it..."
+
+              New-Item `
+                -ItemType Directory `
+                -Path $Desktop `
+                -Force | Out-Null
+          }
+
+          if (-not (Test-Path -LiteralPath $DesktopBackup)) {
+              New-Item `
+                -ItemType Directory `
+                -Path $DesktopBackup `
+                -Force | Out-Null
+          }
+
+          Write-Host "Synchronizing Desktop..."
+
+          # /MIR ensures that deletions on the Desktop are also
+          # reflected in the persistent backup.
+          robocopy `
+            $Desktop `
+            $DesktopBackup `
+            /MIR `
+            /COPY:DAT `
+            /DCOPY:DAT `
+            /R:2 `
+            /W:1 `
+            /XJ
+
+          # Robocopy exit codes 0-7 are successful.
+          if ($LASTEXITCODE -gt 7) {
+              throw "Desktop backup failed. Robocopy exit code: $LASTEXITCODE"
+          }
+
+          Write-Host ""
+          Write-Host "Desktop saved successfully."
+
+          Write-Host ""
+          Write-Host "Files being persisted:"
+          Write-Host "--------------------------------------------------"
+
+          Get-ChildItem `
+            -LiteralPath $DesktopBackup `
+            -Force `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+
+          Write-Host "--------------------------------------------------"
+
+
+      # ============================================================
+      # 12. Save Persistent Workspace To GitHub Cache
+      # ============================================================
+      - name: 12. Save Workspace For Next Run
         if: always()
         uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}\workspace
 
           # IMPORTANT:
-          # GitHub cache entries are immutable.
-          # Therefore every run receives a unique key.
           #
-          # The NEXT run's restore step searches using:
+          # GitHub Actions cache entries are immutable.
+          # Therefore every run receives a unique cache key.
           #
-          # cynet-rdp-workspace-Windows-
-          #
-          # and restores the newest matching cache.
+          # The next workflow run uses restore-keys to find
+          # this cache and restore it.
           key: cynet-rdp-workspace-${{ runner.os }}-${{ github.run_id }}
