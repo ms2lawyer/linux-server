@@ -11,8 +11,6 @@ jobs:
     steps:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
-      
-	  # بازیابی هارد ابری دائمی
       - name: 2. Restore Persistent Workspace
         uses: actions/cache@v4
         with:
@@ -94,8 +92,7 @@ jobs:
           for ($i = 1; $i -le 360; $i++) {
             Start-Sleep -Seconds 60
             Write-Host "[$i/360] Server running..."
-          }
-      # ذخیره خودکار فایل‌های پوشه دائمی قبل از ری‌استارت
+          }      
       - name: 7. Save Workspace to Cloud
         uses: actions/cache@v4
         if: always()
