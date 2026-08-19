@@ -77,6 +77,9 @@ jobs:
 
       # ======================================================================
       # 3. Detect and Restore Latest Release Backup
+      #
+      # IMPORTANT:
+      #   Missing release = FIRST RUN, NOT an error.
       # ======================================================================
       - name: 3. Detect Latest GitHub Release Backup
         id: detect_backup
@@ -87,40 +90,126 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           $manifestPath = "$env:BACKUP_ROOT\download\$env:BACKUP_MANIFEST_NAME"
+          $releaseJsonPath = "$env:BACKUP_ROOT\release.json"
           $hasBackup = $false
 
-          gh release view $env:BACKUP_RELEASE_TAG --json isDraft,isPrerelease,assets |
-            Out-File -FilePath "$env:BACKUP_ROOT\release.json" -Encoding utf8
+          Write-Host "Checking for persistent backup release..."
+          Write-Host "Release tag: $env:BACKUP_RELEASE_TAG"
 
-          if ($LASTEXITCODE -eq 0) {
-              $release = Get-Content "$env:BACKUP_ROOT\release.json" -Raw | ConvertFrom-Json
-              $manifestAsset = $release.assets | Where-Object { $_.name -eq $env:BACKUP_MANIFEST_NAME } | Select-Object -First 1
+          # ---------------------------------------------------------------
+          # A missing release is EXPECTED on the first run.
+          # Do not allow gh's exit code 1 to fail this PowerShell step.
+          # ---------------------------------------------------------------
+          & gh release view $env:BACKUP_RELEASE_TAG `
+              --json isDraft,isPrerelease,assets `
+              > $releaseJsonPath 2>$null
+
+          $releaseExitCode = $LASTEXITCODE
+
+          if ($releaseExitCode -eq 0) {
+
+              Write-Host "Persistent release found."
+
+              try {
+                  $release = Get-Content `
+                      -LiteralPath $releaseJsonPath `
+                      -Raw |
+                      ConvertFrom-Json
+              }
+              catch {
+                  throw "GitHub release information could not be parsed: $($_.Exception.Message)"
+              }
+
+              $manifestAsset = $release.assets |
+                  Where-Object {
+                      $_.name -eq $env:BACKUP_MANIFEST_NAME
+                  } |
+                  Select-Object -First 1
 
               if ($null -ne $manifestAsset) {
                   $hasBackup = $true
+                  Write-Host "Persistent backup manifest found."
+              }
+              else {
+                  Write-Host "Release exists, but backup manifest is missing."
+                  Write-Host "Treating this as FIRST RUN."
               }
           }
+          else {
 
-          "HAS_BACKUP=$($hasBackup.ToString().ToLower())" >> $env:GITHUB_OUTPUT
-          Write-Host "Existing persistent release backup: $hasBackup"
+              # -----------------------------------------------------------
+              # This is the normal FIRST-RUN condition.
+              # gh returns exit code 1 when the release does not exist.
+              # -----------------------------------------------------------
+              Write-Host "No persistent release exists."
+              Write-Host "This is the FIRST RUN. A new Windows image will be created."
+          }
 
+          # ---------------------------------------------------------------
+          # CRITICAL:
+          # gh may have left LASTEXITCODE = 1.
+          # Reset it so GitHub Actions does NOT fail this step.
+          # ---------------------------------------------------------------
+          $global:LASTEXITCODE = 0
+
+          "HAS_BACKUP=$($hasBackup.ToString().ToLowerInvariant())" |
+              Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "Persistent Backup Detection"
+          Write-Host "=============================================="
+          Write-Host "Release tag : $env:BACKUP_RELEASE_TAG"
+          Write-Host "Has backup  : $hasBackup"
+          Write-Host "First run   : $(-not $hasBackup)"
+          Write-Host "=============================================="
+          Write-Host ""
+
+          # ---------------------------------------------------------------
+          # Existing backup: download and validate manifest.
+          # First run: simply continue.
+          # ---------------------------------------------------------------
           if ($hasBackup) {
-              gh release download $env:BACKUP_RELEASE_TAG `
-                --pattern $env:BACKUP_MANIFEST_NAME `
-                --dir "$env:BACKUP_ROOT\download" `
-                --clobber
+
+              Write-Host "Downloading backup manifest..."
+
+              & gh release download $env:BACKUP_RELEASE_TAG `
+                  --pattern $env:BACKUP_MANIFEST_NAME `
+                  --dir "$env:BACKUP_ROOT\download" `
+                  --clobber
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to download the persistent backup manifest."
+              }
 
               if (-not (Test-Path -LiteralPath $manifestPath)) {
                   throw "Release manifest could not be downloaded."
               }
 
-              $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
-              Write-Host "Backup generation : $($manifest.generation)"
-              Write-Host "Part count        : $($manifest.part_count)"
-              Write-Host "Archive size      : $($manifest.archive_bytes) bytes"
-              Write-Host "SHA256            : $($manifest.sha256)"
-          }
+              $manifest = Get-Content `
+                  -LiteralPath $manifestPath `
+                  -Raw |
+                  ConvertFrom-Json
 
+              Write-Host ""
+              Write-Host "Existing backup information:"
+              Write-Host "  Backup generation : $($manifest.generation)"
+              Write-Host "  Part count        : $($manifest.part_count)"
+              Write-Host "  Archive size      : $($manifest.archive_bytes) bytes"
+              Write-Host "  SHA256            : $($manifest.sha256)"
+              Write-Host ""
+
+              $global:LASTEXITCODE = 0
+          }
+          else {
+
+              Write-Host "No backup found."
+              Write-Host "Continuing with FIRST-RUN initialization..."
+              Write-Host ""
+
+              # Explicitly guarantee success of this step.
+              $global:LASTEXITCODE = 0
+          }
       # ======================================================================
       # 4. Download and Reassemble Previous Image
       # ======================================================================
