@@ -1,47 +1,44 @@
 # ============================================================================
 # Windows Cloud RDP — Persistent Disk Image via GitHub Release
 #
-# TEST VERSION
+# Persistence test workflow
 #
-# Purpose:
-#   Test whether a Windows runner can be captured into a VHDX and restored
-#   on a future GitHub Actions runner.
-#
-# First run:
-#   1. Start Windows runner.
+# FIRST RUN:
+#   1. GitHub Windows runner starts.
 #   2. Configure RDP.
-#   3. Create a uniquely named test file on Desktop.
-#   4. Keep runner alive for 2 minutes.
-#   5. Capture complete Windows system disk with Disk2vhd.
-#   6. Compress + encrypt VHDX.
-#   7. Split archive into <= 2,000,000,000 byte parts.
-#   8. Upload parts + manifest to one fixed GitHub Release.
+#   3. Configure Tailscale.
+#   4. Create a timestamped test file on Desktop with random content.
+#   5. Keep the Windows environment alive.
+#   6. Capture the runner system disk using Disk2vhd.
+#   7. Compress + encrypt the VHDX.
+#   8. Split archive into <= 2,000,000,000 byte parts.
+#   9. Upload parts + manifest to one fixed GitHub Release.
 #
-# Subsequent run:
-#   1. Detect persistent GitHub Release.
-#   2. Download manifest + archive parts.
-#   3. Reassemble archive.
-#   4. Verify SHA256.
-#   5. Decrypt/extract VHDX.
-#   6. Boot restored Windows in QEMU.
-#   7. Expose guest RDP through host Tailscale.
+# NEXT RUN:
+#   1. Detect persistent Release.
+#   2. Download manifest.
+#   3. Download all matching archive parts.
+#   4. Reassemble archive.
+#   5. Verify SHA256.
+#   6. Extract VHDX.
+#   7. Boot VHDX using QEMU.
+#   8. Expose guest RDP through Tailscale.
+#   9. The previous Desktop persistence-test file should exist
+#      inside the restored Windows image.
 #
 # IMPORTANT:
-#   This is a TEST workflow.
-#   SESSION_MINUTES is intentionally only 2 minutes.
-#
+#   A GitHub-hosted runner cannot be physically powered off and then continue
+#   executing later workflow steps. Therefore Step 14 captures the live runner
+#   using Disk2vhd/VSS. This is the correct test model for this workflow.
 # ============================================================================
 
-name: Windows Cloud RDP - Persistence Test
+name: Windows Cloud RDP - Release Persistence
 
 on:
-  workflow_dispatch:
-
-  # Temporary test schedule.
-  # Every 30 minutes instead of every 5 minutes to avoid overlapping
-  # persistence tests while debugging.
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/5 * * * *'
+
+  workflow_dispatch:
 
 concurrency:
   group: windows-cloud-rdp
@@ -55,42 +52,34 @@ env:
   BACKUP_RELEASE_TAG: windows-rdp-persistent
   BACKUP_MANIFEST_NAME: windows-rdp-manifest.json
 
-  # GitHub Release asset safety limit.
-  # Keep each part below 2 GiB.
+  # Must remain below GitHub's individual release asset limit.
   BACKUP_PART_BYTES: '2000000000'
 
   BACKUP_ROOT: C:\WindowsRdpPersistence
 
-  # Host -> QEMU guest RDP forwarding.
+  # QEMU guest RDP is exposed through this host port.
   QEMU_RDP_PORT: '33989'
 
   # QEMU QMP control port.
   QEMU_QMP_PORT: '4444'
 
-  # TEST ONLY:
-  # Keep the Windows runner alive for only 2 minutes before backup.
-  SESSION_MINUTES: '2'
+  # Current test duration.
+  SESSION_MINUTES: '350'
 
   TAILSCALE_HOSTNAME: github-rdp-host
+
 
 jobs:
 
   # ==========================================================================
-  # JOB
+  # MAIN WINDOWS RDP JOB
   # ==========================================================================
 
   rdp-server:
 
     runs-on: windows-latest
 
-    # Give enough time for:
-    # - Windows startup
-    # - Disk2vhd
-    # - 7-Zip
-    # - upload
-    #
-    # The session itself is only 2 minutes.
-    timeout-minutes: 30
+    timeout-minutes: 360
 
     steps:
 
@@ -109,6 +98,7 @@ jobs:
       - name: 2. Prepare Persistence Workspace
         shell: powershell
         run: |
+
           $ErrorActionPreference = 'Stop'
 
           Write-Host ''
@@ -143,35 +133,46 @@ jobs:
           Write-Host "Persistence root: $env:BACKUP_ROOT"
 
           Write-Host ''
-          Write-Host 'Current disk space:'
+          Write-Host 'Current C: disk space:'
 
           Get-PSDrive -Name C |
             Select-Object Name, Used, Free |
-            Format-List
+            Format-Table -AutoSize
 
 
       # ======================================================================
       # 3. Detect Existing Persistent Backup
       #
       # IMPORTANT:
+      # gh.exe writes "release not found" to stderr and PowerShell can treat
+      # that stderr output as a NativeCommandError.
       #
-      # Missing release is NORMAL on first run.
-      #
-      # We deliberately execute gh through cmd.exe because Windows
-      # PowerShell 5.1 can turn native stderr into NativeCommandError when
-      # ErrorActionPreference = Stop.
+      # Therefore gh is executed through cmd.exe and stderr is redirected.
+      # A missing release is treated as NORMAL FIRST RUN.
       # ======================================================================
 
-      - name: 3. Detect Existing Persistent Backup
+      - name: 3. Detect Persistent Backup
         id: detect_backup
         shell: powershell
+
         env:
           GH_TOKEN: ${{ github.token }}
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          $manifestPath = "$env:BACKUP_ROOT\download\$env:BACKUP_MANIFEST_NAME"
-          $releaseJsonPath = "$env:BACKUP_ROOT\release.json"
+          $manifestPath = Join-Path `
+            $env:BACKUP_ROOT `
+            "download\$env:BACKUP_MANIFEST_NAME"
+
+          $releaseJsonPath = Join-Path `
+            $env:BACKUP_ROOT `
+            'release.json'
+
+          $releaseErrorPath = Join-Path `
+            $env:BACKUP_ROOT `
+            'release-error.txt'
 
           $hasBackup = $false
 
@@ -182,84 +183,100 @@ jobs:
 
           Write-Host "Release tag: $env:BACKUP_RELEASE_TAG"
 
-          # ------------------------------------------------------------------
+          # --------------------------------------------------------------
           # Execute gh through CMD.
           #
-          # If release does not exist:
-          #
-          #   gh exit code = 1
-          #
-          # That is expected and means FIRST RUN.
-          # ------------------------------------------------------------------
+          # This prevents PowerShell from converting gh stderr into a
+          # terminating NativeCommandError.
+          # --------------------------------------------------------------
 
-          cmd.exe /c "gh release view `"$env:BACKUP_RELEASE_TAG`" --json isDraft,isPrerelease,assets > `"$releaseJsonPath`" 2>nul"
+          $command = 'gh release view "{0}" --json isDraft,isPrerelease,assets > "{1}" 2> "{2}"' -f `
+            $env:BACKUP_RELEASE_TAG,
+            $releaseJsonPath,
+            $releaseErrorPath
+
+          cmd.exe /c $command
 
           $releaseExitCode = $LASTEXITCODE
 
           Write-Host "gh exit code: $releaseExitCode"
 
-          # ------------------------------------------------------------------
+          # --------------------------------------------------------------
           # Release exists
-          # ------------------------------------------------------------------
+          # --------------------------------------------------------------
 
           if ($releaseExitCode -eq 0) {
 
               Write-Host 'Persistent release found.'
 
               if (-not (Test-Path -LiteralPath $releaseJsonPath)) {
-                  throw 'GitHub returned success but release information was not created.'
+                  throw 'GitHub release command succeeded but release.json was not created.'
               }
 
               try {
+
                   $release = Get-Content `
                     -LiteralPath $releaseJsonPath `
                     -Raw |
                     ConvertFrom-Json
+
               }
               catch {
-                  throw "Could not parse GitHub release information: $($_.Exception.Message)"
+
+                  throw "GitHub release information could not be parsed: $($_.Exception.Message)"
               }
 
               $manifestAsset = $release.assets |
-                Where-Object {
-                    $_.name -eq $env:BACKUP_MANIFEST_NAME
-                } |
-                Select-Object -First 1
+                  Where-Object {
+                      $_.name -eq $env:BACKUP_MANIFEST_NAME
+                  } |
+                  Select-Object -First 1
 
               if ($null -ne $manifestAsset) {
 
                   $hasBackup = $true
 
-                  Write-Host 'Persistent backup manifest found.'
-                  Write-Host 'Existing backup will be restored.'
+                  Write-Host ''
+                  Write-Host 'Persistent backup manifest found.' -ForegroundColor Green
 
               }
               else {
 
-                  Write-Host 'Release exists, but backup manifest is missing.'
-                  Write-Host 'Treating this as FIRST RUN.'
+                  Write-Host ''
+                  Write-Host 'Release exists, but backup manifest is missing.' -ForegroundColor Yellow
+                  Write-Host 'Treating this as FIRST RUN.' -ForegroundColor Yellow
               }
           }
 
-          # ------------------------------------------------------------------
-          # Release does not exist
-          # ------------------------------------------------------------------
+          # --------------------------------------------------------------
+          # Release does not exist.
+          #
+          # This is EXPECTED on the first run.
+          # --------------------------------------------------------------
 
           else {
 
               Write-Host ''
-              Write-Host '==================================================' -ForegroundColor Yellow
-              Write-Host 'NO PERSISTENT BACKUP FOUND' -ForegroundColor Yellow
-              Write-Host '==================================================' -ForegroundColor Yellow
+              Write-Host 'No persistent release exists.' -ForegroundColor Yellow
+              Write-Host 'This is the FIRST RUN.' -ForegroundColor Yellow
+              Write-Host 'A new Windows persistence image will be created.' -ForegroundColor Yellow
 
-              Write-Host "Release '$env:BACKUP_RELEASE_TAG' does not exist."
-              Write-Host 'This is the FIRST RUN.'
-              Write-Host 'Continuing with first-run initialization.'
+              if (Test-Path -LiteralPath $releaseErrorPath) {
+
+                  $errorText = Get-Content `
+                    -LiteralPath $releaseErrorPath `
+                    -Raw `
+                    -ErrorAction SilentlyContinue
+
+                  if (-not [string]::IsNullOrWhiteSpace($errorText)) {
+                      Write-Host "gh message: $($errorText.Trim())" -ForegroundColor DarkYellow
+                  }
+              }
           }
 
-          # ------------------------------------------------------------------
-          # Export output for all following steps.
-          # ------------------------------------------------------------------
+          # --------------------------------------------------------------
+          # Export result to GitHub Actions.
+          # --------------------------------------------------------------
 
           "HAS_BACKUP=$($hasBackup.ToString().ToLowerInvariant())" |
             Out-File `
@@ -267,16 +284,12 @@ jobs:
               -Append `
               -Encoding utf8
 
-          # Never propagate gh's exit code.
-          $global:LASTEXITCODE = 0
-
           Write-Host ''
-          Write-Host '==================================================' -ForegroundColor Green
-          Write-Host 'BACKUP DETECTION RESULT' -ForegroundColor Green
-          Write-Host '==================================================' -ForegroundColor Green
-          Write-Host "Has backup : $hasBackup"
-          Write-Host "First run  : $(-not $hasBackup)"
-          Write-Host '==================================================' -ForegroundColor Green
+          Write-Host "Existing persistent backup: $hasBackup" -ForegroundColor Green
+
+          # CRITICAL:
+          # Always finish this step successfully.
+          $global:LASTEXITCODE = 0
 
 
       # ======================================================================
@@ -286,35 +299,47 @@ jobs:
       - name: 4. Download and Reassemble Previous Image
         if: steps.detect_backup.outputs.HAS_BACKUP == 'true'
         shell: powershell
+
         env:
           GH_TOKEN: ${{ github.token }}
           BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          $manifestPath = "$env:BACKUP_ROOT\download\$env:BACKUP_MANIFEST_NAME"
+          $manifestPath = `
+            "$env:BACKUP_ROOT\download\$env:BACKUP_MANIFEST_NAME"
+
           $manifest = Get-Content `
             -LiteralPath $manifestPath `
             -Raw |
             ConvertFrom-Json
 
           $generation = [string]$manifest.generation
+
           $partCount = [int]$manifest.part_count
 
           $prefix = "windows-rdp-$generation-part-"
 
           $downloadDir = "$env:BACKUP_ROOT\download"
-          $archivePath = "$env:BACKUP_ROOT\image\windows-rdp.7z"
-          $imagePath = "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
+
+          $archivePath = `
+            "$env:BACKUP_ROOT\image\windows-rdp.vhdx.7z"
+
+          $imagePath = `
+            "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
 
           Write-Host ''
           Write-Host '==================================================' -ForegroundColor Cyan
-          Write-Host 'DOWNLOADING PREVIOUS BACKUP' -ForegroundColor Cyan
+          Write-Host 'RESTORING PREVIOUS BACKUP' -ForegroundColor Cyan
           Write-Host '==================================================' -ForegroundColor Cyan
 
           Write-Host "Generation : $generation"
           Write-Host "Part count : $partCount"
           Write-Host "SHA256     : $($manifest.sha256)"
+
+          # Remove old downloaded parts.
 
           Get-ChildItem `
             -LiteralPath $downloadDir `
@@ -324,35 +349,41 @@ jobs:
               -Force `
               -ErrorAction SilentlyContinue
 
-          gh release download $env:BACKUP_RELEASE_TAG `
+          # Download all parts.
+
+          gh release download `
+            $env:BACKUP_RELEASE_TAG `
             --pattern "$prefix*" `
             --dir "$downloadDir" `
             --clobber
 
           if ($LASTEXITCODE -ne 0) {
-              throw 'Failed to download backup parts.'
+              throw 'Failed to download backup archive parts.'
           }
+
+          # Get parts in numerical order.
 
           $parts = Get-ChildItem `
             -LiteralPath $downloadDir `
             -Filter "$prefix*" |
             Sort-Object {
-                [int](($_.Name -replace '^.*-part-(\d+)$', '$1'))
+                [int](
+                    (
+                        $_.Name `
+                        -replace '^.*-part-(\d+)$','$1'
+                    )
+                )
             }
 
           if ($parts.Count -ne $partCount) {
               throw "Expected $partCount backup parts, but downloaded $($parts.Count)."
           }
 
-          # ------------------------------------------------------------------
-          # Reassemble archive
-          # ------------------------------------------------------------------
+          Write-Host "Downloaded parts: $($parts.Count)"
 
-          if (Test-Path -LiteralPath $archivePath) {
-              Remove-Item `
-                -LiteralPath $archivePath `
-                -Force
-          }
+          # Reassemble.
+
+          Write-Host 'Reassembling encrypted archive...'
 
           $out = [System.IO.File]::Open(
               $archivePath,
@@ -364,9 +395,11 @@ jobs:
 
               foreach ($part in $parts) {
 
-                  Write-Host "Appending $($part.Name) ($($part.Length) bytes)"
+                  Write-Host "Appending $($part.Name) - $($part.Length) bytes"
 
-                  $in = [System.IO.File]::OpenRead($part.FullName)
+                  $in = [System.IO.File]::OpenRead(
+                      $part.FullName
+                  )
 
                   try {
                       $in.CopyTo($out)
@@ -380,9 +413,7 @@ jobs:
               $out.Dispose()
           }
 
-          # ------------------------------------------------------------------
-          # Verify SHA256
-          # ------------------------------------------------------------------
+          # Verify archive SHA256.
 
           $sha = (
               Get-FileHash `
@@ -394,11 +425,9 @@ jobs:
               throw "Archive SHA256 mismatch. Expected $($manifest.sha256), got $sha."
           }
 
-          Write-Host "Archive SHA256 verified: $sha"
+          Write-Host 'Archive SHA256 verified.' -ForegroundColor Green
 
-          # ------------------------------------------------------------------
-          # Install 7-Zip
-          # ------------------------------------------------------------------
+          # Install 7-Zip.
 
           choco install 7zip -y --no-progress
 
@@ -410,24 +439,25 @@ jobs:
               throw '7-Zip executable was not found.'
           }
 
-          if ([string]::IsNullOrWhiteSpace($env:BACKUP_ENCRYPTION_PASSWORD)) {
+          if ([string]::IsNullOrWhiteSpace(
+              $env:BACKUP_ENCRYPTION_PASSWORD
+          )) {
               throw 'Secret BACKUP_ENCRYPTION_PASSWORD is required.'
           }
 
-          # ------------------------------------------------------------------
-          # Extract VHDX
-          # ------------------------------------------------------------------
+          # Extract VHDX.
 
           Write-Host 'Extracting encrypted VHDX...'
 
-          & $sevenZip x `
+          & $sevenZip `
+            x `
             $archivePath `
             "-o$($env:BACKUP_ROOT)\image" `
-            "-p$env:BACKUP_ENCRYPTION_PASSWORD" `
+            "-p$($env:BACKUP_ENCRYPTION_PASSWORD)" `
             -y
 
           if ($LASTEXITCODE -ne 0) {
-              throw "7-Zip extraction failed with exit code $LASTEXITCODE."
+              throw '7-Zip extraction failed.'
           }
 
           if (-not (Test-Path -LiteralPath $imagePath)) {
@@ -435,20 +465,31 @@ jobs:
           }
 
           Write-Host "Restored VHDX: $imagePath"
-          Write-Host "Restored VHDX size: $((Get-Item $imagePath).Length) bytes"
+          Write-Host "Size: $((Get-Item $imagePath).Length) bytes"
 
 
       # ======================================================================
       # 5. Install QEMU
+      #
+      # FIRST RUN:
+      #   Skipped.
+      #
+      # RESTORE RUN:
+      #   Runs and boots the persisted VHDX.
       # ======================================================================
 
       - name: 5. Install QEMU
         if: steps.detect_backup.outputs.HAS_BACKUP == 'true'
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          Write-Host 'Installing QEMU...'
+          Write-Host ''
+          Write-Host '==================================================' -ForegroundColor Cyan
+          Write-Host 'INSTALLING QEMU' -ForegroundColor Cyan
+          Write-Host '==================================================' -ForegroundColor Cyan
 
           choco install qemu -y --no-progress
 
@@ -485,20 +526,26 @@ jobs:
 
 
       # ======================================================================
-      # 6. Boot Restored Windows Image in QEMU
+      # 6. Boot Restored Windows Image
       # ======================================================================
 
       - name: 6. Boot Restored Windows Image in QEMU
         id: boot_vm
         if: steps.detect_backup.outputs.HAS_BACKUP == 'true'
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          $imagePath = "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
+          $imagePath = `
+            "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
 
-          $logPath = "$env:BACKUP_ROOT\qemu.log"
-          $errorLogPath = "$env:BACKUP_ROOT\qemu-error.log"
+          $logPath = `
+            "$env:BACKUP_ROOT\qemu.log"
+
+          $errorLogPath = `
+            "$env:BACKUP_ROOT\qemu-error.log"
 
           if (-not (Test-Path -LiteralPath $imagePath)) {
               throw "VHDX not found: $imagePath"
@@ -506,24 +553,24 @@ jobs:
 
           Write-Host ''
           Write-Host '==================================================' -ForegroundColor Cyan
-          Write-Host 'STARTING RESTORED WINDOWS VM' -ForegroundColor Cyan
+          Write-Host 'STARTING RESTORED WINDOWS GUEST' -ForegroundColor Cyan
           Write-Host '==================================================' -ForegroundColor Cyan
 
           $args = @(
-            '-display','none',
-            '-machine','q35',
-            '-accel','tcg,thread=multi',
-            '-m','4096',
-            '-smp','2',
-            '-bios',"$env:OVMF_CODE",
-            '-drive',"file=$imagePath,format=vhdx,if=ide,cache=writeback",
-            '-netdev',"user,id=n1,hostfwd=tcp:0.0.0.0:$env:QEMU_RDP_PORT-:3389",
-            '-device','e1000,netdev=n1',
-            '-qmp',"tcp:127.0.0.1:$env:QEMU_QMP_PORT,server=on,wait=off",
-            '-nodefaults',
-            '-serial','none',
-            '-monitor','none',
-            '-no-reboot'
+              '-display','none',
+              '-machine','q35',
+              '-accel','tcg,thread=multi',
+              '-m','4096',
+              '-smp','2',
+              '-bios',"$env:OVMF_CODE",
+              '-drive',"file=$imagePath,format=vhdx,if=ide,cache=writeback",
+              '-netdev',"user,id=n1,hostfwd=tcp:0.0.0.0:$env:QEMU_RDP_PORT-:3389",
+              '-device','e1000,netdev=n1',
+              '-qmp',"tcp:127.0.0.1:$env:QEMU_QMP_PORT,server=on,wait=off",
+              '-nodefaults',
+              '-serial','none',
+              '-monitor','none',
+              '-no-reboot'
           )
 
           $process = Start-Process `
@@ -545,26 +592,27 @@ jobs:
 
           $ready = $false
 
-          # Maximum wait:
-          # 180 x 2 seconds = 360 seconds
-
           for ($i = 1; $i -le 180; $i++) {
 
               Start-Sleep -Seconds 2
 
               if ($process.HasExited) {
 
+                  Write-Host ''
+                  Write-Host 'QEMU exited during boot.' -ForegroundColor Red
+                  Write-Host "Exit code: $($process.ExitCode)"
+
                   Get-Content `
-                    -LiteralPath $logPath `
+                    $logPath `
                     -Tail 100 `
                     -ErrorAction SilentlyContinue
 
                   Get-Content `
-                    -LiteralPath $errorLogPath `
+                    $errorLogPath `
                     -Tail 100 `
                     -ErrorAction SilentlyContinue
 
-                  throw "QEMU exited during boot. Exit code: $($process.ExitCode)"
+                  throw 'QEMU exited before guest RDP became available.'
               }
 
               $check = Test-NetConnection `
@@ -573,51 +621,53 @@ jobs:
                 -WarningAction SilentlyContinue
 
               if ($check.TcpTestSucceeded) {
+
                   $ready = $true
                   break
               }
 
               if (($i % 10) -eq 0) {
-                  Write-Host "Still waiting for guest RDP... elapsed $($i * 2)s"
+
+                  Write-Host `
+                    "Still waiting for guest RDP... elapsed $($i * 2)s"
               }
           }
 
           if (-not $ready) {
 
-              Write-Host ''
-              Write-Host 'QEMU STDOUT:' -ForegroundColor Yellow
-
               Get-Content `
-                -LiteralPath $logPath `
+                $logPath `
                 -Tail 100 `
                 -ErrorAction SilentlyContinue
 
-              Write-Host ''
-              Write-Host 'QEMU STDERR:' -ForegroundColor Yellow
-
               Get-Content `
-                -LiteralPath $errorLogPath `
+                $errorLogPath `
                 -Tail 100 `
                 -ErrorAction SilentlyContinue
 
-              throw 'Guest RDP port did not become available within 360 seconds.'
+              throw 'Guest RDP port did not become available.'
           }
 
           Write-Host ''
-          Write-Host 'Restored Windows guest appears to be online.' -ForegroundColor Green
+          Write-Host 'Restored Windows guest is ONLINE.' -ForegroundColor Green
 
 
       # ======================================================================
-      # 7. Enable RDP on First Run
+      # 7. Enable Remote Desktop on First Run
       # ======================================================================
 
-      - name: 7. Enable Remote Desktop on First Run Host
+      - name: 7. Enable Remote Desktop on First Run
         if: steps.detect_backup.outputs.HAS_BACKUP != 'true'
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          Write-Host 'Enabling Windows Remote Desktop...'
+          Write-Host ''
+          Write-Host '==================================================' -ForegroundColor Cyan
+          Write-Host 'CONFIGURING FIRST-RUN WINDOWS RDP' -ForegroundColor Cyan
+          Write-Host '==================================================' -ForegroundColor Cyan
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
@@ -640,28 +690,34 @@ jobs:
             -Name 'TermService' `
             -ErrorAction SilentlyContinue
 
-          $service = Get-Service -Name 'TermService'
+          $service = Get-Service `
+            -Name 'TermService'
 
           if ($service.Status -ne 'Running') {
               throw 'TermService is not running.'
           }
 
-          Write-Host 'Remote Desktop enabled.'
+          Write-Host 'Remote Desktop enabled.' -ForegroundColor Green
 
 
       # ======================================================================
-      # 8. Create CynetAdmin on First Run
+      # 8. Create / Configure CynetAdmin
       # ======================================================================
 
       - name: 8. Create CynetAdmin on First Run
         if: steps.detect_backup.outputs.HAS_BACKUP != 'true'
         shell: powershell
+
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+          if ([string]::IsNullOrWhiteSpace(
+              $env:RDP_PASSWORD
+          )) {
               throw 'GitHub Secret RDP_PASSWORD is not configured.'
           }
 
@@ -706,37 +762,35 @@ jobs:
             -Member $username `
             -ErrorAction SilentlyContinue
 
-          Write-Host "Configured local user: $username"
+          Write-Host "Configured local user: $username" -ForegroundColor Green
 
 
       # ======================================================================
       # 9. Install and Connect Tailscale
       #
-      # On first run:
-      #   Install + authenticate.
-      #
-      # On restored run:
-      #   Try to use the restored Tailscale installation.
-      #
+      # Runs on BOTH first-run host and restored host.
       # ======================================================================
 
       - name: 9. Install and Connect Tailscale
         shell: powershell
+
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY_WIN_1 }}
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+          if ([string]::IsNullOrWhiteSpace(
+              $env:TAILSCALE_AUTHKEY
+          )) {
               throw 'GitHub Secret TAILSCALE_AUTHKEY_WIN_1 is not configured.'
           }
 
           $installer = 'C:\tailscale.msi'
-          $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
 
-          # ------------------------------------------------------------------
-          # Install Tailscale only if it is not already present.
-          # ------------------------------------------------------------------
+          $tailscale = `
+            'C:\Program Files\Tailscale\tailscale.exe'
 
           if (-not (Test-Path -LiteralPath $tailscale)) {
 
@@ -746,19 +800,21 @@ jobs:
                 -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
                 -OutFile $installer
 
+              Write-Host 'Installing Tailscale...'
+
               $p = Start-Process `
                 -FilePath 'msiexec.exe' `
-                -ArgumentList '/i',$installer,'/quiet','/norestart' `
+                -ArgumentList `
+                  '/i',
+                  $installer,
+                  '/quiet',
+                  '/norestart' `
                 -Wait `
                 -PassThru
 
               if ($p.ExitCode -ne 0) {
-                  throw "Tailscale installation failed: $($p.ExitCode)"
+                  throw "Tailscale install failed: $($p.ExitCode)"
               }
-          }
-
-          if (-not (Test-Path -LiteralPath $tailscale)) {
-              throw 'Tailscale executable was not found.'
           }
 
           Start-Service `
@@ -767,12 +823,7 @@ jobs:
 
           Start-Sleep -Seconds 5
 
-          # ------------------------------------------------------------------
-          # Authenticate.
-          #
-          # We use --force-reauthentication so the temporary runner/host
-          # receives a valid current Tailscale session.
-          # ------------------------------------------------------------------
+          Write-Host 'Connecting Tailscale...'
 
           & $tailscale up `
             --auth-key="$env:TAILSCALE_AUTHKEY" `
@@ -788,7 +839,9 @@ jobs:
 
           for ($i = 1; $i -le 20; $i++) {
 
-              $ip = (& $tailscale ip -4 2>$null).Trim()
+              $ip = (
+                  & $tailscale ip -4 2>$null
+              ).Trim()
 
               if (-not [string]::IsNullOrWhiteSpace($ip)) {
                   break
@@ -807,50 +860,35 @@ jobs:
               -Append `
               -Encoding utf8
 
-          Write-Host "Tailscale IPv4: $ip"
+          Write-Host ''
+          Write-Host "Tailscale IP: $ip" -ForegroundColor Green
 
 
       # ======================================================================
-      # 10. Verify First Run RDP
+      # 10. Create Windows Persistence Test File
+      #
+      # FIRST RUN ONLY
+      #
+      # This intentionally avoids PowerShell here-string syntax to prevent
+      # the parser error encountered previously.
       # ======================================================================
 
-      - name: 10. Verify First-Run Host RDP
+      - name: 10. Create Windows Persistence Test File
         if: steps.detect_backup.outputs.HAS_BACKUP != 'true'
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          $rdpDenied = Get-ItemPropertyValue `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections'
+          Write-Host ''
+          Write-Host '==================================================' -ForegroundColor Cyan
+          Write-Host 'CREATING WINDOWS PERSISTENCE TEST FILE' -ForegroundColor Cyan
+          Write-Host '==================================================' -ForegroundColor Cyan
 
-          if ($rdpDenied -ne 0) {
-              throw 'RDP is disabled.'
-          }
-
-          if ((Get-Service -Name TermService).Status -ne 'Running') {
-              throw 'TermService is not running.'
-          }
-
-          Write-Host "First-run RDP is ready at $env:TAILSCALE_IP:3389"
-
-
-      # ======================================================================
-      # 10.5 Create Persistence Test File
-      #
-      # THIS IS THE IMPORTANT TEST.
-      #
-      # The file is created BEFORE Disk2vhd capture.
-      #
-      # If the persistence mechanism works, this exact file should be present
-      # in the restored Windows system on a later workflow run.
-      # ======================================================================
-
-      - name: 10.5 Create Persistence Test File
-        if: steps.detect_backup.outputs.HAS_BACKUP != 'true'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
+          # --------------------------------------------------------------
+          # Get current user's Desktop.
+          # --------------------------------------------------------------
 
           $desktop = [Environment]::GetFolderPath('Desktop')
 
@@ -859,91 +897,192 @@ jobs:
           }
 
           if (-not (Test-Path -LiteralPath $desktop)) {
-              throw "Desktop directory does not exist: $desktop"
+
+              New-Item `
+                -ItemType Directory `
+                -Path $desktop `
+                -Force |
+                Out-Null
           }
 
-          $timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+          # --------------------------------------------------------------
+          # Current date/time.
+          # --------------------------------------------------------------
 
-          $randomText = -join (
-              (48..57) +
-              (65..90) +
-              (97..122) |
-              Get-Random -Count 32 |
-              ForEach-Object {
-                  [char]$_
-              }
+          $now = Get-Date
+
+          # --------------------------------------------------------------
+          # Windows filename-safe timestamp.
+          #
+          # Example:
+          #
+          # WindowsPersistence_2026-08-20_10-35-42.txt
+          # --------------------------------------------------------------
+
+          $timestamp = `
+            $now.ToString('yyyy-MM-dd_HH-mm-ss')
+
+          # --------------------------------------------------------------
+          # Random value.
+          # --------------------------------------------------------------
+
+          $randomText = `
+            [Guid]::NewGuid().ToString()
+
+          # --------------------------------------------------------------
+          # Filename.
+          # --------------------------------------------------------------
+
+          $fileName = `
+            "WindowsPersistence_$timestamp.txt"
+
+          $filePath = `
+            Join-Path $desktop $fileName
+
+          # --------------------------------------------------------------
+          # File content.
+          #
+          # IMPORTANT:
+          # No here-string is used here.
+          # --------------------------------------------------------------
+
+          $lines = @(
+              'WINDOWS PERSISTENCE TEST'
+              ''
+              "Created at: $($now.ToString('yyyy-MM-dd HH:mm:ss'))"
+              "Random text: $randomText"
+              "Computer: $env:COMPUTERNAME"
+              "User: $env:USERNAME"
+              "GitHub Run ID: $env:GITHUB_RUN_ID"
+              "Runner OS: $env:RUNNER_OS"
+              ''
+              'This file was created during the FIRST RUN.'
+              'It should survive inside the captured VHDX.'
+              'The next workflow run will restore the VHDX.'
+              'After restoration this file should still exist.'
           )
 
-          $fileName = "RDP-PERSISTENCE-TEST-$timestamp.txt"
+          $content = $lines -join [Environment]::NewLine
 
-          $filePath = Join-Path `
-            $desktop `
-            $fileName
-
-          $content = @"Windows persistence test Created at:
-          $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff zzz')
-          Runner:
-          $env:RUNNER_NAME
-          Run ID:
-          $env:GITHUB_RUN_ID
-          Repository:
-          $env:GITHUB_REPOSITORY
-          Random test value:
-          $randomText
-          Message:
-          سیس ویندوز خاموش شده و مراحل پشتیبان گیری شروع شود
-
-          Purpose:
-          This file was intentionally created BEFORE Disk2vhd capture.
-
-          Expected result:
-          If Windows persistence works correctly, this exact file should
-          still exist after the VHDX is restored and Windows is booted again.    "@
+          # --------------------------------------------------------------
+          # Write file.
+          # --------------------------------------------------------------
 
           Set-Content `
             -LiteralPath $filePath `
             -Value $content `
             -Encoding UTF8
 
+          # --------------------------------------------------------------
+          # Verify file.
+          # --------------------------------------------------------------
+
           if (-not (Test-Path -LiteralPath $filePath)) {
-              throw "Test file was not created: $filePath"
+              throw "Persistence test file was not created: $filePath"
           }
 
-          Write-Host ''
-          Write-Host '==================================================' -ForegroundColor Green
-          Write-Host 'PERSISTENCE TEST FILE CREATED' -ForegroundColor Green
-          Write-Host '==================================================' -ForegroundColor Green
+          $fileInfo = `
+            Get-Item -LiteralPath $filePath
 
+          Write-Host ''
+          Write-Host 'TEST FILE CREATED SUCCESSFULLY' -ForegroundColor Green
+          Write-Host ''
           Write-Host "Desktop : $desktop"
-          Write-Host "File    : $fileName"
-          Write-Host "Path    : $filePath"
-
+          Write-Host "File    : $($fileInfo.FullName)"
+          Write-Host "Size    : $($fileInfo.Length) bytes"
           Write-Host ''
-          Write-Host 'File content:'
+
+          Write-Host 'File content:' -ForegroundColor Yellow
           Write-Host '--------------------------------------------------'
 
           Get-Content `
             -LiteralPath $filePath
 
           Write-Host '--------------------------------------------------'
+          Write-Host ''
+
+          Write-Host 'Persistence test file is ready.' -ForegroundColor Green
+
+
+      # ======================================================================
+      # 11. Verify RDP
+      #
+      # First run: verify host RDP.
+      # Restore run: QEMU guest RDP was already verified in Step 6.
+      # ======================================================================
+
+      - name: 11. Verify RDP Availability
+        shell: powershell
+
+        run: |
+
+          $ErrorActionPreference = 'Stop'
+
+          $backupExists = `
+            '${{ steps.detect_backup.outputs.HAS_BACKUP }}'
 
           Write-Host ''
-          Write-Host 'The file will now be included in the Windows image.'
-          Write-Host '==================================================' -ForegroundColor Green
+          Write-Host '==================================================' -ForegroundColor Cyan
+          Write-Host 'VERIFYING RDP' -ForegroundColor Cyan
+          Write-Host '==================================================' -ForegroundColor Cyan
+
+          if ($backupExists -eq 'true') {
+
+              Write-Host 'Restored guest RDP was verified in Step 6.'
+
+              $portCheck = Test-NetConnection `
+                -ComputerName 127.0.0.1 `
+                -Port ([int]$env:QEMU_RDP_PORT) `
+                -WarningAction SilentlyContinue
+
+              if (-not $portCheck.TcpTestSucceeded) {
+                  throw 'Restored guest RDP port is no longer available.'
+              }
+
+              Write-Host `
+                "Guest RDP port $env:QEMU_RDP_PORT is available." `
+                -ForegroundColor Green
+          }
+
+          else {
+
+              $rdpDenied = Get-ItemPropertyValue `
+                -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                -Name 'fDenyTSConnections'
+
+              if ($rdpDenied -ne 0) {
+                  throw 'RDP is disabled.'
+              }
+
+              if (
+                  (Get-Service -Name TermService).Status `
+                  -ne 'Running'
+              ) {
+                  throw 'TermService is not running.'
+              }
+
+              Write-Host `
+                "First-run host RDP is ready at $env:TAILSCALE_IP`:3389" `
+                -ForegroundColor Green
+          }
 
 
       # ======================================================================
-      # 11. Display Connection Information
+      # 12. Display Connection Information
       # ======================================================================
 
-      - name: 11. Display RDP Connection Information
+      - name: 12. Display RDP Connection Information
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Continue'
 
-          $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+          $tailscale = `
+            'C:\Program Files\Tailscale\tailscale.exe'
 
-          $backupExists = '${{ steps.detect_backup.outputs.HAS_BACKUP }}'
+          $backupExists = `
+            '${{ steps.detect_backup.outputs.HAS_BACKUP }}'
 
           Write-Host ''
           Write-Host '==================================================' -ForegroundColor Green
@@ -955,9 +1094,10 @@ jobs:
               if (-not (Test-Path -LiteralPath $tailscale)) {
 
                   Write-Host `
-                    'Host Tailscale executable is not present; host networking is not configured.' `
+                    'Tailscale executable is not present.' `
                     -ForegroundColor Yellow
               }
+
               else {
 
                   Start-Service `
@@ -976,10 +1116,19 @@ jobs:
                           -Append `
                           -Encoding utf8
 
-                      Write-Host "Tailscale IP : $hostIp" -ForegroundColor Yellow
-                      Write-Host "RDP endpoint : $hostIp`:$env:QEMU_RDP_PORT" -ForegroundColor Yellow
-                      Write-Host "RDP command  : mstsc /v:$hostIp`:$env:QEMU_RDP_PORT" -ForegroundColor Magenta
+                      Write-Host `
+                        "Tailscale IP : $hostIp" `
+                        -ForegroundColor Yellow
+
+                      Write-Host `
+                        "RDP endpoint : $hostIp`:$env:QEMU_RDP_PORT" `
+                        -ForegroundColor Yellow
+
+                      Write-Host `
+                        "RDP command  : mstsc /v:$hostIp`:$env:QEMU_RDP_PORT" `
+                        -ForegroundColor Magenta
                   }
+
                   else {
 
                       Write-Host `
@@ -988,189 +1137,178 @@ jobs:
                   }
               }
           }
+
           else {
 
-              Write-Host "Tailscale IP : $env:TAILSCALE_IP" -ForegroundColor Yellow
-              Write-Host "RDP endpoint : $env:TAILSCALE_IP`:3389" -ForegroundColor Yellow
-              Write-Host "RDP command  : mstsc /v:$env:TAILSCALE_IP" -ForegroundColor Magenta
+              Write-Host `
+                "Tailscale IP : $env:TAILSCALE_IP" `
+                -ForegroundColor Yellow
+
+              Write-Host `
+                "RDP endpoint : $env:TAILSCALE_IP`:3389" `
+                -ForegroundColor Yellow
+
+              Write-Host `
+                "RDP command  : mstsc /v:$env:TAILSCALE_IP" `
+                -ForegroundColor Magenta
           }
 
           Write-Host ''
 
 
       # ======================================================================
-      # 12. Keep RDP Session Alive
+      # 13. Keep Session Alive
       #
-      # TEST MODE:
-      #   SESSION_MINUTES = 2
-      #
-      # After this step finishes, backup begins.
+      # During this period the user can connect using RDP.
       # ======================================================================
 
-      - name: 12. Keep RDP Session Alive
+      - name: 13. Keep RDP Session Alive
         id: keep_alive
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Continue'
 
-          $totalMinutes = [int]$env:SESSION_MINUTES
+          $totalMinutes = `
+            [int]$env:SESSION_MINUTES
 
-          $intervalSeconds = 30
+          $intervalSeconds = 60
 
-          $totalSeconds = $totalMinutes * 60
+          $totalSeconds = `
+            $totalMinutes * 60
 
           $elapsed = 0
 
+          $nextNotification = 300
+
           Write-Host ''
           Write-Host '==================================================' -ForegroundColor Cyan
-          Write-Host 'TEST SESSION STARTED' -ForegroundColor Cyan
+          Write-Host 'RDP SESSION STARTED' -ForegroundColor Cyan
           Write-Host '==================================================' -ForegroundColor Cyan
 
-          Write-Host "Session runtime: $totalMinutes minutes"
+          Write-Host `
+            "Session runtime: $totalMinutes minutes"
 
           while ($elapsed -lt $totalSeconds) {
 
-              Start-Sleep -Seconds $intervalSeconds
+              Start-Sleep `
+                -Seconds $intervalSeconds
 
               $elapsed += $intervalSeconds
 
-              $remainingSeconds = $totalSeconds - $elapsed
+              if ($elapsed -ge $nextNotification) {
 
-              if ($remainingSeconds -lt 0) {
-                  $remainingSeconds = 0
+                  $remaining = [math]::Ceiling(
+                      ($totalSeconds - $elapsed) / 60
+                  )
+
+                  Write-Host `
+                    "[$(Get-Date)] RDP running. Elapsed: $([math]::Floor($elapsed / 60))m; Remaining: $remaining m"
+
+                  $nextNotification += 300
               }
-
-              Write-Host `
-                "RDP running... elapsed=$elapsed sec; remaining=$remainingSeconds sec"
           }
 
           Write-Host ''
-          Write-Host '==================================================' -ForegroundColor Green
-          Write-Host 'TEST SESSION FINISHED' -ForegroundColor Green
-          Write-Host 'BACKUP PROCESS WILL NOW START' -ForegroundColor Green
-          Write-Host '==================================================' -ForegroundColor Green
+          Write-Host 'RDP session window completed.' -ForegroundColor Green
 
           $global:LASTEXITCODE = 0
 
 
       # ======================================================================
-      # 13. Gracefully Shutdown Restored Guest
+      # 14. Capture First-Run System Disk With Disk2vhd
       #
-      # Only applies to second/subsequent runs where QEMU is running.
-      # ======================================================================
-
-      - name: 13. Gracefully Shutdown Restored Guest
-        if: steps.detect_backup.outputs.HAS_BACKUP == 'true' && steps.keep_alive.outcome == 'success'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-
-          if ([string]::IsNullOrWhiteSpace($env:QEMU_PID)) {
-              throw 'QEMU PID is not available.'
-          }
-
-          Write-Host 'Sending ACPI powerdown to restored guest...'
-
-          try {
-
-              $client = New-Object `
-                System.Net.Sockets.TcpClient(
-                    '127.0.0.1',
-                    [int]$env:QEMU_QMP_PORT
-                )
-
-              $stream = $client.GetStream()
-
-              $buffer = New-Object byte[] 4096
-
-              $null = $stream.Read(
-                  $buffer,
-                  0,
-                  $buffer.Length
-              )
-
-              $command = '{"execute":"system_powerdown"}' + "`n"
-
-              $bytes = [System.Text.Encoding]::ASCII.GetBytes($command)
-
-              $stream.Write(
-                  $bytes,
-                  0,
-                  $bytes.Length
-              )
-
-              $stream.Flush()
-
-              $stream.Dispose()
-              $client.Dispose()
-          }
-          catch {
-
-              Write-Host `
-                "QMP powerdown request failed: $($_.Exception.Message)" `
-                -ForegroundColor Yellow
-          }
-
-          $deadline = (Get-Date).AddSeconds(120)
-
-          while ((Get-Date) -lt $deadline) {
-
-              $p = Get-Process `
-                -Id ([int]$env:QEMU_PID) `
-                -ErrorAction SilentlyContinue
-
-              if ($null -eq $p) {
-
-                  Write-Host 'QEMU exited after guest shutdown.'
-
-                  break
-              }
-
-              Start-Sleep -Seconds 5
-          }
-
-          $p = Get-Process `
-            -Id ([int]$env:QEMU_PID) `
-            -ErrorAction SilentlyContinue
-
-          if ($null -ne $p) {
-
-              Write-Host `
-                'Guest did not shut down within 120 seconds; stopping QEMU.' `
-                -ForegroundColor Yellow
-
-              Stop-Process `
-                -Id ([int]$env:QEMU_PID) `
-                -Force
-
-              Start-Sleep -Seconds 3
-          }
-
-
-      # ======================================================================
-      # 14. Capture First-Run Windows System Disk
+      # FIRST RUN ONLY.
       #
-      # IMPORTANT:
-      #   -accepteula is required for the first execution of Disk2vhd.
+      # This is the actual persistence test.
+      #
+      # We do NOT call shutdown.exe here because that would terminate the
+      # GitHub Actions runner before the remaining backup steps execute.
+      #
+      # Disk2vhd captures the live Windows volumes using VSS.
       # ======================================================================
 
       - name: 14. Capture First-Run System Disk With Disk2vhd
         id: capture_image
+
         if: steps.detect_backup.outputs.HAS_BACKUP != 'true' && steps.keep_alive.outcome == 'success'
+
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Stop'
-
-          $disk2vhdZip = "$env:BACKUP_ROOT\disk2vhd.zip"
-
-          $disk2vhdDir = "$env:BACKUP_ROOT\disk2vhd"
-
-          $imagePath = "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
 
           Write-Host ''
           Write-Host '==================================================' -ForegroundColor Cyan
-          Write-Host 'DOWNLOADING DISK2VHD' -ForegroundColor Cyan
+          Write-Host 'STEP 14 - CAPTURE WINDOWS SYSTEM DISK' -ForegroundColor Cyan
           Write-Host '==================================================' -ForegroundColor Cyan
+
+          Write-Host ''
+          Write-Host 'Windows session has completed.'
+          Write-Host 'Backup phase is starting now.'
+          Write-Host ''
+          Write-Host 'IMPORTANT: The runner itself cannot be physically shut down'
+          Write-Host 'before this step because that would terminate the workflow.'
+          Write-Host 'Disk2vhd/VSS will capture the live Windows system instead.'
+          Write-Host ''
+
+          # --------------------------------------------------------------
+          # Paths.
+          # --------------------------------------------------------------
+
+          $disk2vhdZip = `
+            "$env:BACKUP_ROOT\disk2vhd.zip"
+
+          $disk2vhdDir = `
+            "$env:BACKUP_ROOT\disk2vhd"
+
+          $imagePath = `
+            "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
+
+          # --------------------------------------------------------------
+          # Show Desktop test file before capture.
+          # --------------------------------------------------------------
+
+          $desktop = `
+            [Environment]::GetFolderPath('Desktop')
+
+          Write-Host 'Checking persistence test file before VHDX capture...'
+
+          if (Test-Path -LiteralPath $desktop) {
+
+              $testFiles = Get-ChildItem `
+                -LiteralPath $desktop `
+                -Filter 'WindowsPersistence_*.txt' `
+                -File `
+                -ErrorAction SilentlyContinue
+
+              if ($testFiles.Count -gt 0) {
+
+                  foreach ($file in $testFiles) {
+
+                      Write-Host ''
+                      Write-Host "TEST FILE: $($file.FullName)" -ForegroundColor Green
+
+                      Get-Content `
+                        -LiteralPath $file.FullName
+                  }
+              }
+              else {
+
+                  Write-Host `
+                    'WARNING: No persistence test file found on Desktop.' `
+                    -ForegroundColor Yellow
+              }
+          }
+
+          # --------------------------------------------------------------
+          # Download Disk2vhd.
+          # --------------------------------------------------------------
+
+          Write-Host ''
+          Write-Host 'Downloading Microsoft Sysinternals Disk2vhd...'
 
           Invoke-WebRequest `
             -Uri 'https://download.sysinternals.com/files/Disk2vhd.zip' `
@@ -1179,6 +1317,10 @@ jobs:
           if (-not (Test-Path -LiteralPath $disk2vhdZip)) {
               throw 'Disk2vhd ZIP was not downloaded.'
           }
+
+          # --------------------------------------------------------------
+          # Extract.
+          # --------------------------------------------------------------
 
           if (Test-Path -LiteralPath $disk2vhdDir) {
 
@@ -1203,27 +1345,34 @@ jobs:
               throw 'disk2vhd64.exe was not found.'
           }
 
-          Write-Host "Disk2vhd executable: $($disk2vhd.FullName)"
+          Write-Host `
+            "Disk2vhd: $($disk2vhd.FullName)"
 
-          # ------------------------------------------------------------------
-          # Check disk space
-          # ------------------------------------------------------------------
+          # --------------------------------------------------------------
+          # Check disk space.
+          # --------------------------------------------------------------
 
           Write-Host ''
-          Write-Host 'Checking free disk space...'
+          Write-Host 'Checking free disk space before capture...'
 
-          $free = (Get-PSDrive -Name C).Free
+          $disk = Get-PSDrive `
+            -Name C
 
-          Write-Host "Free C: space = $free bytes"
-          Write-Host "Free C: space = $([math]::Round($free / 1GB, 2)) GB"
+          $free = `
+            [int64]$disk.Free
+
+          Write-Host `
+            "Free C: space = $free bytes"
 
           if ($free -lt 5000000000) {
-              throw 'Less than 5 GB free space is available.'
+
+              throw `
+                'Less than 5 GB free space is available. Full-system VHDX capture cannot safely proceed.'
           }
 
-          # ------------------------------------------------------------------
-          # Remove previous local image
-          # ------------------------------------------------------------------
+          # --------------------------------------------------------------
+          # Remove previous image.
+          # --------------------------------------------------------------
 
           if (Test-Path -LiteralPath $imagePath) {
 
@@ -1232,79 +1381,78 @@ jobs:
                 -Force
           }
 
-          # ------------------------------------------------------------------
-          # Capture
-          # ------------------------------------------------------------------
+          # --------------------------------------------------------------
+          # Capture ALL volumes.
+          #
+          # '*' tells Disk2vhd to capture all volumes.
+          # --------------------------------------------------------------
 
           Write-Host ''
-          Write-Host '==================================================' -ForegroundColor Cyan
-          Write-Host 'STARTING DISK2VHD SYSTEM CAPTURE' -ForegroundColor Cyan
-          Write-Host '==================================================' -ForegroundColor Cyan
+          Write-Host 'Creating full-system VHDX...'
+          Write-Host 'This can take several minutes.'
 
-          Write-Host "Output: $imagePath"
-
-          # IMPORTANT:
-          # -accepteula prevents first-run EULA failure.
-          #
-          # '*' means capture all available volumes.
-          #
           & $disk2vhd.FullName `
-            -accepteula `
             '*' `
             $imagePath
 
           $disk2vhdExitCode = $LASTEXITCODE
 
-          Write-Host ''
-          Write-Host "Disk2vhd exit code: $disk2vhdExitCode"
+          Write-Host `
+            "Disk2vhd exit code: $disk2vhdExitCode"
 
           if ($disk2vhdExitCode -ne 0) {
-              throw "Disk2vhd failed with exit code $disk2vhdExitCode."
+              throw "Disk2vhd failed with exit code $disk2vhdExitCode"
           }
+
+          # --------------------------------------------------------------
+          # Verify image.
+          # --------------------------------------------------------------
 
           if (-not (Test-Path -LiteralPath $imagePath)) {
-              throw "Disk2vhd completed but VHDX was not created: $imagePath"
+              throw 'Disk2vhd did not create the VHDX.'
           }
 
-          $imageBytes = (
-              Get-Item -LiteralPath $imagePath
-          ).Length
-
-          if ($imageBytes -le 0) {
-              throw 'Disk2vhd created an empty VHDX.'
-          }
+          $imageBytes = `
+            (Get-Item -LiteralPath $imagePath).Length
 
           Write-Host ''
-          Write-Host '==================================================' -ForegroundColor Green
-          Write-Host 'DISK2VHD CAPTURE COMPLETED' -ForegroundColor Green
-          Write-Host '==================================================' -ForegroundColor Green
-          Write-Host "VHDX path : $imagePath"
-          Write-Host "VHDX size : $imageBytes bytes"
-          Write-Host "VHDX size : $([math]::Round($imageBytes / 1GB, 2)) GB"
-          Write-Host '==================================================' -ForegroundColor Green
+          Write-Host 'VHDX CAPTURE COMPLETED' -ForegroundColor Green
+          Write-Host ''
+          Write-Host "Image path : $imagePath"
+          Write-Host "Image size : $imageBytes bytes"
+
+          if ($imageBytes -le 0) {
+              throw 'VHDX file exists but is empty.'
+          }
 
 
       # ======================================================================
       # 15. Verify Restored VHDX
+      #
+      # RESTORE RUN ONLY.
       # ======================================================================
 
-      - name: 15. Verify Restored VHDX After Guest Shutdown
+      - name: 15. Verify Restored VHDX
         if: steps.detect_backup.outputs.HAS_BACKUP == 'true' && steps.keep_alive.outcome == 'success'
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          $imagePath = "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
+          $imagePath = `
+            "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
 
           if (-not (Test-Path -LiteralPath $imagePath)) {
-              throw 'Restored VHDX is missing after guest shutdown.'
+              throw 'Restored VHDX is missing.'
           }
 
-          $size = (
-              Get-Item -LiteralPath $imagePath
-          ).Length
+          $size = `
+            (Get-Item -LiteralPath $imagePath).Length
 
-          Write-Host "Current restored VHDX size: $size bytes"
+          Write-Host ''
+          Write-Host 'RESTORED VHDX VERIFIED' -ForegroundColor Green
+          Write-Host "Size: $size bytes"
 
 
       # ======================================================================
@@ -1312,31 +1460,45 @@ jobs:
       # ======================================================================
 
       - name: 16. Encrypt and Compress Image
+
         id: pack_image
+
         if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+
         shell: powershell
+
         env:
           BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          if ([string]::IsNullOrWhiteSpace($env:BACKUP_ENCRYPTION_PASSWORD)) {
+          if ([string]::IsNullOrWhiteSpace(
+              $env:BACKUP_ENCRYPTION_PASSWORD
+          )) {
               throw 'Secret BACKUP_ENCRYPTION_PASSWORD is required.'
           }
 
+          Write-Host ''
+          Write-Host '==================================================' -ForegroundColor Cyan
+          Write-Host 'ENCRYPTING AND COMPRESSING VHDX' -ForegroundColor Cyan
+          Write-Host '==================================================' -ForegroundColor Cyan
+
           choco install 7zip -y --no-progress
 
-          $sevenZip = Join-Path `
-            $env:ProgramFiles `
-            '7-Zip\7z.exe'
+          $sevenZip = `
+            Join-Path $env:ProgramFiles '7-Zip\7z.exe'
 
           if (-not (Test-Path -LiteralPath $sevenZip)) {
               throw '7-Zip executable was not found.'
           }
 
-          $imagePath = "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
+          $imagePath = `
+            "$env:BACKUP_ROOT\image\windows-rdp.vhdx"
 
-          $archivePath = "$env:BACKUP_ROOT\windows-rdp.vhdx.7z"
+          $archivePath = `
+            "$env:BACKUP_ROOT\windows-rdp.vhdx.7z"
 
           if (-not (Test-Path -LiteralPath $imagePath)) {
               throw "Image not found: $imagePath"
@@ -1349,17 +1511,14 @@ jobs:
                 -Force
           }
 
-          Write-Host ''
-          Write-Host '==================================================' -ForegroundColor Cyan
-          Write-Host 'CREATING ENCRYPTED 7-ZIP ARCHIVE' -ForegroundColor Cyan
-          Write-Host '==================================================' -ForegroundColor Cyan
+          Write-Host 'Creating encrypted 7-Zip archive...'
 
           & $sevenZip `
             a `
             -t7z `
             -mx=1 `
             -mhe=on `
-            "-p$env:BACKUP_ENCRYPTION_PASSWORD" `
+            "-p$($env:BACKUP_ENCRYPTION_PASSWORD)" `
             $archivePath `
             $imagePath
 
@@ -1373,9 +1532,8 @@ jobs:
                 -LiteralPath $archivePath
           ).Hash.ToLowerInvariant()
 
-          $bytes = (
-              Get-Item -LiteralPath $archivePath
-          ).Length
+          $bytes = `
+            (Get-Item -LiteralPath $archivePath).Length
 
           "ARCHIVE_SHA256=$sha" |
             Out-File `
@@ -1390,8 +1548,8 @@ jobs:
               -Encoding utf8
 
           Write-Host ''
-          Write-Host "Encrypted archive size: $bytes bytes"
-          Write-Host "Encrypted archive SHA256: $sha"
+          Write-Host "Encrypted archive size : $bytes bytes"
+          Write-Host "Encrypted archive SHA256 : $sha"
 
 
       # ======================================================================
@@ -1399,21 +1557,31 @@ jobs:
       # ======================================================================
 
       - name: 17. Split Archive Into 2 GB Parts
+
         id: split_archive
+
         if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          $archivePath = "$env:BACKUP_ROOT\windows-rdp.vhdx.7z"
+          $archivePath = `
+            "$env:BACKUP_ROOT\windows-rdp.vhdx.7z"
 
-          $partBytes = [int64]$env:BACKUP_PART_BYTES
+          $partBytes = `
+            [int64]$env:BACKUP_PART_BYTES
 
-          $generation = "$env:GITHUB_RUN_ID"
+          $generation = `
+            "$env:GITHUB_RUN_ID"
 
-          $partsDir = "$env:BACKUP_ROOT\parts"
+          $partsDir = `
+            "$env:BACKUP_ROOT\parts"
 
-          $prefix = "windows-rdp-$generation-part-"
+          $prefix = `
+            "windows-rdp-$generation-part-"
 
           if (Test-Path -LiteralPath $partsDir) {
 
@@ -1429,11 +1597,18 @@ jobs:
             -Force |
             Out-Null
 
-          $input = [System.IO.File]::OpenRead($archivePath)
+          Write-Host ''
+          Write-Host '==================================================' -ForegroundColor Cyan
+          Write-Host 'SPLITTING ARCHIVE' -ForegroundColor Cyan
+          Write-Host '==================================================' -ForegroundColor Cyan
+
+          $input = `
+            [System.IO.File]::OpenRead($archivePath)
 
           try {
 
-              $buffer = New-Object byte[] (4MB)
+              $buffer = `
+                New-Object byte[] (4MB)
 
               $partIndex = 1
 
@@ -1443,31 +1618,35 @@ jobs:
                     $partsDir `
                     ("{0}{1:D5}" -f $prefix, $partIndex)
 
-                  $output = [System.IO.File]::Open(
-                      $partPath,
-                      [System.IO.FileMode]::CreateNew,
-                      [System.IO.FileAccess]::Write
-                  )
+                  $output = `
+                    [System.IO.File]::Open(
+                        $partPath,
+                        [System.IO.FileMode]::CreateNew,
+                        [System.IO.FileAccess]::Write
+                    )
 
                   try {
 
                       $remaining = $partBytes
 
                       while (
-                          $remaining -gt 0 -and
+                          $remaining -gt 0 `
+                          -and `
                           $input.Position -lt $input.Length
                       ) {
 
-                          $want = [int][Math]::Min(
-                              $buffer.Length,
-                              $remaining
-                          )
+                          $want = `
+                            [int][Math]::Min(
+                                $buffer.Length,
+                                $remaining
+                            )
 
-                          $read = $input.Read(
-                              $buffer,
-                              0,
-                              $want
-                          )
+                          $read = `
+                            $input.Read(
+                                $buffer,
+                                0,
+                                $want
+                            )
 
                           if ($read -le 0) {
                               break
@@ -1482,23 +1661,26 @@ jobs:
                           $remaining -= $read
                       }
                   }
-                  finally {
 
+                  finally {
                       $output.Dispose()
                   }
 
-                  $createdSize = (
-                      Get-Item -LiteralPath $partPath
-                  ).Length
+                  $size = `
+                    (Get-Item -LiteralPath $partPath).Length
 
                   Write-Host `
-                    "Created part $partIndex : $partPath ($createdSize bytes)"
+                    "Created part $partIndex : $size bytes"
+
+                  if ($size -gt $partBytes) {
+                      throw "Part exceeds maximum size: $partPath"
+                  }
 
                   $partIndex++
               }
           }
-          finally {
 
+          finally {
               $input.Dispose()
           }
 
@@ -1509,13 +1691,6 @@ jobs:
 
           if ($parts.Count -lt 1) {
               throw 'No archive parts were created.'
-          }
-
-          foreach ($part in $parts) {
-
-              if ($part.Length -gt $partBytes) {
-                  throw "Part exceeds configured maximum: $($part.Name)"
-              }
           }
 
           "BACKUP_GENERATION=$generation" |
@@ -1536,7 +1711,8 @@ jobs:
               -Append `
               -Encoding utf8
 
-          Write-Host "Total parts: $($parts.Count)"
+          Write-Host ''
+          Write-Host "Total parts: $($parts.Count)" -ForegroundColor Green
 
 
       # ======================================================================
@@ -1544,12 +1720,17 @@ jobs:
       # ======================================================================
 
       - name: 18. Build Backup Manifest
+
         if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          $partsDir = "$env:BACKUP_ROOT\parts"
+          $partsDir = `
+            "$env:BACKUP_ROOT\parts"
 
           $parts = Get-ChildItem `
             -LiteralPath $partsDir `
@@ -1560,28 +1741,36 @@ jobs:
 
               schema_version = 1
 
-              generation = [string]$env:BACKUP_GENERATION
+              generation = `
+                [string]$env:BACKUP_GENERATION
 
-              archive_name = 'windows-rdp.vhdx.7z'
+              archive_name = `
+                'windows-rdp.vhdx.7z'
 
-              archive_bytes = [int64]$env:ARCHIVE_BYTES
+              archive_bytes = `
+                [int64]$env:ARCHIVE_BYTES
 
-              sha256 = [string]$env:ARCHIVE_SHA256
+              sha256 = `
+                [string]$env:ARCHIVE_SHA256
 
-              part_bytes_max = [int64]$env:BACKUP_PART_BYTES
+              part_bytes_max = `
+                [int64]$env:BACKUP_PART_BYTES
 
-              part_count = [int]$parts.Count
+              part_count = `
+                [int]$parts.Count
 
-              created_utc = (
-                  Get-Date
-              ).ToUniversalTime().ToString('o')
+              created_utc = `
+                (Get-Date).ToUniversalTime().ToString('o')
 
-              image_name = 'windows-rdp.vhdx'
+              image_name = `
+                'windows-rdp.vhdx'
 
-              notes = 'Persistence test: Windows runner system disk captured with Disk2vhd, encrypted, split, and stored in GitHub Release.'
+              notes = `
+                'Full-system VHDX captured from the GitHub-hosted Windows runner and persisted as a QEMU guest image.'
           }
 
-          $manifestPath = "$env:BACKUP_ROOT\$env:BACKUP_MANIFEST_NAME"
+          $manifestPath = `
+            "$env:BACKUP_ROOT\$env:BACKUP_MANIFEST_NAME"
 
           $manifest |
             ConvertTo-Json -Depth 5 |
@@ -1590,7 +1779,7 @@ jobs:
               -Encoding utf8
 
           Write-Host ''
-          Write-Host 'Backup manifest:'
+          Write-Host 'BACKUP MANIFEST:' -ForegroundColor Cyan
           Write-Host '--------------------------------------------------'
 
           Get-Content `
@@ -1603,35 +1792,44 @@ jobs:
       # 19. Create Fixed GitHub Release If Needed
       # ======================================================================
 
-      - name: 19. Create Fixed GitHub Release If Needed
+      - name: 19. Create Fixed GitHub Release
+
         if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+
         shell: powershell
+
         env:
           GH_TOKEN: ${{ github.token }}
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          cmd.exe /c "gh release view `"$env:BACKUP_RELEASE_TAG`" >nul 2>nul"
+          # Check release without allowing "not found" to terminate step.
+
+          cmd.exe /c `
+            "gh release view `"$env:BACKUP_RELEASE_TAG`" > nul 2> nul"
 
           $releaseExitCode = $LASTEXITCODE
 
           if ($releaseExitCode -ne 0) {
 
               Write-Host 'Persistent release does not exist.'
-              Write-Host 'Creating it now...'
+              Write-Host 'Creating release...'
 
               gh release create `
                 $env:BACKUP_RELEASE_TAG `
                 --title 'Windows RDP Persistent Backup' `
-                --notes 'Latest encrypted Windows persistence-test image.'
+                --notes 'Encrypted persistent Windows disk image for the Windows RDP workflow.'
 
               if ($LASTEXITCODE -ne 0) {
-                  throw 'Failed to create persistent GitHub Release.'
+                  throw 'Failed to create GitHub Release.'
               }
           }
+
           else {
 
-              Write-Host 'Persistent GitHub Release already exists.'
+              Write-Host 'Persistent release already exists.'
           }
 
 
@@ -1640,16 +1838,23 @@ jobs:
       # ======================================================================
 
       - name: 20. Upload New Backup Parts
+
         if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+
         shell: powershell
+
         env:
           GH_TOKEN: ${{ github.token }}
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          $partsDir = "$env:BACKUP_ROOT\parts"
+          $partsDir = `
+            "$env:BACKUP_ROOT\parts"
 
-          $manifestPath = "$env:BACKUP_ROOT\$env:BACKUP_MANIFEST_NAME"
+          $manifestPath = `
+            "$env:BACKUP_ROOT\$env:BACKUP_MANIFEST_NAME"
 
           $parts = Get-ChildItem `
             -LiteralPath $partsDir `
@@ -1658,14 +1863,16 @@ jobs:
 
           Write-Host ''
           Write-Host '==================================================' -ForegroundColor Cyan
-          Write-Host 'UPLOADING BACKUP' -ForegroundColor Cyan
+          Write-Host 'UPLOADING BACKUP PARTS' -ForegroundColor Cyan
           Write-Host '==================================================' -ForegroundColor Cyan
 
           Write-Host "Uploading $($parts.Count) parts..."
 
           foreach ($part in $parts) {
 
+              Write-Host ''
               Write-Host "Uploading: $($part.Name)"
+              Write-Host "Size: $($part.Length) bytes"
 
               gh release upload `
                 $env:BACKUP_RELEASE_TAG `
@@ -1677,7 +1884,8 @@ jobs:
               }
           }
 
-          Write-Host "Uploading manifest..."
+          Write-Host ''
+          Write-Host 'Uploading manifest...'
 
           gh release upload `
             $env:BACKUP_RELEASE_TAG `
@@ -1688,7 +1896,8 @@ jobs:
               throw 'Failed to upload backup manifest.'
           }
 
-          Write-Host 'Backup upload completed.'
+          Write-Host ''
+          Write-Host 'All backup assets uploaded.' -ForegroundColor Green
 
 
       # ======================================================================
@@ -1696,32 +1905,52 @@ jobs:
       # ======================================================================
 
       - name: 21. Remove Stale Backup Assets
+
         if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+
         shell: powershell
+
         env:
           GH_TOKEN: ${{ github.token }}
+
         run: |
+
           $ErrorActionPreference = 'Continue'
 
-          $currentGeneration = [string]$env:BACKUP_GENERATION
+          $currentGeneration = `
+            [string]$env:BACKUP_GENERATION
 
-          $release = (
-              gh release view `
-                $env:BACKUP_RELEASE_TAG `
-                --json assets |
-              ConvertFrom-Json
-          )
+          $releaseJson = `
+            gh release view `
+              $env:BACKUP_RELEASE_TAG `
+              --json assets
+
+          if ($LASTEXITCODE -ne 0) {
+
+              Write-Host `
+                'Could not read release assets for cleanup.' `
+                -ForegroundColor Yellow
+
+              exit 0
+          }
+
+          $release = `
+            $releaseJson |
+            ConvertFrom-Json
 
           foreach ($asset in $release.assets) {
 
-              $name = [string]$asset.name
+              $name = `
+                [string]$asset.name
 
               if (
-                  $name -like 'windows-rdp-*-part-*' -and
+                  $name -like 'windows-rdp-*-part-*' `
+                  -and `
                   $name -notlike "windows-rdp-$currentGeneration-part-*"
               ) {
 
-                  Write-Host "Deleting stale asset: $name"
+                  Write-Host `
+                    "Deleting stale asset: $name"
 
                   gh release delete-asset `
                     $env:BACKUP_RELEASE_TAG `
@@ -1730,27 +1959,34 @@ jobs:
               }
           }
 
+          Write-Host 'Stale asset cleanup completed.'
+
 
       # ======================================================================
       # 22. Verify Published Backup
       # ======================================================================
 
       - name: 22. Verify Published Backup
+
         if: steps.keep_alive.outcome == 'success' && (steps.detect_backup.outputs.HAS_BACKUP == 'true' || steps.capture_image.outcome == 'success')
+
         shell: powershell
+
         env:
           GH_TOKEN: ${{ github.token }}
+
         run: |
+
           $ErrorActionPreference = 'Stop'
 
-          $release = (
-              gh release view `
-                $env:BACKUP_RELEASE_TAG `
-                --json assets |
-              ConvertFrom-Json
-          )
+          $release = `
+            gh release view `
+              $env:BACKUP_RELEASE_TAG `
+              --json assets |
+            ConvertFrom-Json
 
-          $manifestAsset = $release.assets |
+          $manifestAsset = `
+            $release.assets |
             Where-Object {
                 $_.name -eq $env:BACKUP_MANIFEST_NAME
             }
@@ -1759,15 +1995,19 @@ jobs:
               throw 'Published release manifest was not found.'
           }
 
-          $prefix = [string]$env:BACKUP_PREFIX
+          $prefix = `
+            [string]$env:BACKUP_PREFIX
 
-          $parts = $release.assets |
+          $parts = `
+            $release.assets |
             Where-Object {
                 $_.name -like "$prefix*"
             }
 
           if ($parts.Count -ne [int]$env:BACKUP_PART_COUNT) {
-              throw "Published part count mismatch. Expected $env:BACKUP_PART_COUNT, found $($parts.Count)."
+
+              throw `
+                "Published part count mismatch. Expected $env:BACKUP_PART_COUNT, found $($parts.Count)."
           }
 
           Write-Host ''
@@ -1775,11 +2015,9 @@ jobs:
           Write-Host 'PUBLISHED BACKUP VERIFIED' -ForegroundColor Green
           Write-Host '==================================================' -ForegroundColor Green
 
-          Write-Host "Release    : $env:BACKUP_RELEASE_TAG"
           Write-Host "Generation : $env:BACKUP_GENERATION"
           Write-Host "Parts      : $($parts.Count)"
           Write-Host "SHA256     : $env:ARCHIVE_SHA256"
-          Write-Host '==================================================' -ForegroundColor Green
 
 
       # ======================================================================
@@ -1787,13 +2025,21 @@ jobs:
       # ======================================================================
 
       - name: 23. Cleanup Large Local Files
+
         if: always()
+
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Continue'
 
           Write-Host ''
-          Write-Host 'Cleaning local large files...'
+          Write-Host '==================================================' -ForegroundColor Cyan
+          Write-Host 'CLEANUP' -ForegroundColor Cyan
+          Write-Host '==================================================' -ForegroundColor Cyan
+
+          Write-Host 'Cleaning local image/archive files...'
 
           Remove-Item `
             "$env:BACKUP_ROOT\windows-rdp.vhdx.7z" `
@@ -1825,47 +2071,45 @@ jobs:
       # ======================================================================
 
       - name: 24. Final Summary
+
         if: always()
+
         shell: powershell
+
         run: |
+
           $ErrorActionPreference = 'Continue'
 
           Write-Host ''
           Write-Host '==================================================' -ForegroundColor Green
-          Write-Host 'FINAL WINDOWS RDP PERSISTENCE TEST SUMMARY' -ForegroundColor Green
+          Write-Host 'FINAL WINDOWS RDP WORKFLOW SUMMARY' -ForegroundColor Green
           Write-Host '==================================================' -ForegroundColor Green
 
           Write-Host "Run ID             : $env:GITHUB_RUN_ID"
-          Write-Host "Runner              : $env:RUNNER_OS"
+          Write-Host "Runner OS          : $env:RUNNER_OS"
 
-          Write-Host "Existing Backup     : ${{ steps.detect_backup.outputs.HAS_BACKUP }}"
+          Write-Host `
+            "Existing Backup    : ${{ steps.detect_backup.outputs.HAS_BACKUP }}"
 
-          Write-Host "Keep Alive          : ${{ steps.keep_alive.outcome }}"
+          Write-Host `
+            "Keep Alive         : ${{ steps.keep_alive.outcome }}"
 
-          Write-Host "Image Capture       : ${{ steps.capture_image.outcome }}"
+          Write-Host `
+            "Image Capture      : ${{ steps.capture_image.outcome }}"
 
-          Write-Host "Release Tag         : $env:BACKUP_RELEASE_TAG"
+          Write-Host `
+            "Release Tag        : $env:BACKUP_RELEASE_TAG"
 
-          Write-Host "Session Minutes     : $env:SESSION_MINUTES"
+          Write-Host `
+            "Part Size Maximum  : $env:BACKUP_PART_BYTES bytes"
 
-          Write-Host "Part Size Maximum   : $env:BACKUP_PART_BYTES bytes"
-
-          Write-Host "Backup Generation   : $env:BACKUP_GENERATION"
+          Write-Host `
+            "Backup Generation  : $env:BACKUP_GENERATION"
 
           Write-Host ''
-          Write-Host 'Persistence test:'
-
-          if ('${{ steps.detect_backup.outputs.HAS_BACKUP }}' -eq 'true') {
-
-              Write-Host '  RESTORE MODE' -ForegroundColor Cyan
-              Write-Host '  The previous Windows image was restored into QEMU.'
-              Write-Host '  The Desktop persistence test file should exist inside the guest.'
-          }
-          else {
-
-              Write-Host '  FIRST-RUN MODE' -ForegroundColor Cyan
-              Write-Host '  A Desktop persistence test file was created.'
-              Write-Host '  The file was included in the VHDX capture.'
-          }
+          Write-Host 'Persistence model:'
+          Write-Host '  FIRST RUN  -> Desktop test file -> Disk2vhd -> 7z -> Release'
+          Write-Host '  NEXT RUN   -> Release -> VHDX -> QEMU -> RDP'
+          Write-Host ''
 
           Write-Host '==================================================' -ForegroundColor Green
