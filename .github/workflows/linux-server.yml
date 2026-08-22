@@ -1,4 +1,3 @@
-```yaml
 name: Permanent Linux SSH Server
 
 on:
@@ -1096,4 +1095,4 @@ jobs:
             --no-pager \
             -n 100 \
             || true
-```
+
