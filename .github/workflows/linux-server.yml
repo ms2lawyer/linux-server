@@ -60,7 +60,7 @@ jobs:
       # ============================================================
       - name: 3. Setup OpenSSH Server
         env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_USERNAME: 'Mehdi'
           SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
         run: |
           set -euo pipefail
@@ -153,7 +153,7 @@ jobs:
       - name: 4. Restore Persistent Workspace
         uses: actions/cache/restore@v4
         with:
-          path: /home/${{ secrets.RDP_USERNAME }}/workspace
+          path: /home/Mehdi/workspace
           key: cynet-ssh-workspace-${{ github.run_id }}
           restore-keys: |
             cynet-ssh-workspace-
@@ -163,7 +163,8 @@ jobs:
       # ============================================================
       - name: 5. Fix Workspace Ownership
         env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          
+          NAME: 'Mehdi'
         run: |
           set -euo pipefail
 
@@ -225,7 +226,7 @@ jobs:
       # ============================================================
       - name: 8. Define OmniRoute Paths
         env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_USERNAME: 'Mehdi'
         run: |
           set -euo pipefail
 
@@ -298,7 +299,7 @@ jobs:
       - name: 10. Restore OmniRoute Backup
         if: steps.check_backup.outputs.backup_exists == 'true'
         env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_USERNAME: 'Mehdi'
         run: |
           set -euo pipefail
 
@@ -434,7 +435,7 @@ jobs:
       # ============================================================
       - name: 11. Configure OmniRoute
         env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_USERNAME: 'Mehdi'
         run: |
           set -euo pipefail
 
@@ -534,7 +535,7 @@ jobs:
       # ============================================================
       - name: 12. Create OmniRoute systemd Service
         env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_USERNAME: 'Mehdi'
         run: |
           set -euo pipefail
 
@@ -614,7 +615,7 @@ jobs:
       - name: 13. Verify OmniRoute
         id: verify_omniroute
         env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_USERNAME: 'Mehdi'
         run: |
           set -euo pipefail
 
@@ -829,7 +830,7 @@ jobs:
       - name: 14. Connect Tailscale VPN
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_USERNAME: 'Mehdi'
         run: |
           set -euo pipefail
 
@@ -898,7 +899,7 @@ jobs:
       # ============================================================
       - name: 15. Final Health Check
         env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_USERNAME: 'Mehdi'
         run: |
           set -euo pipefail
 
@@ -1071,7 +1072,7 @@ jobs:
       # ============================================================
       - name: 17. Create Updated OmniRoute Backup
         env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_USERNAME: 'Mehdi'
         run: |
           set -euo pipefail
 
@@ -1365,7 +1366,7 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: /home/${{ secrets.RDP_USERNAME }}/workspace
+          path: /home/Mehdi/workspace
           key: cynet-ssh-workspace-${{ github.run_id }}
 
       # ============================================================
