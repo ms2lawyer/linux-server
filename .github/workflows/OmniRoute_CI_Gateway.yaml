@@ -96,32 +96,51 @@ jobs:
               sudo tailscale status --peers=false || true
             fi
           done
-
-      - name: 7. Stop Container & Flush WAL Logs
+      - name: 7. Graceful Shutdown & Database Checkpoint
         if: always()
         run: |
-          echo "Stopping container cleanly..."
+          set -euo pipefail
+          echo "Stopping OmniRoute container to release file locks..."
           docker stop omniroute || true
-          # Merge WAL changes back into storage.sqlite before pushing to Git
-          sqlite3 "${{ github.workspace }}/storage.sqlite" "PRAGMA wal_checkpoint(TRUNCATE);" || true
 
-      - name: 8. Commit and Push Updated Database to Git
+          # Force-flush SQLite WAL log into the main storage.sqlite database file
+          if [ -f "${{ github.workspace }}/storage.sqlite" ]; then
+            echo "Flushing SQLite WAL checkpoint..."
+            sqlite3 "${{ github.workspace }}/storage.sqlite" "PRAGMA wal_checkpoint(TRUNCATE);" || true
+          fi
+
+      - name: 8. Create Backup & Push Latest State to GitHub
         if: always()
         env:
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN || github.token }}
           GIT_USERNAME: ${{ secrets.GIT_USERNAME }}
         run: |
           set -euo pipefail
+
+          # 1. Configure Git Bot Identity
           USERNAME="${GIT_USERNAME:-github-actions[bot]}"
           git config user.name "$USERNAME"
           git config user.email "$USERNAME@users.noreply.github.com"
 
-          # Stage updated root database files and db_backups directory
-          git add storage.sqlite* db_backups/ || true
+          # 2. Update Full Compressed Backup Archive
+          mkdir -p backup/omniroute
+          tar -czf backup/omniroute/omniroute-full-backup.tar.gz \
+            --exclude='logs' \
+            --exclude='server' \
+            storage.sqlite* .env db_backups/ 2>/dev/null || true
 
+          # 3. Pull latest remote changes to avoid push conflicts
+          git fetch origin ${{ github.ref_name }}
+          git rebase origin/${{ github.ref_name }} || git rebase --abort
+
+          # 4. Stage raw database files, backup archive, and db_backups folder
+          git add storage.sqlite* backup/omniroute/omniroute-full-backup.tar.gz db_backups/ .env || true
+
+          # 5. Commit and Push to Repository
           if git diff --cached --quiet; then
-            echo "No database changes detected."
+            echo "No database changes detected. Skipping git push."
           else
-            git commit -m "chore: auto-update OmniRoute SQLite state [skip ci]"
+            git commit -m "chore: automated OmniRoute DB backup [skip ci]"
             git push origin HEAD:${{ github.ref_name }}
-            echo "Successfully pushed updated database state to repository."
+            echo "Latest database pushed to GitHub successfully."
           fi
