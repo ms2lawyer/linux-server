@@ -14,19 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
-    # ============================================================
-    # GLOBAL CONFIGURATION
-    # ============================================================
     env:
       RDP_USERNAME: Mehdi
       OMNIROUTE_PORT: '20128'
       OMNIROUTE_BACKUP_PATH: backup/omniroute/omniroute-full-backup.tar.gz
 
     steps:
-
-      # ============================================================
-      # 1. CHECKOUT
-      # ============================================================
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
         with:
@@ -34,34 +27,17 @@ jobs:
           token: ${{ secrets.GIT_TOKEN }}
           persist-credentials: true
 
-      # ============================================================
-      # 2. CONFIGURE GIT
-      # ============================================================
       - name: 2. Configure Git
         env:
           GIT_USERNAME: ${{ secrets.GIT_USERNAME }}
           GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
         run: |
           set -euo pipefail
-
-          if [ -z "${GIT_USERNAME:-}" ]; then
-            echo "ERROR: GIT_USERNAME secret is empty."
-            exit 1
-          fi
-
-          if [ -z "${GIT_TOKEN:-}" ]; then
-            echo "ERROR: GIT_TOKEN secret is empty."
-            exit 1
-          fi
-
+          test -n "${GIT_USERNAME:-}" || { echo "ERROR: GIT_USERNAME is empty."; exit 1; }
+          test -n "${GIT_TOKEN:-}" || { echo "ERROR: GIT_TOKEN is empty."; exit 1; }
           git config user.name "$GIT_USERNAME"
           git config user.email "$GIT_USERNAME@users.noreply.github.com"
 
-          echo "Git identity configured."
-
-      # ============================================================
-      # 3. SETUP OPENSSH
-      # ============================================================
       - name: 3. Setup OpenSSH Server
         env:
           SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
@@ -71,17 +47,15 @@ jobs:
           echo "=================================================="
           echo "SETTING UP SSH"
           echo "=================================================="
-
           echo "Username: $RDP_USERNAME"
           echo "Home: /home/$RDP_USERNAME"
 
-          if [ -z "${SSH_PASSWORD:-}" ]; then
+          test -n "${SSH_PASSWORD:-}" || {
             echo "ERROR: SSH_PASSWORD secret is empty."
             exit 1
-          fi
+          }
 
           sudo apt-get update
-
           sudo apt-get install -y \
             openssh-server \
             curl \
@@ -92,84 +66,57 @@ jobs:
             gzip \
             sqlite3
 
-          # --------------------------------------------------------
-          # Create user if necessary
-          # --------------------------------------------------------
-          if ! id "$RDP_USERNAME" >/dev/null 2>&1; then
-            echo "Creating user: $RDP_USERNAME"
+          # Required by sshd on GitHub's Ubuntu runner.
+          sudo mkdir -p /run/sshd
+          sudo chmod 755 /run/sshd
 
-            sudo useradd \
-              -m \
-              -s /bin/bash \
-              "$RDP_USERNAME"
-          else
+          if id "$RDP_USERNAME" >/dev/null 2>&1; then
             echo "User already exists: $RDP_USERNAME"
+          else
+            echo "Creating user: $RDP_USERNAME"
+            sudo useradd -m -s /bin/bash "$RDP_USERNAME"
           fi
 
-          # --------------------------------------------------------
-          # Password
-          # --------------------------------------------------------
-          echo "$RDP_USERNAME:$SSH_PASSWORD" \
-            | sudo chpasswd
+          sudo passwd -u "$RDP_USERNAME" >/dev/null 2>&1 || true
+          echo "$RDP_USERNAME:$SSH_PASSWORD" | sudo chpasswd
 
-          # --------------------------------------------------------
-          # Sudo
-          # --------------------------------------------------------
-          sudo usermod \
-            -aG sudo \
-            "$RDP_USERNAME"
+          sudo usermod -aG sudo "$RDP_USERNAME"
 
           echo "$RDP_USERNAME ALL=(ALL) NOPASSWD:ALL" \
-            | sudo tee \
-              "/etc/sudoers.d/$RDP_USERNAME" \
-            >/dev/null
+            | sudo tee "/etc/sudoers.d/$RDP_USERNAME" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/$RDP_USERNAME"
 
-          sudo chmod 440 \
-            "/etc/sudoers.d/$RDP_USERNAME"
+          sudo mkdir -p /etc/ssh/sshd_config.d
 
-          # --------------------------------------------------------
-          # SSH configuration
-          # --------------------------------------------------------
-          sudo mkdir -p \
-            /etc/ssh/sshd_config.d
+          printf '%s\n' 'PasswordAuthentication yes' \
+            | sudo tee /etc/ssh/sshd_config.d/99-password-auth.conf >/dev/null
 
-          echo "PasswordAuthentication yes" \
-            | sudo tee \
-              /etc/ssh/sshd_config.d/99-password-auth.conf \
-            >/dev/null
+          printf '%s\n' 'PubkeyAuthentication yes' \
+            | sudo tee /etc/ssh/sshd_config.d/98-pubkey-auth.conf >/dev/null
 
-          echo "PubkeyAuthentication yes" \
-            | sudo tee \
-              /etc/ssh/sshd_config.d/98-pubkey-auth.conf \
-            >/dev/null
-
+          # Validate sshd configuration before restart.
           sudo sshd -t
 
           sudo systemctl enable ssh
           sudo systemctl restart ssh
 
-          # --------------------------------------------------------
-          # Workspace
-          # --------------------------------------------------------
-          sudo mkdir -p \
+          sudo systemctl is-active --quiet ssh || {
+            echo "ERROR: ssh.service is not active."
+            sudo journalctl -u ssh --no-pager -n 100 || true
+            exit 1
+          }
+
+          sudo mkdir -p "/home/$RDP_USERNAME/workspace"
+          sudo chown -R "$RDP_USERNAME:$RDP_USERNAME" \
             "/home/$RDP_USERNAME/workspace"
 
-          sudo chown -R \
-            "$RDP_USERNAME:$RDP_USERNAME" \
-            "/home/$RDP_USERNAME/workspace"
+          sudo mkdir -p "/home/$RDP_USERNAME/.omniroute"
+          sudo chown -R "$RDP_USERNAME:$RDP_USERNAME" \
+            "/home/$RDP_USERNAME/.omniroute"
+          sudo chmod 700 "/home/$RDP_USERNAME/.omniroute"
 
-          echo
-          echo "SSH setup completed."
+          echo "SSH setup completed successfully."
 
-          echo "Username:"
-          echo "$RDP_USERNAME"
-
-          echo "HOME:"
-          echo "/home/$RDP_USERNAME"
-
-      # ============================================================
-      # 4. RESTORE WORKSPACE CACHE
-      # ============================================================
       - name: 4. Restore Persistent Workspace
         uses: actions/cache/restore@v4
         with:
@@ -178,123 +125,40 @@ jobs:
           restore-keys: |
             cynet-ssh-workspace-
 
-      # ============================================================
-      # 5. FIX WORKSPACE OWNERSHIP
-      # ============================================================
       - name: 5. Fix Workspace Ownership
         run: |
           set -euo pipefail
-
-          sudo mkdir -p \
+          sudo mkdir -p "/home/$RDP_USERNAME/workspace"
+          sudo chown -R "$RDP_USERNAME:$RDP_USERNAME" \
             "/home/$RDP_USERNAME/workspace"
 
-          sudo chown -R \
-            "$RDP_USERNAME:$RDP_USERNAME" \
-            "/home/$RDP_USERNAME/workspace"
-
-          echo "Workspace:"
-          ls -ld \
-            "/home/$RDP_USERNAME/workspace"
-
-      # ============================================================
-      # 6. INSTALL NODE.JS 22
-      # ============================================================
       - name: 6. Install Node.js 22
         run: |
           set -euo pipefail
-
-          echo "=================================================="
-          echo "INSTALLING NODE.JS 22"
-          echo "=================================================="
-
-          curl -fsSL \
-            https://deb.nodesource.com/setup_22.x \
-            | sudo -E bash -
-
+          curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
           sudo apt-get install -y nodejs
+          echo "Node.js: $(node --version)"
+          echo "NPM: $(npm --version)"
 
-          echo
-          echo "Node:"
-          node --version
-
-          echo
-          echo "NPM:"
-          npm --version
-
-      # ============================================================
-      # 7. INSTALL OMNIROUTE
-      # ============================================================
       - name: 7. Install OmniRoute
         run: |
           set -euo pipefail
-
-          echo "=================================================="
-          echo "INSTALLING OMNIROUTE"
-          echo "=================================================="
-
           sudo npm install -g omniroute
-
-          OMNIROUTE_BIN="$(command -v omniroute)"
-
-          if [ -z "$OMNIROUTE_BIN" ]; then
-            echo "ERROR: omniroute executable not found."
-            exit 1
-          fi
-
-          echo
-          echo "Executable:"
-          echo "$OMNIROUTE_BIN"
-
-          echo
-          echo "Version:"
+          command -v omniroute
           omniroute --version
 
-          echo
-          echo "NPM global root:"
-          npm root -g
-
-      # ============================================================
-      # 8. DEFINE PERSISTENT PATHS
-      # ============================================================
-      - name: 8. Define OmniRoute Paths
+      - name: 8. Prepare OmniRoute Directory
         run: |
           set -euo pipefail
 
           OMNIROUTE_HOME="/home/$RDP_USERNAME/.omniroute"
 
-          echo "OMNIROUTE_HOME=$OMNIROUTE_HOME" \
-            >> "$GITHUB_ENV"
+          sudo mkdir -p "$OMNIROUTE_HOME"
+          sudo chown -R "$RDP_USERNAME:$RDP_USERNAME" "$OMNIROUTE_HOME"
+          sudo chmod 700 "$OMNIROUTE_HOME"
 
-          echo "OMNIROUTE_DB=$OMNIROUTE_HOME/storage.sqlite" \
-            >> "$GITHUB_ENV"
+          echo "OMNIROUTE_HOME=$OMNIROUTE_HOME" >> "$GITHUB_ENV"
 
-          echo "OMNIROUTE_ENV=$OMNIROUTE_HOME/.env" \
-            >> "$GITHUB_ENV"
-
-          echo "HOME=/home/$RDP_USERNAME" \
-            >> "$GITHUB_ENV"
-
-          sudo mkdir -p \
-            "$OMNIROUTE_HOME"
-
-          sudo chown -R \
-            "$RDP_USERNAME:$RDP_USERNAME" \
-            "$OMNIROUTE_HOME"
-
-          sudo chmod 700 \
-            "$OMNIROUTE_HOME"
-
-          echo
-          echo "OmniRoute home:"
-          echo "$OMNIROUTE_HOME"
-
-          echo
-          echo "Database:"
-          echo "$OMNIROUTE_HOME/storage.sqlite"
-
-      # ============================================================
-      # 9. CHECK GIT BACKUP
-      # ============================================================
       - name: 9. Check OmniRoute Backup
         id: check_backup
         run: |
@@ -302,73 +166,22 @@ jobs:
 
           BACKUP_FILE="$GITHUB_WORKSPACE/$OMNIROUTE_BACKUP_PATH"
 
-          echo "=================================================="
-          echo "CHECKING OMNIROUTE BACKUP"
-          echo "=================================================="
+          if [ -f "$BACKUP_FILE" ]; then
+            echo "backup_exists=true" >> "$GITHUB_OUTPUT"
 
-          echo
-          echo "Backup:"
-          echo "$BACKUP_FILE"
+            echo "OmniRoute backup found:"
+            ls -lh "$BACKUP_FILE"
 
-          if [ ! -f "$BACKUP_FILE" ]; then
+            echo "Validating gzip archive..."
+            gzip -t "$BACKUP_FILE"
+            tar -tzf "$BACKUP_FILE" >/dev/null
 
-            echo "backup_exists=false" \
-              >> "$GITHUB_OUTPUT"
-
-            echo
-            echo "No Git backup found."
-            echo "A fresh OmniRoute installation will be initialized."
-
-            exit 0
+            echo "Backup archive is valid."
+          else
+            echo "backup_exists=false" >> "$GITHUB_OUTPUT"
+            echo "No OmniRoute backup found. Fresh state will be created."
           fi
 
-          echo "backup_exists=true" \
-            >> "$GITHUB_OUTPUT"
-
-          echo
-          echo "Backup found."
-
-          ls -lh "$BACKUP_FILE"
-
-          FILE_SIZE="$(stat -c '%s' "$BACKUP_FILE")"
-
-          if [ "$FILE_SIZE" -lt 100 ]; then
-            echo
-            echo "ERROR: Backup file is suspiciously small:"
-            echo "$FILE_SIZE bytes"
-            exit 1
-          fi
-
-          echo
-          echo "Validating gzip/tar archive..."
-
-          tar -tzf \
-            "$BACKUP_FILE" \
-            >/dev/null
-
-          echo "Archive is valid."
-
-          echo
-          echo "Checking storage.sqlite inside archive..."
-
-          if ! tar -tzf "$BACKUP_FILE" \
-            | grep -Eq '(^|/)\./?storage\.sqlite$|(^|/)storage\.sqlite$'; then
-
-            echo "ERROR: storage.sqlite is not present in backup."
-
-            echo
-            echo "Archive contents:"
-            tar -tzf "$BACKUP_FILE" \
-              | head -300
-
-            exit 1
-          fi
-
-          echo "storage.sqlite is present."
-
-      # ============================================================
-      # 10. RESTORE OMNIROUTE BACKUP
-      # ============================================================
       - name: 10. Restore OmniRoute Backup
         if: steps.check_backup.outputs.backup_exists == 'true'
         run: |
@@ -378,134 +191,53 @@ jobs:
           BACKUP_FILE="$GITHUB_WORKSPACE/$OMNIROUTE_BACKUP_PATH"
           RESTORE_TEMP="$RUNNER_TEMP/omniroute-restore"
 
-          echo "=================================================="
-          echo "RESTORING OMNIROUTE BACKUP"
-          echo "=================================================="
-
-          echo
-          echo "Target:"
-          echo "$OMNIROUTE_HOME"
-
-          # --------------------------------------------------------
-          # Existing DB means preserve it.
-          # --------------------------------------------------------
           if [ -f "$OMNIROUTE_HOME/storage.sqlite" ]; then
-
-            echo
-            echo "Existing database detected."
-            echo "Git restore will NOT overwrite it."
-
+            echo "Existing OmniRoute database detected. Skipping restore."
             exit 0
           fi
 
-          echo
-          echo "No local database found."
-          echo "Restoring Git backup..."
+          sudo rm -rf "$RESTORE_TEMP"
+          sudo mkdir -p "$RESTORE_TEMP"
 
-          sudo rm -rf \
-            "$RESTORE_TEMP"
+          sudo tar -xzf "$BACKUP_FILE" -C "$RESTORE_TEMP"
 
-          sudo mkdir -p \
-            "$RESTORE_TEMP"
-
-          sudo tar \
-            -xzf "$BACKUP_FILE" \
-            -C "$RESTORE_TEMP"
-
-          echo
-          echo "Archive contents:"
-          sudo find \
-            "$RESTORE_TEMP" \
-            -maxdepth 5 \
-            -type f \
-            -printf '%P\n' \
-            | head -300
-
-          # --------------------------------------------------------
-          # Locate DB
-          # --------------------------------------------------------
           FOUND_DB="$(
-            sudo find \
-              "$RESTORE_TEMP" \
+            sudo find "$RESTORE_TEMP" \
               -type f \
-              -name "storage.sqlite" \
+              -name storage.sqlite \
               -print \
               -quit
           )"
 
           if [ -z "${FOUND_DB:-}" ]; then
-
-            echo
-            echo "ERROR: storage.sqlite was not found."
-
-            sudo find \
-              "$RESTORE_TEMP" \
-              -maxdepth 8 \
-              -print
-
+            echo "ERROR: storage.sqlite was not found in backup."
+            sudo find "$RESTORE_TEMP" -maxdepth 8 -print || true
             exit 1
           fi
 
           SOURCE_DIR="$(dirname "$FOUND_DB")"
 
-          echo
-          echo "Found DB:"
-          echo "$FOUND_DB"
+          echo "Restoring from: $SOURCE_DIR"
 
-          echo
-          echo "Source directory:"
-          echo "$SOURCE_DIR"
+          sudo cp -a "$SOURCE_DIR"/. "$OMNIROUTE_HOME"/
 
-          # --------------------------------------------------------
-          # Copy COMPLETE state.
-          # --------------------------------------------------------
-          sudo cp -a \
-            "$SOURCE_DIR"/. \
-            "$OMNIROUTE_HOME"/
-
-          # --------------------------------------------------------
-          # Ownership
-          # --------------------------------------------------------
-          sudo chown -R \
-            "$RDP_USERNAME:$RDP_USERNAME" \
-            "$OMNIROUTE_HOME"
-
-          sudo chmod 700 \
-            "$OMNIROUTE_HOME"
+          sudo chown -R "$RDP_USERNAME:$RDP_USERNAME" "$OMNIROUTE_HOME"
+          sudo chmod 700 "$OMNIROUTE_HOME"
 
           if [ -f "$OMNIROUTE_HOME/.env" ]; then
-            sudo chmod 600 \
-              "$OMNIROUTE_HOME/.env"
+            sudo chmod 600 "$OMNIROUTE_HOME/.env"
           fi
 
-          # --------------------------------------------------------
-          # Validate
-          # --------------------------------------------------------
-          if [ ! -f "$OMNIROUTE_HOME/storage.sqlite" ]; then
-            echo "ERROR: Database restore failed."
-            exit 1
-          fi
+          test -f "$OMNIROUTE_HOME/storage.sqlite"
 
-          echo
-          echo "Checking restored SQLite..."
-
-          sudo -u "$RDP_USERNAME" \
-            sqlite3 \
+          sudo -u "$RDP_USERNAME" sqlite3 \
             "$OMNIROUTE_HOME/storage.sqlite" \
-            "PRAGMA integrity_check;" \
-            | grep -qx "ok"
+            "PRAGMA integrity_check;" | grep -qx 'ok'
 
-          echo "Restored database integrity: OK"
+          sudo rm -rf "$RESTORE_TEMP"
 
-          sudo rm -rf \
-            "$RESTORE_TEMP"
-
-          echo
           echo "OmniRoute backup restored successfully."
 
-      # ============================================================
-      # 11. CONFIGURE OMNIROUTE
-      # ============================================================
       - name: 11. Configure OmniRoute
         run: |
           set -euo pipefail
@@ -513,141 +245,52 @@ jobs:
           OMNIROUTE_HOME="/home/$RDP_USERNAME/.omniroute"
           ENV_FILE="$OMNIROUTE_HOME/.env"
 
-          sudo mkdir -p \
-            "$OMNIROUTE_HOME"
+          sudo touch "$ENV_FILE"
 
-          # --------------------------------------------------------
-          # Preserve existing .env from backup.
-          # --------------------------------------------------------
-          if [ ! -f "$ENV_FILE" ]; then
-            sudo touch "$ENV_FILE"
-          fi
-
-          # --------------------------------------------------------
-          # Helper
-          # --------------------------------------------------------
           set_env() {
             local KEY="$1"
             local VALUE="$2"
 
             if sudo grep -q "^${KEY}=" "$ENV_FILE"; then
-
-              sudo sed -i \
-                "s|^${KEY}=.*|${KEY}=${VALUE}|" \
-                "$ENV_FILE"
-
+              sudo sed -i "s|^${KEY}=.*|${KEY}=${VALUE}|" "$ENV_FILE"
             else
-
-              echo "${KEY}=${VALUE}" \
-                | sudo tee -a "$ENV_FILE" \
-                >/dev/null
-
+              printf '%s=%s\n' "$KEY" "$VALUE" \
+                | sudo tee -a "$ENV_FILE" >/dev/null
             fi
           }
 
-          # --------------------------------------------------------
-          # REQUIRED RUNTIME SETTINGS
-          # --------------------------------------------------------
-          set_env \
-            "NODE_ENV" \
-            "production"
+          set_env NODE_ENV production
+          set_env PORT "$OMNIROUTE_PORT"
+          set_env HOSTNAME 0.0.0.0
+          set_env HOME "/home/$RDP_USERNAME"
+          set_env DATA_DIR "$OMNIROUTE_HOME"
+          set_env NEXT_PUBLIC_BASE_URL "http://localhost:$OMNIROUTE_PORT"
 
-          set_env \
-            "PORT" \
-            "$OMNIROUTE_PORT"
-
-          set_env \
-            "HOSTNAME" \
-            "0.0.0.0"
-
-          set_env \
-            "HOME" \
-            "/home/$RDP_USERNAME"
-
-          set_env \
-            "DATA_DIR" \
-            "$OMNIROUTE_HOME"
-
-          set_env \
-            "NEXT_PUBLIC_BASE_URL" \
-            "http://localhost:$OMNIROUTE_PORT"
-
-          # --------------------------------------------------------
-          # BASE_URL is supported by OmniRoute and useful for
-          # server-side internal URLs.
-          # --------------------------------------------------------
-          set_env \
-            "BASE_URL" \
-            "http://127.0.0.1:$OMNIROUTE_PORT"
-
-          # --------------------------------------------------------
-          # Do NOT generate a new encryption key when an existing
-          # database exists.
-          #
-          # The existing STORAGE_ENCRYPTION_KEY from the backup
-          # must remain unchanged.
-          # --------------------------------------------------------
+          # Only create an initial password marker for a fresh database.
           if [ ! -f "$OMNIROUTE_HOME/storage.sqlite" ]; then
-
-            if ! sudo grep -q "^INITIAL_PASSWORD=" "$ENV_FILE"; then
-
-              echo "INITIAL_PASSWORD=CHANGEME" \
-                | sudo tee -a "$ENV_FILE" \
-                >/dev/null
-
+            if ! sudo grep -q '^INITIAL_PASSWORD=' "$ENV_FILE"; then
+              printf '%s\n' 'INITIAL_PASSWORD=CHANGEME' \
+                | sudo tee -a "$ENV_FILE" >/dev/null
             fi
-
           fi
 
-          # --------------------------------------------------------
-          # Ownership
-          # --------------------------------------------------------
-          sudo chown \
-            "$RDP_USERNAME:$RDP_USERNAME" \
-            "$ENV_FILE"
+          sudo chown "$RDP_USERNAME:$RDP_USERNAME" "$ENV_FILE"
+          sudo chmod 600 "$ENV_FILE"
 
-          sudo chmod 600 \
-            "$ENV_FILE"
-
-          sudo chown -R \
-            "$RDP_USERNAME:$RDP_USERNAME" \
-            "$OMNIROUTE_HOME"
-
-          sudo chmod 700 \
-            "$OMNIROUTE_HOME"
-
-          echo
-          echo "=================================================="
-          echo "OMNIROUTE CONFIGURATION"
-          echo "=================================================="
-
+          echo "OmniRoute runtime configuration:"
           sudo grep -E \
-            '^(NODE_ENV|PORT|HOSTNAME|HOME|DATA_DIR|BASE_URL|NEXT_PUBLIC_BASE_URL)=' \
-            "$ENV_FILE" \
-            || true
+            '^(NODE_ENV|PORT|HOSTNAME|HOME|DATA_DIR|NEXT_PUBLIC_BASE_URL)=' \
+            "$ENV_FILE" || true
 
-          echo
           echo "Sensitive variables:"
-
-          for KEY in \
-            JWT_SECRET \
-            API_KEY_SECRET \
-            STORAGE_ENCRYPTION_KEY \
-            STORAGE_ENCRYPTION_KEY_VERSION \
-            INITIAL_PASSWORD
-          do
-
+          for KEY in JWT_SECRET API_KEY_SECRET STORAGE_ENCRYPTION_KEY INITIAL_PASSWORD; do
             if sudo grep -q "^${KEY}=" "$ENV_FILE"; then
               echo "$KEY = PRESENT"
             else
               echo "$KEY = NOT PRESENT"
             fi
-
           done
 
-      # ============================================================
-      # 12. CREATE SYSTEMD SERVICE
-      # ============================================================
       - name: 12. Create OmniRoute systemd Service
         run: |
           set -euo pipefail
@@ -655,17 +298,9 @@ jobs:
           OMNIROUTE_HOME="/home/$RDP_USERNAME/.omniroute"
           OMNIROUTE_BIN="$(command -v omniroute)"
 
-          if [ -z "$OMNIROUTE_BIN" ]; then
-            echo "ERROR: omniroute executable not found."
-            exit 1
-          fi
+          test -n "$OMNIROUTE_BIN"
 
-          echo "OmniRoute executable:"
-          echo "$OMNIROUTE_BIN"
-
-          sudo tee \
-            /etc/systemd/system/omniroute.service \
-            >/dev/null <<EOF
+          sudo tee /etc/systemd/system/omniroute.service >/dev/null <<EOF
           [Unit]
           Description=OmniRoute AI Gateway
           After=network-online.target
@@ -673,10 +308,8 @@ jobs:
 
           [Service]
           Type=simple
-
           User=$RDP_USERNAME
           Group=$RDP_USERNAME
-
           WorkingDirectory=$OMNIROUTE_HOME
 
           Environment=HOME=/home/$RDP_USERNAME
@@ -684,444 +317,110 @@ jobs:
           Environment=PORT=$OMNIROUTE_PORT
           Environment=HOSTNAME=0.0.0.0
           Environment=NODE_ENV=production
-          Environment=BASE_URL=http://127.0.0.1:$OMNIROUTE_PORT
           Environment=NEXT_PUBLIC_BASE_URL=http://localhost:$OMNIROUTE_PORT
-
           EnvironmentFile=$OMNIROUTE_HOME/.env
 
           ExecStart=$OMNIROUTE_BIN
 
           Restart=always
           RestartSec=5
-
           KillSignal=SIGTERM
           TimeoutStopSec=40
-
-          NoNewPrivileges=false
 
           [Install]
           WantedBy=multi-user.target
           EOF
 
-          sudo chmod 644 \
-            /etc/systemd/system/omniroute.service
-
+          sudo chmod 644 /etc/systemd/system/omniroute.service
           sudo systemctl daemon-reload
-
-          sudo systemctl enable \
-            omniroute.service
-
-          sudo systemctl restart \
-            omniroute.service
+          sudo systemctl enable omniroute.service
+          sudo systemctl restart omniroute.service
 
           sleep 5
 
-          echo
-          echo "=================================================="
-          echo "SYSTEMD STATUS"
-          echo "=================================================="
+          sudo systemctl is-active --quiet omniroute.service || {
+            echo "ERROR: OmniRoute service failed."
+            sudo systemctl --no-pager status omniroute.service || true
+            sudo journalctl -u omniroute.service --no-pager -n 250 || true
+            exit 1
+          }
 
-          sudo systemctl --no-pager status \
-            omniroute.service \
-            || true
+          sudo systemctl --no-pager status omniroute.service || true
 
-      # ============================================================
-      # 13. VERIFY OMNIROUTE + DATABASE
-      # ============================================================
       - name: 13. Verify OmniRoute
-        id: verify_omniroute
         run: |
           set -euo pipefail
 
           OMNIROUTE_HOME="/home/$RDP_USERNAME/.omniroute"
           DB_FILE="$OMNIROUTE_HOME/storage.sqlite"
 
-          echo
-          echo "=================================================="
-          echo "VERIFYING OMNIROUTE"
-          echo "=================================================="
+          echo "Waiting for OmniRoute HTTP endpoint..."
 
-          # --------------------------------------------------------
-          # Wait for systemd
-          # --------------------------------------------------------
-          for i in {1..30}; do
-
-            if sudo systemctl is-active \
-              --quiet \
-              omniroute.service; then
-              break
-            fi
-
-            echo "Waiting for systemd service... $i/30"
-            sleep 2
-
-          done
-
-          if ! sudo systemctl is-active \
-            --quiet \
-            omniroute.service; then
-
-            echo
-            echo "ERROR: OmniRoute service is not active."
-
-            sudo systemctl --no-pager status \
-              omniroute.service \
-              || true
-
-            sudo journalctl \
-              -u omniroute.service \
-              --no-pager \
-              -n 250 \
-              || true
-
-            exit 1
-          fi
-
-          # --------------------------------------------------------
-          # Wait for HTTP
-          # --------------------------------------------------------
-          echo
-          echo "Waiting for HTTP endpoint..."
-
-          HTTP_SUCCESS=0
+          SUCCESS=0
 
           for i in {1..60}; do
-
-            HTTP_CODE="$(
-              curl \
-                --silent \
-                --output /dev/null \
-                --write-out '%{http_code}' \
-                --max-time 5 \
-                "http://127.0.0.1:${OMNIROUTE_PORT}" \
-                2>/dev/null \
-                || true
-            )"
-
-            if [[ "$HTTP_CODE" =~ ^[2345][0-9][0-9]$ ]]; then
-
-              echo
-              echo "HTTP endpoint is responding."
-              echo "HTTP status: $HTTP_CODE"
-
-              HTTP_SUCCESS=1
+            if curl -fsS "http://127.0.0.1:$OMNIROUTE_PORT" >/dev/null 2>&1; then
+              SUCCESS=1
               break
-
             fi
-
-            echo "Waiting for HTTP... $i/60"
+            echo "Waiting... $i/60"
             sleep 2
-
           done
 
-          if [ "$HTTP_SUCCESS" -ne 1 ]; then
-
-            echo
+          if [ "$SUCCESS" -ne 1 ]; then
             echo "ERROR: OmniRoute HTTP endpoint did not respond."
-
-            echo
-            echo "Systemd:"
-            sudo systemctl --no-pager status \
-              omniroute.service \
-              || true
-
-            echo
-            echo "Logs:"
-            sudo journalctl \
-              -u omniroute.service \
-              --no-pager \
-              -n 250 \
-              || true
-
+            sudo systemctl --no-pager status omniroute.service || true
+            sudo journalctl -u omniroute.service --no-pager -n 250 || true
             exit 1
           fi
 
-          # --------------------------------------------------------
-          # Show EXACT runtime environment
-          # --------------------------------------------------------
-          echo
-          echo "=================================================="
-          echo "SYSTEMD ENVIRONMENT"
-          echo "=================================================="
+          echo "OmniRoute HTTP endpoint is responding."
 
-          sudo systemctl show \
-            omniroute.service \
-            -p User \
-            -p Group \
-            -p WorkingDirectory \
-            -p Environment \
-            -p EnvironmentFiles \
-            --no-pager
-
-          # --------------------------------------------------------
-          # Process environment
-          # --------------------------------------------------------
-          echo
-          echo "=================================================="
-          echo "PROCESS ENVIRONMENT"
-          echo "=================================================="
-
-          PID="$(
-            sudo systemctl show \
-              -p MainPID \
-              --value \
-              omniroute.service
-          )"
-
-          echo "PID: $PID"
-
-          if [ "$PID" != "0" ] && [ -r "/proc/$PID/environ" ]; then
-
-            sudo tr '\0' '\n' \
-              < "/proc/$PID/environ" \
-              | grep -E \
-                '^(HOME|DATA_DIR|PORT|HOSTNAME|NODE_ENV|BASE_URL|NEXT_PUBLIC_BASE_URL)=' \
-              || true
-
-          fi
-
-          # --------------------------------------------------------
-          # Wait for DB.
-          #
-          # OmniRoute documentation states:
-          # ${DATA_DIR}/storage.sqlite
-          # --------------------------------------------------------
-          echo
-          echo "=================================================="
-          echo "WAITING FOR DATABASE"
-          echo "=================================================="
-
-          DB_FOUND=0
-
-          for i in {1..60}; do
-
-            if [ -f "$DB_FILE" ]; then
-
-              DB_FOUND=1
-              echo "Database found:"
-              echo "$DB_FILE"
-              break
-
-            fi
-
-            echo "Waiting for database... $i/60"
-
+          echo "Waiting for database..."
+          for i in {1..30}; do
+            [ -f "$DB_FILE" ] && break
             sleep 1
-
           done
 
-          # --------------------------------------------------------
-          # If expected DB is missing, diagnose instead of blindly
-          # failing.
-          # --------------------------------------------------------
-          if [ "$DB_FOUND" -ne 1 ]; then
-
-            echo
-            echo "WARNING: Expected database not found:"
+          if [ ! -f "$DB_FILE" ]; then
+            echo "ERROR: storage.sqlite was not created at:"
             echo "$DB_FILE"
 
-            echo
-            echo "=================================================="
-            echo "OMNIROUTE DIRECTORY"
-            echo "=================================================="
+            echo "Searching user home:"
+            sudo find "/home/$RDP_USERNAME" \
+              -type f -name storage.sqlite -print \
+              2>/dev/null || true
 
-            sudo find \
-              "$OMNIROUTE_HOME" \
-              -maxdepth 5 \
-              -printf '%M %u:%g %p\n' \
-              2>/dev/null \
-              || true
+            echo "OmniRoute environment:"
+            sudo systemctl show omniroute.service -p Environment --no-pager || true
 
-            echo
-            echo "=================================================="
-            echo "ALL SQLITE DATABASES UNDER /home/$RDP_USERNAME"
-            echo "=================================================="
+            echo "OmniRoute logs:"
+            sudo journalctl -u omniroute.service --no-pager -n 250 || true
 
-            FOUND_DATABASES="$(
-              sudo find \
-                "/home/$RDP_USERNAME" \
-                -type f \
-                -name "storage.sqlite" \
-                -printf '%p\n' \
-                2>/dev/null \
-                || true
-            )"
-
-            if [ -n "$FOUND_DATABASES" ]; then
-
-              echo "$FOUND_DATABASES"
-
-              FOUND_DB="$(
-                printf '%s\n' "$FOUND_DATABASES" \
-                  | head -n 1
-              )"
-
-              echo
-              echo "Found database elsewhere:"
-              echo "$FOUND_DB"
-
-              echo
-              echo "Canonical target:"
-              echo "$DB_FILE"
-
-              # ----------------------------------------------------
-              # Stop OmniRoute before relocating DB.
-              # ----------------------------------------------------
-              echo
-              echo "Stopping OmniRoute..."
-
-              sudo systemctl stop \
-                omniroute.service
-
-              sleep 2
-
-              sudo mkdir -p \
-                "$OMNIROUTE_HOME"
-
-              sudo cp -a \
-                "$FOUND_DB" \
-                "$DB_FILE"
-
-              # Copy WAL/SHM if they exist beside the DB.
-              if [ -f "${FOUND_DB}-wal" ]; then
-                sudo cp -a \
-                  "${FOUND_DB}-wal" \
-                  "${DB_FILE}-wal"
-              fi
-
-              if [ -f "${FOUND_DB}-shm" ]; then
-                sudo cp -a \
-                  "${FOUND_DB}-shm" \
-                  "${DB_FILE}-shm"
-              fi
-
-              sudo chown -R \
-                "$RDP_USERNAME:$RDP_USERNAME" \
-                "$OMNIROUTE_HOME"
-
-              sudo systemctl start \
-                omniroute.service
-
-              sleep 5
-
-              if [ ! -f "$DB_FILE" ]; then
-                echo "ERROR: Database relocation failed."
-                exit 1
-              fi
-
-              echo "Database canonicalized successfully."
-
-            else
-
-              echo
-              echo "ERROR: storage.sqlite does not exist anywhere under user home."
-
-              echo
-              echo "OmniRoute logs:"
-
-              sudo journalctl \
-                -u omniroute.service \
-                --no-pager \
-                -n 300 \
-                || true
-
-              exit 1
-
-            fi
-
-          fi
-
-          # --------------------------------------------------------
-          # SQLite integrity
-          # --------------------------------------------------------
-          echo
-          echo "=================================================="
-          echo "SQLITE INTEGRITY"
-          echo "=================================================="
-
-          DB_CHECK="$(
-            sudo -u "$RDP_USERNAME" \
-              sqlite3 \
-              "$DB_FILE" \
-              "PRAGMA integrity_check;"
-          )"
-
-          echo "$DB_CHECK"
-
-          if [ "$DB_CHECK" != "ok" ]; then
-            echo "ERROR: SQLite integrity check failed."
             exit 1
           fi
+
+          sudo -u "$RDP_USERNAME" sqlite3 "$DB_FILE" \
+            "PRAGMA integrity_check;" | grep -qx 'ok'
 
           echo "SQLite integrity: OK"
 
-          # --------------------------------------------------------
-          # Port
-          # --------------------------------------------------------
-          echo
-          echo "=================================================="
-          echo "PORT"
-          echo "=================================================="
+          sudo ss -lntp | grep ":$OMNIROUTE_PORT"
+          pgrep -af omniroute || true
+          sudo journalctl -u omniroute.service --no-pager -n 50 || true
 
-          if ! sudo ss -lntp \
-            | grep -q ":${OMNIROUTE_PORT}"; then
-
-            echo "ERROR: Port ${OMNIROUTE_PORT} is not listening."
-            exit 1
-          fi
-
-          sudo ss -lntp \
-            | grep ":${OMNIROUTE_PORT}"
-
-          # --------------------------------------------------------
-          # Process
-          # --------------------------------------------------------
-          echo
-          echo "=================================================="
-          echo "PROCESS"
-          echo "=================================================="
-
-          pgrep -af omniroute \
-            || true
-
-          # --------------------------------------------------------
-          # Logs
-          # --------------------------------------------------------
-          echo
-          echo "=================================================="
-          echo "RECENT LOGS"
-          echo "=================================================="
-
-          sudo journalctl \
-            -u omniroute.service \
-            --no-pager \
-            -n 100 \
-            || true
-
-          echo
-          echo "OmniRoute verification completed successfully."
-
-      # ============================================================
-      # 14. CONNECT TAILSCALE
-      # ============================================================
       - name: 14. Connect Tailscale VPN
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           set -euo pipefail
 
-          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
-            echo "ERROR: TAILSCALE_AUTHKEY secret is empty."
+          test -n "${TAILSCALE_AUTHKEY:-}" || {
+            echo "ERROR: TAILSCALE_AUTHKEY is empty."
             exit 1
-          fi
+          }
 
-          echo "=================================================="
-          echo "CONNECTING TAILSCALE"
-          echo "=================================================="
-
-          curl -fsSL \
-            https://tailscale.com/install.sh \
-            | sh
+          curl -fsSL https://tailscale.com/install.sh | sh
 
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTHKEY" \
@@ -1129,57 +428,17 @@ jobs:
 
           TS_IP="$(tailscale ip -4)"
 
-          if [ -z "$TS_IP" ]; then
-            echo "ERROR: Could not obtain Tailscale IPv4."
-            exit 1
-          fi
-
-          echo
           echo "=================================================="
           echo "LINUX SSH + OMNIROUTE SERVER IS LIVE"
           echo "=================================================="
-
-          echo
-          echo "Tailscale IP:"
-          echo "$TS_IP"
-
-          echo
-          echo "SSH Username:"
-          echo "$RDP_USERNAME"
-
-          echo
-          echo "SSH Password:"
-          echo "Stored in GitHub Secret SSH_PASSWORD"
-
-          echo
-          echo "--------------------------------------------------"
-          echo "SSH:"
-          echo "ssh $RDP_USERNAME@$TS_IP"
-
-          echo
-          echo "--------------------------------------------------"
-          echo "OmniRoute:"
-          echo "http://$TS_IP:$OMNIROUTE_PORT"
-
-          echo
-          echo "OmniRoute API:"
-          echo "http://$TS_IP:$OMNIROUTE_PORT/v1"
-
-          echo
-          echo "--------------------------------------------------"
-          echo "Workspace:"
-          echo "/home/$RDP_USERNAME/workspace"
-
-          echo
-          echo "OmniRoute data:"
-          echo "/home/$RDP_USERNAME/.omniroute"
-
-          echo
+          echo "Tailscale IP: $TS_IP"
+          echo "SSH: ssh $RDP_USERNAME@$TS_IP"
+          echo "OmniRoute: http://$TS_IP:$OMNIROUTE_PORT"
+          echo "OmniRoute API: http://$TS_IP:$OMNIROUTE_PORT/v1"
+          echo "Workspace: /home/$RDP_USERNAME/workspace"
+          echo "OmniRoute data: /home/$RDP_USERNAME/.omniroute"
           echo "=================================================="
 
-      # ============================================================
-      # 15. FINAL HEALTH CHECK
-      # ============================================================
       - name: 15. Final Health Check
         run: |
           set -euo pipefail
@@ -1187,516 +446,160 @@ jobs:
           OMNIROUTE_HOME="/home/$RDP_USERNAME/.omniroute"
           DB_FILE="$OMNIROUTE_HOME/storage.sqlite"
 
-          echo
           echo "=================================================="
           echo "FINAL HEALTH CHECK"
           echo "=================================================="
 
-          # --------------------------------------------------------
-          # SSH
-          # --------------------------------------------------------
-          echo
           echo "SSH:"
+          sudo systemctl is-active --quiet ssh
+          echo "active"
 
-          SSH_STATE="$(
-            sudo systemctl is-active ssh
-          )"
-
-          echo "$SSH_STATE"
-
-          if [ "$SSH_STATE" != "active" ]; then
-            echo "ERROR: SSH is not active."
-            exit 1
-          fi
-
-          # --------------------------------------------------------
-          # OmniRoute
-          # --------------------------------------------------------
-          echo
           echo "OmniRoute:"
+          sudo systemctl is-active --quiet omniroute.service
+          echo "active"
 
-          OMNI_STATE="$(
-            sudo systemctl is-active \
-              omniroute.service
-          )"
-
-          echo "$OMNI_STATE"
-
-          if [ "$OMNI_STATE" != "active" ]; then
-            echo "ERROR: OmniRoute is not active."
-            exit 1
-          fi
-
-          # --------------------------------------------------------
-          # Port
-          # --------------------------------------------------------
-          echo
           echo "OmniRoute port:"
+          sudo ss -lntp | grep ":$OMNIROUTE_PORT"
 
-          sudo ss -lntp \
-            | grep ":${OMNIROUTE_PORT}"
-
-          # --------------------------------------------------------
-          # Database
-          # --------------------------------------------------------
-          echo
           echo "Database:"
-
           if [ ! -f "$DB_FILE" ]; then
-
-            echo "ERROR: Database does not exist:"
-            echo "$DB_FILE"
-
-            echo
-            echo "All storage.sqlite files:"
-
-            sudo find \
-              "/home/$RDP_USERNAME" \
-              -type f \
-              -name "storage.sqlite" \
-              -print \
-              2>/dev/null \
-              || true
-
+            echo "ERROR: Database does not exist: $DB_FILE"
+            sudo find "/home/$RDP_USERNAME" \
+              -type f -name storage.sqlite -print \
+              2>/dev/null || true
             exit 1
           fi
 
-          ls -lh \
-            "$DB_FILE"
+          ls -lh "$DB_FILE"
 
-          # --------------------------------------------------------
-          # SQLite integrity
-          # --------------------------------------------------------
-          echo
           echo "Database integrity:"
+          sudo -u "$RDP_USERNAME" sqlite3 "$DB_FILE" \
+            "PRAGMA integrity_check;" | grep -qx 'ok'
+          echo "ok"
 
-          DB_CHECK="$(
-            sudo -u "$RDP_USERNAME" \
-              sqlite3 \
-              "$DB_FILE" \
-              "PRAGMA integrity_check;"
-          )"
-
-          echo "$DB_CHECK"
-
-          if [ "$DB_CHECK" != "ok" ]; then
-            echo "ERROR: SQLite integrity check failed."
-            exit 1
-          fi
-
-          # --------------------------------------------------------
-          # Ownership
-          # --------------------------------------------------------
-          echo
-          echo "Database ownership:"
-
-          stat \
-            -c '%U:%G %a %n' \
-            "$DB_FILE"
-
-          # --------------------------------------------------------
-          # OmniRoute directory
-          # --------------------------------------------------------
-          echo
           echo "OmniRoute directory:"
+          sudo du -sh "$OMNIROUTE_HOME"
 
-          sudo du -sh \
-            "$OMNIROUTE_HOME"
-
-          # --------------------------------------------------------
-          # Service PID
-          # --------------------------------------------------------
-          echo
-          echo "Service PID:"
-
-          sudo systemctl show \
-            omniroute.service \
-            -p MainPID \
-            --no-pager
-
-          # --------------------------------------------------------
-          # Final
-          # --------------------------------------------------------
-          echo
           echo "=================================================="
           echo "HEALTH CHECK PASSED"
           echo "=================================================="
 
-      # ============================================================
-      # 16. KEEP SERVER ALIVE
-      # ============================================================
       - name: 16. Server Keep-Alive
         run: |
           set -euo pipefail
 
-          echo "Server will remain active for the remainder of the runner."
-
           for i in {1..355}; do
-
             sleep 60
 
             if (( i % 10 == 0 )); then
-
-              echo
               echo "[$i/355] Server is active..."
-
-              echo "OmniRoute:"
-              sudo systemctl is-active \
-                omniroute.service \
-                || true
-
-              echo "SSH:"
-              sudo systemctl is-active \
-                ssh \
-                || true
-
-              echo "Tailscale:"
-              sudo tailscale status \
-                --peers=false \
-                || true
-
-              echo "Database:"
-              if [ -f "$OMNIROUTE_DB" ]; then
-                ls -lh "$OMNIROUTE_DB"
-              else
-                echo "WARNING: Database missing!"
-              fi
-
+              sudo systemctl is-active omniroute.service || true
+              sudo systemctl is-active ssh || true
+              sudo tailscale status --peers=false || true
             fi
-
           done
 
-      # ============================================================
-      # 17. CREATE UPDATED BACKUP
-      # ============================================================
       - name: 17. Create Updated OmniRoute Backup
         run: |
           set -euo pipefail
 
           OMNIROUTE_HOME="/home/$RDP_USERNAME/.omniroute"
-          DB_FILE="$OMNIROUTE_HOME/storage.sqlite"
-
           BACKUP_FILE="$GITHUB_WORKSPACE/$OMNIROUTE_BACKUP_PATH"
-          TEMP_BACKUP="$BACKUP_FILE.tmp"
+          TEMP_BACKUP="$RUNNER_TEMP/omniroute-backup.tar.gz"
 
-          echo
-          echo "=================================================="
-          echo "CREATING UPDATED OMNIROUTE BACKUP"
-          echo "=================================================="
+          test -f "$OMNIROUTE_HOME/storage.sqlite"
 
-          if [ ! -d "$OMNIROUTE_HOME" ]; then
-            echo "ERROR: OmniRoute directory does not exist."
-            exit 1
-          fi
+          sudo systemctl stop omniroute.service
 
-          if [ ! -f "$DB_FILE" ]; then
-            echo "ERROR: storage.sqlite does not exist."
-            exit 1
-          fi
-
-          # --------------------------------------------------------
-          # Stop service
-          # --------------------------------------------------------
-          echo
-          echo "Stopping OmniRoute..."
-
-          sudo systemctl stop \
-            omniroute.service
-
-          # --------------------------------------------------------
-          # Confirm stopped
-          # --------------------------------------------------------
-          for i in {1..30}; do
-
-            if ! sudo systemctl is-active \
-              --quiet \
-              omniroute.service; then
+          for i in {1..20}; do
+            if ! sudo systemctl is-active --quiet omniroute.service; then
               break
             fi
-
             sleep 1
-
           done
 
-          if sudo systemctl is-active \
-            --quiet \
-            omniroute.service; then
-
+          if sudo systemctl is-active --quiet omniroute.service; then
             echo "ERROR: OmniRoute did not stop."
             exit 1
           fi
 
-          # --------------------------------------------------------
-          # SQLite checkpoint
-          # --------------------------------------------------------
-          echo
-          echo "Checkpointing SQLite..."
+          sudo -u "$RDP_USERNAME" sqlite3 \
+            "$OMNIROUTE_HOME/storage.sqlite" \
+            "PRAGMA wal_checkpoint(TRUNCATE);" || true
 
-          sudo -u "$RDP_USERNAME" \
-            sqlite3 \
-            "$DB_FILE" \
-            "PRAGMA wal_checkpoint(TRUNCATE);"
+          sudo -u "$RDP_USERNAME" sqlite3 \
+            "$OMNIROUTE_HOME/storage.sqlite" \
+            "PRAGMA integrity_check;" | grep -qx 'ok'
 
-          # --------------------------------------------------------
-          # Integrity
-          # --------------------------------------------------------
-          echo
-          echo "Checking database integrity..."
-
-          sudo -u "$RDP_USERNAME" \
-            sqlite3 \
-            "$DB_FILE" \
-            "PRAGMA integrity_check;" \
-            | grep -qx "ok"
-
-          echo "Database integrity: OK"
-
-          # --------------------------------------------------------
-          # Backup directory
-          # --------------------------------------------------------
-          sudo mkdir -p \
-            "$(dirname "$BACKUP_FILE")"
-
-          sudo rm -f \
-            "$TEMP_BACKUP"
-
-          # --------------------------------------------------------
-          # Create backup.
-          #
-          # We archive the COMPLETE .omniroute directory so that
-          # .env, encryption keys, database and all state survive.
-          # --------------------------------------------------------
-          echo
-          echo "Creating archive..."
+          mkdir -p "$(dirname "$BACKUP_FILE")"
+          rm -f "$TEMP_BACKUP"
 
           sudo tar \
             -czf "$TEMP_BACKUP" \
             -C "$OMNIROUTE_HOME" \
             .
 
-          # --------------------------------------------------------
-          # Validate archive
-          # --------------------------------------------------------
-          echo
-          echo "Validating archive..."
+          gzip -t "$TEMP_BACKUP"
+          tar -tzf "$TEMP_BACKUP" >/dev/null
 
-          tar -tzf \
-            "$TEMP_BACKUP" \
-            >/dev/null
-
-          if ! tar -tzf "$TEMP_BACKUP" \
-            | grep -qx './storage.sqlite'; then
-
-            echo "ERROR: storage.sqlite missing from archive."
-
-            echo
-            echo "Archive contents:"
-            tar -tzf "$TEMP_BACKUP" \
-              | head -300
-
-            rm -f "$TEMP_BACKUP"
-
+          if ! tar -tzf "$TEMP_BACKUP" | grep -qx './storage.sqlite'; then
+            echo "ERROR: storage.sqlite is missing from archive."
             exit 1
           fi
 
-          # --------------------------------------------------------
-          # Validate archive size
-          # --------------------------------------------------------
-          BACKUP_SIZE="$(
-            stat -c '%s' "$TEMP_BACKUP"
-          )"
+          mv "$TEMP_BACKUP" "$BACKUP_FILE"
 
-          if [ "$BACKUP_SIZE" -lt 100 ]; then
-
-            echo "ERROR: Generated backup is too small:"
-            echo "$BACKUP_SIZE bytes"
-
-            rm -f "$TEMP_BACKUP"
-
-            exit 1
-          fi
-
-          # --------------------------------------------------------
-          # Atomic replacement
-          # --------------------------------------------------------
-          sudo mv \
-            "$TEMP_BACKUP" \
-            "$BACKUP_FILE"
-
-          sudo chown \
-            "$(id -u):$(id -g)" \
-            "$BACKUP_FILE"
-
-          echo
-          echo "Backup created successfully:"
-
-          ls -lh \
-            "$BACKUP_FILE"
-
-          # --------------------------------------------------------
-          # Restart
-          # --------------------------------------------------------
-          echo
-          echo "Restarting OmniRoute..."
-
-          sudo systemctl start \
-            omniroute.service
-
+          sudo systemctl start omniroute.service
           sleep 5
+          sudo systemctl is-active --quiet omniroute.service
 
-          if ! sudo systemctl is-active \
-            --quiet \
-            omniroute.service; then
+          echo "Backup created and OmniRoute restarted successfully."
+          ls -lh "$BACKUP_FILE"
 
-            echo "ERROR: OmniRoute failed to restart."
-
-            sudo journalctl \
-              -u omniroute.service \
-              --no-pager \
-              -n 200 \
-              || true
-
-            exit 1
-          fi
-
-          echo
-          echo "OmniRoute restarted successfully."
-
-      # ============================================================
-      # 18. SYNCHRONIZE GIT WITH REMOTE
-      # ============================================================
-      - name: 18. Synchronize Git
+      - name: 18. Synchronize Git Before Push
         run: |
           set -euo pipefail
 
-          BRANCH="${GITHUB_REF_NAME}"
-          TEMP_GIT_BACKUP="$RUNNER_TEMP/omniroute-git-backup.tar.gz"
+          BRANCH="$GITHUB_REF_NAME"
+          TEMP_BACKUP="$RUNNER_TEMP/omniroute-git-backup.tar.gz"
 
-          echo
-          echo "=================================================="
-          echo "SYNCHRONIZING GIT"
-          echo "=================================================="
-
-          # --------------------------------------------------------
-          # Save newly created backup outside repository.
-          # --------------------------------------------------------
           cp \
             "$GITHUB_WORKSPACE/$OMNIROUTE_BACKUP_PATH" \
-            "$TEMP_GIT_BACKUP"
+            "$TEMP_BACKUP"
 
-          # --------------------------------------------------------
-          # Fetch latest remote.
-          # --------------------------------------------------------
-          git fetch \
-            origin \
-            "$BRANCH"
+          git fetch origin "$BRANCH"
 
-          echo
-          echo "Remote branch:"
-          echo "$BRANCH"
+          git reset --hard "origin/$BRANCH"
 
-          # --------------------------------------------------------
-          # Reset to latest remote.
-          #
-          # This intentionally avoids binary rebase conflicts.
-          # --------------------------------------------------------
-          git reset \
-            --hard \
-            "origin/$BRANCH"
-
-          # --------------------------------------------------------
-          # Restore our newly-created backup.
-          # --------------------------------------------------------
-          mkdir -p \
-            "$(dirname "$GITHUB_WORKSPACE/$OMNIROUTE_BACKUP_PATH")"
+          mkdir -p "$(dirname "$GITHUB_WORKSPACE/$OMNIROUTE_BACKUP_PATH")"
 
           cp \
-            "$TEMP_GIT_BACKUP" \
+            "$TEMP_BACKUP" \
             "$GITHUB_WORKSPACE/$OMNIROUTE_BACKUP_PATH"
-
-          echo
-          echo "Git synchronization completed."
 
           git status --short
 
-      # ============================================================
-      # 19. PUSH BACKUP
-      # ============================================================
-      - name: 19. Push OmniRoute Backup To Git
+      - name: 19. Commit + Push OmniRoute Backup
         env:
           GIT_USERNAME: ${{ secrets.GIT_USERNAME }}
-          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
         run: |
           set -euo pipefail
 
-          BRANCH="${GITHUB_REF_NAME}"
+          BRANCH="$GITHUB_REF_NAME"
           BACKUP_FILE="$OMNIROUTE_BACKUP_PATH"
 
-          echo
-          echo "=================================================="
-          echo "PUSHING OMNIROUTE BACKUP"
-          echo "=================================================="
+          git config user.name "$GIT_USERNAME"
+          git config user.email "$GIT_USERNAME@users.noreply.github.com"
 
-          if [ -z "${GIT_USERNAME:-}" ]; then
-            echo "ERROR: GIT_USERNAME secret is empty."
-            exit 1
-          fi
+          git add "$BACKUP_FILE"
 
-          if [ -z "${GIT_TOKEN:-}" ]; then
-            echo "ERROR: GIT_TOKEN secret is empty."
-            exit 1
-          fi
-
-          if [ ! -f "$GITHUB_WORKSPACE/$BACKUP_FILE" ]; then
-
-            echo "ERROR: Backup file does not exist:"
-            echo "$BACKUP_FILE"
-
-            exit 1
-          fi
-
-          git config \
-            user.name \
-            "$GIT_USERNAME"
-
-          git config \
-            user.email \
-            "$GIT_USERNAME@users.noreply.github.com"
-
-          git add \
-            "$BACKUP_FILE"
-
-          if git diff \
-            --cached \
-            --quiet \
-            -- "$BACKUP_FILE"; then
-
-            echo
-            echo "Backup has not changed."
-            echo "Nothing to commit."
-
+          if git diff --cached --quiet -- "$BACKUP_FILE"; then
+            echo "OmniRoute backup has not changed."
           else
-
-            echo
-            echo "Backup changed."
-
-            git commit \
-              -m "chore: update OmniRoute backup"
-
-            git push \
-              origin \
-              "$BRANCH"
-
-            echo
-            echo "=================================================="
-            echo "BACKUP PUSHED SUCCESSFULLY"
-            echo "=================================================="
-
+            git commit -m "chore: update OmniRoute backup"
+            git push origin "$BRANCH"
           fi
 
-      # ============================================================
-      # 20. SAVE WORKSPACE CACHE
-      # ============================================================
       - name: 20. Save Workspace Cache
         if: always()
         uses: actions/cache/save@v4
@@ -1704,65 +607,21 @@ jobs:
           path: /home/Mehdi/workspace
           key: cynet-ssh-workspace-${{ github.run_id }}
 
-      # ============================================================
-      # 21. FINAL SERVICE STATE
-      # ============================================================
       - name: 21. Final Service State
         if: always()
         run: |
-          echo
           echo "=================================================="
           echo "FINAL SERVICE STATE"
           echo "=================================================="
 
-          echo
           echo "SSH:"
-          sudo systemctl \
-            --no-pager \
-            status ssh \
-            || true
+          sudo systemctl --no-pager status ssh || true
 
-          echo
           echo "OmniRoute:"
-          sudo systemctl \
-            --no-pager \
-            status omniroute.service \
-            || true
+          sudo systemctl --no-pager status omniroute.service || true
 
-          echo
-          echo "Listening ports:"
-          sudo ss -lntp \
-            | grep -E ":${OMNIROUTE_PORT}\b" \
-            || true
+          echo "Listening port:"
+          sudo ss -lntp | grep ":$OMNIROUTE_PORT" || true
 
-          echo
-          echo "Database:"
-          if [ -f "$OMNIROUTE_DB" ]; then
-            ls -lh "$OMNIROUTE_DB"
-          else
-            echo "Database not found:"
-            echo "$OMNIROUTE_DB"
-          fi
-
-          echo
-          echo "OmniRoute directory:"
-          sudo find \
-            "$OMNIROUTE_HOME" \
-            -maxdepth 2 \
-            -printf '%M %u:%g %p\n' \
-            2>/dev/null \
-            || true
-
-          echo
           echo "Recent OmniRoute logs:"
-
-          sudo journalctl \
-            -u omniroute.service \
-            --no-pager \
-            -n 100 \
-            || true
-
-          echo
-          echo "=================================================="
-          echo "END"
-          echo "=================================================="
+          sudo journalctl -u omniroute.service --no-pager -n 100 || true
