@@ -1,0 +1,66 @@
+name: OmniRoute CI Gateway (Restored State)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  run-omniroute:
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 3
+
+    steps:
+      - name: Checkout repository files
+        uses: actions/checkout@v4
+
+      - name: Set database permissions
+        run: |
+          # Grant full write access so SQLite can create journal/WAL files inside CI
+          sudo chmod -R 777 ${{ github.workspace }}
+
+      - name: Start OmniRoute with restored local data
+        run: |
+          docker run -d \
+            --name omniroute \
+            --restart unless-stopped \
+            -p 20128:20128 \
+            -e NODE_ENV=production \
+            -e JWT_SECRET="${{ secrets.JWT_SECRET }}" \
+            -e API_KEY_SECRET="${{ secrets.API_KEY_SECRET }}" \
+            -e REDIS_URL="redis://host.docker.internal:6379" \
+            --add-host=host.docker.internal:host-gateway \
+            -v ${{ github.workspace }}:/root/.omniroute \
+            -v ${{ github.workspace }}:/app/data \
+            diegosouzapw/omniroute:latest
+
+      - name: Wait for OmniRoute readiness
+        run: |
+          echo "Waiting for OmniRoute gateway to initialize..."
+          for i in {1..30}; do
+            if curl -s http://localhost:20128/v1/models > /dev/null; then
+              echo "OmniRoute is active with restored state!"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "OmniRoute initialization failed. Displaying container logs:"
+          docker logs omniroute
+          exit 1
+
+      - name: Verify restored models endpoint
+        run: |
+          echo "Listing available models from restored state:"
+          curl -s http://localhost:20128/v1/models | jq .
