@@ -1,15 +1,20 @@
 name: OmniRoute CI Gateway (Restored State)
 
 on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
   push:
     branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
-  workflow_dispatch:
+
+concurrency:
+  group: omniroute-ci-gateway
+  cancel-in-progress: false
 
 jobs:
   run-omniroute:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     services:
       redis:
@@ -23,15 +28,29 @@ jobs:
           --health-retries 3
 
     steps:
-      - name: Checkout repository files
+      - name: 1. Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GIT_TOKEN || github.token }}
 
-      - name: Set database permissions
+      - name: 2. Set Workspace Permissions & Install SQLite CLI
         run: |
-          # Grant full write access so SQLite can create journal/WAL files inside CI
           sudo chmod -R 777 ${{ github.workspace }}
+          sudo apt-get update && sudo apt-get install -y sqlite3
 
-      - name: Start OmniRoute with restored local data
+      - name: 3. Connect Tailscale VPN
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          test -n "${TAILSCALE_AUTHKEY:-}" || { echo "ERROR: TAILSCALE_AUTHKEY is empty."; exit 1; }
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="omniroute-ci-gateway"
+          TS_IP="$(tailscale ip -4)"
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+
+      - name: 4. Start OmniRoute Container
         run: |
           docker run -d \
             --name omniroute \
@@ -40,27 +59,69 @@ jobs:
             -e NODE_ENV=production \
             -e JWT_SECRET="${{ secrets.JWT_SECRET }}" \
             -e API_KEY_SECRET="${{ secrets.API_KEY_SECRET }}" \
+            -e STORAGE_ENCRYPTION_KEY="${{ secrets.STORAGE_ENCRYPTION_KEY }}" \
             -e REDIS_URL="redis://host.docker.internal:6379" \
             --add-host=host.docker.internal:host-gateway \
             -v ${{ github.workspace }}:/root/.omniroute \
             -v ${{ github.workspace }}:/app/data \
             diegosouzapw/omniroute:latest
 
-      - name: Wait for OmniRoute readiness
+      - name: 5. Verify OmniRoute Health
         run: |
           echo "Waiting for OmniRoute gateway to initialize..."
           for i in {1..30}; do
-            if curl -s http://localhost:20128/v1/models > /dev/null; then
-              echo "OmniRoute is active with restored state!"
+            if curl -s http://localhost:20128 > /dev/null; then
+              echo "=================================================="
+              echo "OMNIROUTE GATEWAY LIVE VIA TAILSCALE"
+              echo "Dashboard URL : http://${{ env.TAILSCALE_IP }}:20128"
+              echo "API Endpoint  : http://${{ env.TAILSCALE_IP }}:20128/v1"
+              echo "=================================================="
               exit 0
             fi
             sleep 2
           done
-          echo "OmniRoute initialization failed. Displaying container logs:"
+          echo "OmniRoute initialization failed. Logs:"
           docker logs omniroute
           exit 1
 
-      - name: Verify restored models endpoint
+      - name: 6. Keep-Alive (355-Minute Loop)
         run: |
-          echo "Listing available models from restored state:"
-          curl -s http://localhost:20128/v1/models | jq .
+          set -euo pipefail
+          echo "Running server keep-alive for 355 minutes..."
+          for i in {1..355}; do
+            sleep 60
+            if (( i % 10 == 0 )); then
+              echo "[$i/355 min] Container status:"
+              docker ps --filter "name=omniroute" --format "Status: {{.Status}}"
+              sudo tailscale status --peers=false || true
+            fi
+          done
+
+      - name: 7. Stop Container & Flush WAL Logs
+        if: always()
+        run: |
+          echo "Stopping container cleanly..."
+          docker stop omniroute || true
+          # Merge WAL changes back into storage.sqlite before pushing to Git
+          sqlite3 "${{ github.workspace }}/storage.sqlite" "PRAGMA wal_checkpoint(TRUNCATE);" || true
+
+      - name: 8. Commit and Push Updated Database to Git
+        if: always()
+        env:
+          GIT_USERNAME: ${{ secrets.GIT_USERNAME }}
+        run: |
+          set -euo pipefail
+          USERNAME="${GIT_USERNAME:-github-actions[bot]}"
+          git config user.name "$USERNAME"
+          git config user.email "$USERNAME@users.noreply.github.com"
+
+          # Stage updated root database files and db_backups directory
+          git add storage.sqlite* db_backups/ || true
+
+          if git diff --cached --quiet; then
+            echo "No database changes detected."
+          else
+            git commit -m "chore: auto-update OmniRoute SQLite state [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "Successfully pushed updated database state to repository."
+          fi
