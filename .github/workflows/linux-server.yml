@@ -191,7 +191,7 @@ jobs:
           BACKUP_FILE="$GITHUB_WORKSPACE/$OMNIROUTE_BACKUP_PATH"
           RESTORE_TEMP="$RUNNER_TEMP/omniroute-restore"
 
-          if [ -f "$OMNIROUTE_HOME/storage.sqlite" ]; then
+          if sudo test -f "$OMNIROUTE_HOME/storage.sqlite"; then
             echo "Existing OmniRoute database detected. Skipping restore."
             exit 0
           fi
@@ -224,11 +224,11 @@ jobs:
           sudo chown -R "$RDP_USERNAME:$RDP_USERNAME" "$OMNIROUTE_HOME"
           sudo chmod 700 "$OMNIROUTE_HOME"
 
-          if [ -f "$OMNIROUTE_HOME/.env" ]; then
+          if sudo test -f "$OMNIROUTE_HOME/.env"; then
             sudo chmod 600 "$OMNIROUTE_HOME/.env"
           fi
 
-          test -f "$OMNIROUTE_HOME/storage.sqlite"
+          sudo test -f "$OMNIROUTE_HOME/storage.sqlite"
 
           sudo -u "$RDP_USERNAME" sqlite3 \
             "$OMNIROUTE_HOME/storage.sqlite" \
@@ -267,7 +267,7 @@ jobs:
           set_env NEXT_PUBLIC_BASE_URL "http://localhost:$OMNIROUTE_PORT"
 
           # Only create an initial password marker for a fresh database.
-          if [ ! -f "$OMNIROUTE_HOME/storage.sqlite" ]; then
+          if ! sudo test -f "$OMNIROUTE_HOME/storage.sqlite"; then
             if ! sudo grep -q '^INITIAL_PASSWORD=' "$ENV_FILE"; then
               printf '%s\n' 'INITIAL_PASSWORD=CHANGEME' \
                 | sudo tee -a "$ENV_FILE" >/dev/null
@@ -376,13 +376,19 @@ jobs:
 
           echo "OmniRoute HTTP endpoint is responding."
 
-          echo "Waiting for database..."
-          for i in {1..30}; do
-            [ -f "$DB_FILE" ] && break
+          echo "Waiting for database (up to 120 s)..."
+          for i in {1..120}; do
+            if sudo test -f "$DB_FILE"; then
+              echo "Database found after ${i}s"
+              break
+            fi
+            if (( i % 10 == 0 )); then
+              echo "Still waiting for database... $i/120"
+            fi
             sleep 1
           done
 
-          if [ ! -f "$DB_FILE" ]; then
+          if ! sudo test -f "$DB_FILE"; then
             echo "ERROR: storage.sqlite was not created at:"
             echo "$DB_FILE"
 
@@ -394,14 +400,25 @@ jobs:
             echo "OmniRoute environment:"
             sudo systemctl show omniroute.service -p Environment --no-pager || true
 
+            echo "OmniRoute directory listing:"
+            sudo ls -la "$OMNIROUTE_HOME" || true
+
             echo "OmniRoute logs:"
             sudo journalctl -u omniroute.service --no-pager -n 250 || true
 
             exit 1
           fi
 
-          sudo -u "$RDP_USERNAME" sqlite3 "$DB_FILE" \
-            "PRAGMA integrity_check;" | grep -qx 'ok'
+          echo "Database exists:"
+          sudo ls -lh "$DB_FILE"
+
+          DB_CHECK="$(
+            sudo -u "$RDP_USERNAME" \
+              sqlite3 "$DB_FILE" \
+              "PRAGMA integrity_check;"
+          )"
+          echo "SQLite integrity_check: $DB_CHECK"
+          echo "$DB_CHECK" | grep -qx 'ok'
 
           echo "SQLite integrity: OK"
 
@@ -462,7 +479,7 @@ jobs:
           sudo ss -lntp | grep ":$OMNIROUTE_PORT"
 
           echo "Database:"
-          if [ ! -f "$DB_FILE" ]; then
+          if ! sudo test -f "$DB_FILE"; then
             echo "ERROR: Database does not exist: $DB_FILE"
             sudo find "/home/$RDP_USERNAME" \
               -type f -name storage.sqlite -print \
@@ -470,11 +487,16 @@ jobs:
             exit 1
           fi
 
-          ls -lh "$DB_FILE"
+          sudo ls -lh "$DB_FILE"
 
           echo "Database integrity:"
-          sudo -u "$RDP_USERNAME" sqlite3 "$DB_FILE" \
-            "PRAGMA integrity_check;" | grep -qx 'ok'
+          DB_CHECK="$(
+            sudo -u "$RDP_USERNAME" \
+              sqlite3 "$DB_FILE" \
+              "PRAGMA integrity_check;"
+          )"
+          echo "$DB_CHECK"
+          echo "$DB_CHECK" | grep -qx 'ok'
           echo "ok"
 
           echo "OmniRoute directory:"
@@ -507,7 +529,7 @@ jobs:
           BACKUP_FILE="$GITHUB_WORKSPACE/$OMNIROUTE_BACKUP_PATH"
           TEMP_BACKUP="$RUNNER_TEMP/omniroute-backup.tar.gz"
 
-          test -f "$OMNIROUTE_HOME/storage.sqlite"
+          sudo test -f "$OMNIROUTE_HOME/storage.sqlite"
 
           sudo systemctl stop omniroute.service
 
