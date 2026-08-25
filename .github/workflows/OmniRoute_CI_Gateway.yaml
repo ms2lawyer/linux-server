@@ -32,15 +32,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          lfs: true
           token: ${{ secrets.GIT_TOKEN || github.token }}
 
-      - name: 2. Set Workspace Permissions & Install SQLite CLI
+      - name: 2. Set Workspace Permissions & Install Dependencies
         run: |
           sudo chmod -R 777 ${{ github.workspace }}
-          sudo apt-get update && sudo apt-get install -y sqlite3
+          sudo apt-get update && sudo apt-get install -y sqlite3 git-lfs
 
       - name: 3. Connect Tailscale VPN (OAuth)
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -117,6 +118,7 @@ jobs:
           USERNAME="${GIT_USERNAME:-github-actions[bot]}"
           git config user.name "$USERNAME"
           git config user.email "$USERNAME@users.noreply.github.com"
+          git lfs install
 
           mkdir -p backup/omniroute
           tar -czf backup/omniroute/omniroute-full-backup.tar.gz \
@@ -124,15 +126,23 @@ jobs:
             --exclude='server' \
             storage.sqlite* .env db_backups/ 2>/dev/null || true
 
+          # Stash all working directory changes to allow clean git rebase
+          git stash push --include-untracked -m "omniroute-backup-stash" || true
+
+          # Fetch latest origin changes and rebase
           git fetch origin ${{ github.ref_name }}
           git rebase origin/${{ github.ref_name }} || git rebase --abort
 
-          git add storage.sqlite* backup/omniroute/omniroute-full-backup.tar.gz db_backups/ .env || true
+          # Restore local backup state onto updated tree
+          git stash pop || true
+
+          # Stage backup files and attributes
+          git add .gitattributes storage.sqlite* backup/omniroute/omniroute-full-backup.tar.gz db_backups/ .env 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "No database changes detected. Skipping git push."
           else
             git commit -m "chore: automated OmniRoute DB backup [skip ci]"
             git push origin HEAD:${{ github.ref_name }}
-            echo "Latest database pushed to GitHub successfully."
+            echo "Latest database pushed via Git LFS successfully."
           fi
