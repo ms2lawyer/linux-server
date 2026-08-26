@@ -166,19 +166,46 @@ jobs:
               tailscale status --peers=false || true
             fi
           done
-
-      - name: 8. Graceful Shutdown & Database Checkpoint
+          
+      - name: 8. Create Backup & Push Latest State to GitHub
         if: always()
+        env:
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN || github.token }}
+          GIT_USERNAME: ${{ secrets.GIT_USERNAME }}
         run: |
           set -euo pipefail
-          echo "Stopping OmniRoute container to release file locks..."
-          docker stop omniroute || true
 
-          if [ -f "${{ github.workspace }}/storage.sqlite" ]; then
-            echo "Flushing SQLite WAL checkpoint..."
-            sqlite3 "${{ github.workspace }}/storage.sqlite" "PRAGMA wal_checkpoint(TRUNCATE);" || true
+          # Reclaim ownership of Docker-generated root files
+          sudo chown -R $(whoami):$(whoami) .
+
+          USERNAME="${GIT_USERNAME:-github-actions[bot]}"
+          git config user.name "$USERNAME"
+          git config user.email "$USERNAME@users.noreply.github.com"
+          git lfs install
+
+          mkdir -p backup/omniroute
+          tar -czf backup/omniroute/omniroute-full-backup.tar.gz \
+            --exclude='logs' \
+            --exclude='server' \
+            storage.sqlite* .env db_backups/ 2>/dev/null || true
+
+          # Cleanly stash untracked files now that permissions are restored
+          git stash push --include-untracked -m "omniroute-backup-stash" || true
+
+          git fetch origin ${{ github.ref_name }}
+          git rebase origin/${{ github.ref_name }} || git rebase --abort
+          git stash pop || true
+
+          git add .gitattributes storage.sqlite* backup/omniroute/omniroute-full-backup.tar.gz db_backups/ .env 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "No database changes detected. Skipping git push."
+          else
+            git commit -m "chore: automated OmniRoute DB backup [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "Latest database pushed via Git LFS successfully."
           fi
-
+          
       - name: 9. Create Backup & Push Latest State to GitHub
         if: always()
         env:
