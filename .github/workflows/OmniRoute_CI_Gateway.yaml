@@ -38,7 +38,8 @@ jobs:
       - name: 2. Set Workspace Permissions & Install Dependencies
         run: |
           sudo chmod -R 777 ${{ github.workspace }}
-          sudo apt-get update && sudo apt-get install -y sqlite3 git-lfs
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 git-lfs openssh-server
 
       - name: 3. Connect Tailscale VPN (OAuth)
         uses: tailscale/github-action@v3
@@ -47,80 +48,50 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
           hostname: omniroute-ci-gateway
-          
-      - name: 4. Enable SSH Access
+
+      - name: 4. Enable SSH Access (hardened)
         env:
           SSH_USERNAME: ${{ secrets.RDP_USERNAME }}
           SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
         run: |
           set -euo pipefail
-
           echo "=================================================="
           echo "CONFIGURING SSH ACCESS"
           echo "=================================================="
 
-          # Install OpenSSH server
-          sudo apt-get update
-          sudo apt-get install -y openssh-server
-
-          # Create privilege separation directory required by sshd
           sudo mkdir -p /run/sshd
           sudo chmod 0755 /run/sshd
 
-          # Create the requested user if it does not already exist
           if ! id "$SSH_USERNAME" >/dev/null 2>&1; then
-            sudo useradd \
-              --create-home \
-              --shell /bin/bash \
-              "$SSH_USERNAME"
+            sudo useradd --create-home --shell /bin/bash "$SSH_USERNAME"
           fi
 
-          # Set password
           echo "${SSH_USERNAME}:${SSH_PASSWORD}" | sudo chpasswd
-
-          # Add user to sudo group
           sudo usermod -aG sudo "$SSH_USERNAME"
 
-          # Allow password authentication
+          # Harden SSH: allow password auth (for existing secrets) but prefer keys,
+          # disable root login, limit auth attempts, and use a dedicated config drop-in.
           sudo mkdir -p /etc/ssh/sshd_config.d
+          cat <<'EOF' | sudo tee /etc/ssh/sshd_config.d/99-github-runner-ssh.conf > /dev/null
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication yes
+          PubkeyAuthentication yes
+          PermitRootLogin no
+          MaxAuthTries 3
+          LoginGraceTime 30
+          UsePAM yes
+          X11Forwarding no
+          AllowTcpForwarding no
+          EOF
 
-          printf '%s\n' \
-            'PasswordAuthentication yes' \
-            'KbdInteractiveAuthentication yes' \
-            'UsePAM yes' \
-            'PubkeyAuthentication yes' \
-            | sudo tee /etc/ssh/sshd_config.d/99-github-runner-ssh.conf > /dev/null
-
-          # Validate SSH configuration
           sudo sshd -t
-
-          # Start/restart SSH server
           sudo systemctl enable ssh
           sudo systemctl restart ssh
 
-          echo ""
-          echo "SSH service:"
-          sudo systemctl is-active ssh
-
-          echo ""
-          echo "Tailscale hostname:"
-          tailscale status --self=false || true
-
-          echo ""
-          echo "Tailscale IPv4:"
-          tailscale ip -4
-
-          echo ""
-          echo "SSH username:"
-          echo "$SSH_USERNAME"
-
-          echo ""
-          echo "SSH endpoint:"
-          echo "$SSH_USERNAME@omniroute-ci-gateway"
-
+          echo "SSH Endpoint: $SSH_USERNAME@omniroute-ci-gateway"
           echo "=================================================="
-          
-      - name: 5. Start OmniRoute Container
+
+      - name: 5. Start OmniRoute Container (Mounting Workspace State)
         run: |
           docker run -d \
             --name omniroute \
@@ -140,7 +111,7 @@ jobs:
         run: |
           echo "Waiting for OmniRoute gateway to initialize..."
           for i in {1..30}; do
-            if curl -s http://localhost:20128 > /dev/null; then
+            if curl -sf http://localhost:20128 > /dev/null; then
               echo "=================================================="
               echo "OMNIROUTE GATEWAY LIVE VIA TAILSCALE (MAGICDNS)"
               echo "Dashboard URL : http://omniroute-ci-gateway:20128"
@@ -151,7 +122,7 @@ jobs:
             sleep 2
           done
           echo "OmniRoute initialization failed. Logs:"
-          docker logs omniroute
+          docker logs omniroute || true
           exit 1
 
       - name: 7. Keep-Alive (355-Minute Loop)
@@ -162,50 +133,24 @@ jobs:
             sleep 60
             if (( i % 10 == 0 )); then
               echo "[$i/355 min] Container status:"
-              docker ps --filter "name=omniroute" --format "Status: {{.Status}}"
+              docker ps --filter "name=omniroute" --format "Status: {{.Status}}" || true
               tailscale status --peers=false || true
             fi
           done
-          
-      - name: 8. Create Backup & Push Latest State to GitHub
+
+      - name: 8. Graceful Shutdown & Database Checkpoint
         if: always()
-        env:
-          GIT_TOKEN: ${{ secrets.GIT_TOKEN || github.token }}
-          GIT_USERNAME: ${{ secrets.GIT_USERNAME }}
         run: |
           set -euo pipefail
+          echo "Stopping OmniRoute container to release file locks..."
+          docker stop omniroute || true
+          docker rm omniroute || true
 
-          # Reclaim ownership of Docker-generated root files
-          sudo chown -R $(whoami):$(whoami) .
-
-          USERNAME="${GIT_USERNAME:-github-actions[bot]}"
-          git config user.name "$USERNAME"
-          git config user.email "$USERNAME@users.noreply.github.com"
-          git lfs install
-
-          mkdir -p backup/omniroute
-          tar -czf backup/omniroute/omniroute-full-backup.tar.gz \
-            --exclude='logs' \
-            --exclude='server' \
-            storage.sqlite* .env db_backups/ 2>/dev/null || true
-
-          # Cleanly stash untracked files now that permissions are restored
-          git stash push --include-untracked -m "omniroute-backup-stash" || true
-
-          git fetch origin ${{ github.ref_name }}
-          git rebase origin/${{ github.ref_name }} || git rebase --abort
-          git stash pop || true
-
-          git add .gitattributes storage.sqlite* backup/omniroute/omniroute-full-backup.tar.gz db_backups/ .env 2>/dev/null || true
-
-          if git diff --cached --quiet; then
-            echo "No database changes detected. Skipping git push."
-          else
-            git commit -m "chore: automated OmniRoute DB backup [skip ci]"
-            git push origin HEAD:${{ github.ref_name }}
-            echo "Latest database pushed via Git LFS successfully."
+          if [ -f "${{ github.workspace }}/storage.sqlite" ]; then
+            echo "Flushing SQLite WAL checkpoint..."
+            sqlite3 "${{ github.workspace }}/storage.sqlite" "PRAGMA wal_checkpoint(TRUNCATE);" || true
           fi
-          
+
       - name: 9. Create Backup & Push Latest State to GitHub
         if: always()
         env:
@@ -214,6 +159,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Reclaim ownership of Docker-generated root files
+          sudo chown -R "$(whoami):$(whoami)" .
+
           USERNAME="${GIT_USERNAME:-github-actions[bot]}"
           git config user.name "$USERNAME"
           git config user.email "$USERNAME@users.noreply.github.com"
@@ -222,26 +170,26 @@ jobs:
           mkdir -p backup/omniroute
           tar -czf backup/omniroute/omniroute-full-backup.tar.gz \
             --exclude='logs' \
+            --exclude='call_logs' \
             --exclude='server' \
-            storage.sqlite* .env db_backups/ 2>/dev/null || true
+            storage.sqlite* db_backups/ 2>/dev/null || true
 
-          # Stash all working directory changes to allow clean git rebase
+          # Cleanly stash untracked/local changes
           git stash push --include-untracked -m "omniroute-backup-stash" || true
 
-          # Fetch latest origin changes and rebase
-          git fetch origin ${{ github.ref_name }}
-          git rebase origin/${{ github.ref_name }} || git rebase --abort
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}" || git rebase --abort
 
-          # Restore local backup state onto updated tree
           git stash pop || true
 
-          # Stage backup files and attributes
-          git add .gitattributes storage.sqlite* backup/omniroute/omniroute-full-backup.tar.gz db_backups/ .env 2>/dev/null || true
+          # Stage only the database artifacts and backup archive.
+          # Intentionally exclude .env to avoid committing secrets.
+          git add .gitattributes storage.sqlite* backup/omniroute/omniroute-full-backup.tar.gz db_backups/ 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "No database changes detected. Skipping git push."
           else
-            git commit -m "chore: automated OmniRoute DB backup [skip ci]"
-            git push origin HEAD:${{ github.ref_name }}
-            echo "Latest database pushed via Git LFS successfully."
+            git commit -m "chore: automated OmniRoute DB state backup [skip ci]"
+            git push origin "HEAD:${{ github.ref_name }}"
+            echo "Latest database state pushed to GitHub successfully."
           fi
