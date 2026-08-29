@@ -491,13 +491,10 @@ jobs:
 
             if ($null -eq $dockerDesktopCli) {
 
-              throw @"
-Docker is running in Windows-container mode.
-
-Redis and OmniRoute are Linux containers, so this runner
-cannot start them with the current Docker engine.
-DockerCli.exe was not found to switch container modes.
-"@
+              throw @"Docker is running in Windows-container mode.
+              Redis and OmniRoute are Linux containers, so this runner
+              cannot start them with the current Docker engine.
+              DockerCli.exe was not found to switch container modes."@
             }
 
             Write-Host ""
@@ -553,12 +550,9 @@ DockerCli.exe was not found to switch container modes.
 
           if ($finalText -notmatch 'OSType:\s*linux') {
 
-            throw @"
-Docker is not using Linux containers.
-
-The OmniRoute image and redis:7-alpine require a Linux
-container engine.
-"@
+            throw @"Docker is not using Linux containers.
+            The OmniRoute image and redis:7-alpine require a Linux
+            container engine."@
           }
 
           Write-Host ""
@@ -1132,14 +1126,10 @@ container engine.
 
             if ($statusCode -eq 401) {
 
-              throw @"
-OmniRoute returned HTTP 401 for:
-
-POST /api/settings/import-json
-
-The installed OmniRoute instance requires authentication
-for this endpoint.
-"@
+              throw @"OmniRoute returned HTTP 401 for:
+              POST /api/settings/import-json
+              The installed OmniRoute instance requires authentication
+              for this endpoint."@
             }
 
             throw `
