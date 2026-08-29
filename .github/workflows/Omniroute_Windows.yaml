@@ -3,7 +3,6 @@ name: OmniRoute CI Gateway Win (GitHub Windows 2022)
 on:
   schedule:
     - cron: '0 */6 * * *'
-
   workflow_dispatch:
 
   push:
