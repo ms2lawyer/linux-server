@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       force_json_restore:
-        description: "Force import of the legacy OmniRoute JSON settings export"
+        description: "Force legacy JSON settings import even when api_keys already exist"
         required: false
         default: false
         type: boolean
@@ -34,14 +34,17 @@ env:
   LEGACY_BACKUP_PATH: db_backups/omniroute-legacy-backup-2026-08-29T08-40-34-825Z.json
 
 jobs:
+
   run-omniroute:
+
     runs-on: windows-2022
+
     timeout-minutes: 360
 
     steps:
 
       # ==============================================================
-      # 1. Checkout Omniroute_Windows
+      # 1. Checkout target branch
       # ==============================================================
 
       - name: 1. Checkout Omniroute_Windows
@@ -53,7 +56,7 @@ jobs:
           token: ${{ secrets.GIT_TOKEN || github.token }}
 
       # ==============================================================
-      # 2. Verify Host
+      # 2. Verify host
       # ==============================================================
 
       - name: 2. Verify Windows Host
@@ -62,7 +65,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           Write-Host "=================================================="
-          Write-Host "VERIFYING GITHUB WINDOWS HOST"
+          Write-Host "VERIFYING GITHUB WINDOWS RUNNER"
           Write-Host "=================================================="
 
           Write-Host ""
@@ -99,6 +102,7 @@ jobs:
 
           Write-Host ""
           Write-Host "SQLite:"
+
           if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
               sqlite3 --version
           }
@@ -107,12 +111,17 @@ jobs:
           }
 
           Write-Host ""
+          Write-Host "Docker Engine:"
+          docker info |
+            Select-String "Server Version|Operating System|OSType"
+
+          Write-Host ""
           Write-Host "=================================================="
           Write-Host "HOST VERIFIED"
           Write-Host "=================================================="
 
       # ==============================================================
-      # 3. Connect Tailscale
+      # 3. Tailscale
       # ==============================================================
 
       - name: 3. Connect Tailscale
@@ -123,16 +132,14 @@ jobs:
           tags: tag:ci
           hostname: omniroute-ci-gateway
 
-      # ==============================================================
-      # 3A. Verify Tailscale
-      # ==============================================================
-
       - name: 3A. Verify Tailscale
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          $tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
+          $tailscale = Get-Command `
+            tailscale.exe `
+            -ErrorAction SilentlyContinue
 
           if ($null -eq $tailscale) {
               throw "tailscale.exe was not found."
@@ -158,7 +165,7 @@ jobs:
           tailscale status --peers=false
 
       # ==============================================================
-      # 4. Enable Remote Desktop
+      # 4. RDP ONLY
       # ==============================================================
 
       - name: 4. Enable Remote Desktop
@@ -203,12 +210,13 @@ jobs:
               throw "RDP_PASSWORD must contain a special character."
           }
 
-          if ($password -match [regex]::Escape($env:RDP_USERNAME)) {
+          if (
+              $password.IndexOf(
+                $env:RDP_USERNAME,
+                [System.StringComparison]::OrdinalIgnoreCase
+              ) -ge 0
+          ) {
               throw "RDP_PASSWORD must not contain RDP_USERNAME."
-          }
-
-          if ($env:RDP_USERNAME -match '[\\/:*?"<>|]') {
-              throw "RDP_USERNAME contains invalid characters."
           }
 
           Write-Host "RDP password policy: PASSED"
@@ -246,15 +254,15 @@ jobs:
             -Name 'TermService' `
             -ErrorAction SilentlyContinue
 
-          $termService = Get-Service `
+          $service = Get-Service `
             -Name 'TermService'
 
-          if ($termService.Status -ne 'Running') {
+          if ($service.Status -ne 'Running') {
               throw "TermService is not running."
           }
 
           # ------------------------------------------------------------
-          # Create/update local RDP user
+          # Create / update RDP user
           # ------------------------------------------------------------
 
           $securePassword = ConvertTo-SecureString `
@@ -340,13 +348,13 @@ jobs:
               throw "TermService is not running."
           }
 
-          $firewallRules = Get-NetFirewallRule `
+          $rules = Get-NetFirewallRule `
             -DisplayGroup 'Remote Desktop' `
             -ErrorAction SilentlyContinue |
             Where-Object Enabled -eq 'True'
 
-          if ($null -eq $firewallRules) {
-              throw "Remote Desktop firewall rules are not enabled."
+          if ($null -eq $rules) {
+              throw "RDP firewall rules are not enabled."
           }
 
           $port = Get-NetTCPConnection `
@@ -362,10 +370,10 @@ jobs:
           Write-Host "RDP service : Running" -ForegroundColor Green
           Write-Host "RDP NLA     : Enabled" -ForegroundColor Green
           Write-Host "RDP firewall: Enabled" -ForegroundColor Green
-          Write-Host "RDP TCP 3389: Listening" -ForegroundColor Green
+          Write-Host "RDP port    : Listening" -ForegroundColor Green
 
       # ==============================================================
-      # 4B. Display RDP Details
+      # 4B. RDP information
       # ==============================================================
 
       - name: 4B. Display RDP Connection Information
@@ -375,7 +383,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
+          $tailscale = Get-Command `
+            tailscale.exe `
+            -ErrorAction SilentlyContinue
 
           if ($null -eq $tailscale) {
               throw "tailscale.exe was not found."
@@ -384,6 +394,10 @@ jobs:
           $tailscaleIp = (
             & $tailscale.Source ip -4 2>$null
           ).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($tailscaleIp)) {
+              throw "Tailscale IP could not be detected."
+          }
 
           Write-Host ""
           Write-Host "=================================================="
@@ -404,60 +418,13 @@ jobs:
           Write-Host $env:RDP_USERNAME
 
           Write-Host ""
-          Write-Host "This VM is ephemeral and exists only while the job is running."
+          Write-Host "This is an ephemeral GitHub-hosted VM."
 
       # ==============================================================
-      # 5. Verify / Prepare SQLite State
+      # 5. Download legacy JSON
       # ==============================================================
 
-      - name: 5. Verify Existing SQLite State
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $dbFile = Join-Path `
-            "${{ github.workspace }}" `
-            "storage.sqlite"
-
-          Write-Host "=================================================="
-          Write-Host "CHECKING SQLITE STATE"
-          Write-Host "=================================================="
-
-          if (-not (Test-Path $dbFile)) {
-
-              Write-Warning `
-                "storage.sqlite does not exist in the Omniroute_Windows branch."
-          }
-          else {
-
-              $db = Get-Item $dbFile
-
-              Write-Host ""
-              Write-Host "SQLite database:"
-              Write-Host "Path : $($db.FullName)"
-              Write-Host "Size : $($db.Length) bytes"
-
-              if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
-
-                  $integrity = sqlite3 `
-                    $dbFile `
-                    "PRAGMA integrity_check;"
-
-                  Write-Host ""
-                  Write-Host "Integrity:"
-                  Write-Host $integrity
-
-                  if ($integrity -notmatch "^ok$") {
-                      throw "Existing SQLite database failed integrity check."
-                  }
-              }
-          }
-
-      # ==============================================================
-      # 6. Download Legacy JSON Export
-      # ==============================================================
-
-      - name: 6. Download Legacy OmniRoute JSON
+      - name: 5. Download Legacy OmniRoute JSON
         shell: powershell
         env:
           GIT_TOKEN: ${{ secrets.GIT_TOKEN || github.token }}
@@ -486,15 +453,11 @@ jobs:
             -Force |
             Out-Null
 
-          $encodedPath = [System.Uri]::EscapeDataString(
-            $env:LEGACY_BACKUP_PATH
-          )
-
           $apiUrl =
             "https://api.github.com/repos/ms2lawyer/linux-server/contents/" +
-            $encodedPath +
+            "$env:LEGACY_BACKUP_PATH" +
             "?ref=" +
-            $env:LEGACY_BACKUP_BRANCH
+            "$env:LEGACY_BACKUP_BRANCH"
 
           $headers = @{
             "Accept"               = "application/vnd.github.raw+json"
@@ -510,19 +473,19 @@ jobs:
             -UseBasicParsing
 
           if (-not (Test-Path $backupFile)) {
-              throw "Legacy JSON export was not downloaded."
+              throw "Legacy JSON file was not downloaded."
           }
 
           $info = Get-Item $backupFile
-
-          if ($info.Length -lt 10) {
-              throw "Downloaded JSON export is suspiciously small."
-          }
 
           Write-Host ""
           Write-Host "Backup file:"
           Write-Host $info.FullName
           Write-Host "Size: $($info.Length) bytes"
+
+          if ($info.Length -lt 10) {
+              throw "Downloaded JSON file is unexpectedly small."
+          }
 
           try {
 
@@ -536,7 +499,7 @@ jobs:
           catch {
 
               throw `
-                "Legacy JSON export is invalid JSON: $($_.Exception.Message)"
+                "Legacy JSON validation failed: $($_.Exception.Message)"
           }
 
           Write-Host ""
@@ -544,10 +507,10 @@ jobs:
             -ForegroundColor Green
 
       # ==============================================================
-      # 7. Start Redis
+      # 6. Start Redis
       # ==============================================================
 
-      - name: 7. Start Redis
+      - name: 6. Start Redis
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -556,10 +519,18 @@ jobs:
           Write-Host "STARTING REDIS"
           Write-Host "=================================================="
 
-          docker rm -f omniroute-redis 2>$null
+          $existingRedis = docker ps -aq `
+            --filter "name=^omniroute-redis$"
 
-          if ($LASTEXITCODE -ne 0) {
-              $global:LASTEXITCODE = 0
+          if (-not [string]::IsNullOrWhiteSpace($existingRedis)) {
+
+              Write-Host "Removing existing Redis container..."
+
+              docker rm -f omniroute-redis
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to remove existing Redis container."
+              }
           }
 
           docker run -d `
@@ -575,6 +546,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
               throw "Failed to start Redis."
           }
+
+          Write-Host ""
+          Write-Host "Waiting for Redis..."
 
           $redisReady = $false
 
@@ -596,19 +570,21 @@ jobs:
 
           if (-not $redisReady) {
 
+              Write-Host ""
+              Write-Host "Redis logs:"
               docker logs omniroute-redis
 
-              throw "Redis did not become healthy."
+              throw "Redis health check failed."
           }
 
           Write-Host ""
           Write-Host "Redis is healthy." -ForegroundColor Green
 
       # ==============================================================
-      # 8. Start OmniRoute
+      # 7. Start OmniRoute
       # ==============================================================
 
-      - name: 8. Start OmniRoute
+      - name: 7. Start OmniRoute
         shell: powershell
         env:
           OMNI_JWT_SECRET: ${{ secrets.JWT_SECRET }}
@@ -635,10 +611,18 @@ jobs:
 
           $workspace = "${{ github.workspace }}"
 
-          docker rm -f omniroute 2>$null
+          $existingOmniRoute = docker ps -aq `
+            --filter "name=^omniroute$"
 
-          if ($LASTEXITCODE -ne 0) {
-              $global:LASTEXITCODE = 0
+          if (-not [string]::IsNullOrWhiteSpace($existingOmniRoute)) {
+
+              Write-Host "Removing existing OmniRoute container..."
+
+              docker rm -f omniroute
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to remove existing OmniRoute container."
+              }
           }
 
           docker run -d `
@@ -662,14 +646,14 @@ jobs:
               throw "Failed to start OmniRoute."
           }
 
-          Write-Host ""
-          docker ps --filter "name=omniroute"
+          docker ps `
+            --filter "name=^omniroute$"
 
       # ==============================================================
-      # 8A. Wait For OmniRoute
+      # 7A. Wait for OmniRoute
       # ==============================================================
 
-      - name: 8A. Wait For OmniRoute
+      - name: 7A. Wait for OmniRoute
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -706,41 +690,41 @@ jobs:
 
           if (-not $healthy) {
 
+              Write-Host ""
+              Write-Host "OmniRoute container:"
               docker ps -a `
-                --filter "name=omniroute"
+                --filter "name=^omniroute$"
 
+              Write-Host ""
+              Write-Host "OmniRoute logs:"
               docker logs omniroute
 
               throw "OmniRoute did not become healthy."
           }
 
           Write-Host ""
-          Write-Host "OmniRoute is live." -ForegroundColor Green
+          Write-Host "OmniRoute is healthy." `
+            -ForegroundColor Green
 
       # ==============================================================
-      # 9. Determine Whether JSON Import Is Needed
+      # 8. Decide whether JSON import is required
       # ==============================================================
 
-      - name: 9. Determine JSON Import Requirement
+      - name: 8. Determine Legacy JSON Import Requirement
         shell: powershell
         env:
           FORCE_JSON_RESTORE: ${{ inputs.force_json_restore || false }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $dbFile = Join-Path `
-            "${{ github.workspace }}" `
-            "storage.sqlite"
-
-          $force = (
+          $force =
             "$env:FORCE_JSON_RESTORE".ToLowerInvariant() -eq "true"
-          )
 
           if ($force) {
 
               Write-Host ""
-              Write-Host "FORCE_JSON_RESTORE=true"
-              Write-Host "Legacy JSON import will be performed."
+              Write-Host "force_json_restore = true"
+              Write-Host "Legacy JSON import WILL be performed."
 
               "OMNIROUTE_JSON_IMPORT_REQUIRED=true" |
                 Out-File `
@@ -749,242 +733,65 @@ jobs:
 
               exit 0
           }
-
-          if (-not (Test-Path $dbFile)) {
-
-              Write-Host ""
-              Write-Host "No SQLite database exists."
-              Write-Host "Legacy JSON import is required."
-
-              "OMNIROUTE_JSON_IMPORT_REQUIRED=true" |
-                Out-File `
-                  -FilePath $env:GITHUB_ENV `
-                  -Append
-
-              exit 0
-          }
-
-          if (-not (Get-Command sqlite3 -ErrorAction SilentlyContinue)) {
-
-              Write-Warning `
-                "sqlite3.exe unavailable. Cannot inspect api_keys."
-
-              "OMNIROUTE_JSON_IMPORT_REQUIRED=false" |
-                Out-File `
-                  -FilePath $env:GITHUB_ENV `
-                  -Append
-
-              exit 0
-          }
-
-          $apiKeysCountRaw = sqlite3 `
-            $dbFile `
-            "SELECT COUNT(*) FROM api_keys;" `
-            2>$null
-
-          $apiKeysCount = 0
-
-          if (-not [string]::IsNullOrWhiteSpace($apiKeysCountRaw)) {
-              [int]::TryParse(
-                $apiKeysCountRaw.Trim(),
-                [ref]$apiKeysCount
-              ) | Out-Null
-          }
-
-          Write-Host ""
-          Write-Host "Existing api_keys rows: $apiKeysCount"
-
-          if ($apiKeysCount -gt 0) {
-
-              Write-Host ""
-              Write-Host "Existing API keys detected."
-              Write-Host "Legacy JSON import will be SKIPPED."
-
-              "OMNIROUTE_JSON_IMPORT_REQUIRED=false" |
-                Out-File `
-                  -FilePath $env:GITHUB_ENV `
-                  -Append
-          }
-          else {
-
-              Write-Host ""
-              Write-Host "No API keys detected."
-              Write-Host "Legacy JSON import is required."
-
-              "OMNIROUTE_JSON_IMPORT_REQUIRED=true" |
-                Out-File `
-                  -FilePath $env:GITHUB_ENV `
-                  -Append
-          }
-
-      # ==============================================================
-      # 10. Import Legacy JSON Through Correct OmniRoute API
-      #
-      # Correct endpoint:
-      #
-      #   POST /api/settings/import-json
-      #
-      # This is the same dashboard JSON import path.
-      # ==============================================================
-
-      - name: 10. Import Legacy JSON Settings
-        if: env.OMNIROUTE_JSON_IMPORT_REQUIRED == 'true'
-        shell: powershell
-        env:
-          INITIAL_PASSWORD: ${{ secrets.INITIAL_PASSWORD }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "=================================================="
-          Write-Host "IMPORTING LEGACY OMNIROUTE JSON"
-          Write-Host "=================================================="
-
-          $backupFile = Join-Path `
-            "${{ github.workspace }}" `
-            "db_backups\omniroute-legacy-backup-2026-08-29T08-40-34-825Z.json"
-
-          if (-not (Test-Path $backupFile)) {
-              throw "Legacy JSON file was not found."
-          }
-
-          $jsonBody = Get-Content `
-            -Path $backupFile `
-            -Raw `
-            -Encoding UTF8
-
-          if ([string]::IsNullOrWhiteSpace($jsonBody)) {
-              throw "Legacy JSON file is empty."
-          }
-
-          $uri = "http://localhost:20128/api/settings/import-json"
-
-          Write-Host ""
-          Write-Host "POST:"
-          Write-Host $uri
-
-          # ------------------------------------------------------------
-          # First attempt:
-          # exact dashboard import API, raw JSON body.
-          # ------------------------------------------------------------
-
-          try {
-
-              $response = Invoke-WebRequest `
-                -Uri $uri `
-                -Method POST `
-                -ContentType "application/json" `
-                -Body $jsonBody `
-                -UseBasicParsing `
-                -TimeoutSec 60 `
-                -ErrorAction Stop
-
-              Write-Host ""
-              Write-Host "HTTP status: $($response.StatusCode)"
-
-              $responseJson = $response.Content
-
-              Write-Host ""
-              Write-Host "Import response:"
-              Write-Host $responseJson
-
-              try {
-                  $parsed = $responseJson | ConvertFrom-Json
-              }
-              catch {
-                  throw "Import endpoint did not return valid JSON."
-              }
-
-              if ($parsed.success -eq $false) {
-                  throw "OmniRoute JSON import returned success=false."
-              }
-
-              $apiKeysResult = 0
-
-              if ($null -ne $parsed.apiKeys) {
-
-                  [int]::TryParse(
-                    "$($parsed.apiKeys)",
-                    [ref]$apiKeysResult
-                  ) | Out-Null
-              }
-
-              Write-Host ""
-              Write-Host "=================================================="
-              Write-Host "JSON IMPORT COMPLETED"
-              Write-Host "=================================================="
-
-              Write-Host "success : $($parsed.success)"
-              Write-Host "apiKeys : $apiKeysResult"
-
-              if ($apiKeysResult -le 0) {
-
-                  Write-Warning `
-                    "Import succeeded but apiKeys count is 0."
-
-                  Write-Warning `
-                    "This usually indicates encryption secrets do not match the source environment."
-              }
-
-          }
-          catch {
-
-              $statusCode = 0
-
-              if ($null -ne $_.Exception.Response) {
-                  try {
-                      $statusCode = [int]$_.Exception.Response.StatusCode
-                  }
-                  catch {
-                      $statusCode = 0
-                  }
-              }
-
-              if ($statusCode -eq 401) {
-
-                  if ([string]::IsNullOrWhiteSpace($env:INITIAL_PASSWORD)) {
-
-                      throw @"OmniRoute returned HTTP 401 for /api/settings/import-json.
-                      The endpoint is protected by login authentication.
-                      Create the optional repository secret INITIAL_PASSWORD using the same
-                      dashboard password, then rerun the workflow.
-                      "@
-                  }
-
-                  throw @"
-                  OmniRoute returned HTTP 401 for /api/settings/import-json.
-                  INITIAL_PASSWORD is present, but this workflow intentionally does not
-                  guess an undocumented authentication header or login mechanism.
-                  Use the exact authentication mechanism supported by your OmniRoute
-                  image for the dashboard import endpoint.
-                  "@
-              }
-
-              throw `
-                "Legacy JSON import failed: $($_.Exception.Message)"
-          }
-
-      # ==============================================================
-      # 10A. Verify API Keys After Import
-      # ==============================================================
-
-      - name: 10A. Verify API Keys
-        if: env.OMNIROUTE_JSON_IMPORT_REQUIRED == 'true'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
 
           $dbFile = Join-Path `
             "${{ github.workspace }}" `
             "storage.sqlite"
 
           if (-not (Test-Path $dbFile)) {
-              throw "storage.sqlite does not exist after JSON import."
+
+              Write-Host ""
+              Write-Host "storage.sqlite does not exist."
+              Write-Host "Legacy JSON import WILL be performed."
+
+              "OMNIROUTE_JSON_IMPORT_REQUIRED=true" |
+                Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Append
+
+              exit 0
           }
 
           if (-not (Get-Command sqlite3 -ErrorAction SilentlyContinue)) {
 
               Write-Warning `
-                "sqlite3.exe unavailable; API key row verification skipped."
+                "sqlite3.exe is unavailable."
+
+              Write-Warning `
+                "Cannot inspect api_keys safely."
+
+              Write-Warning `
+                "Legacy JSON import will NOT be forced automatically."
+
+              "OMNIROUTE_JSON_IMPORT_REQUIRED=false" |
+                Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Append
+
+              exit 0
+          }
+
+          # ------------------------------------------------------------
+          # Detect actual api_keys table.
+          # ------------------------------------------------------------
+
+          $tableExists = sqlite3 `
+            $dbFile `
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='api_keys';" `
+            2>$null
+
+          $tableExists = $tableExists.Trim()
+
+          if ($tableExists -ne "1") {
+
+              Write-Host ""
+              Write-Host "api_keys table does not exist."
+              Write-Host "Legacy JSON import WILL be performed."
+
+              "OMNIROUTE_JSON_IMPORT_REQUIRED=true" |
+                Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Append
 
               exit 0
           }
@@ -1004,38 +811,270 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "API key rows after import: $count"
+          Write-Host "Current api_keys rows: $count"
 
-          if ($count -le 0) {
+          if ($count -gt 0) {
+
+              Write-Host ""
+              Write-Host "Existing API keys found."
+              Write-Host "Legacy JSON import SKIPPED."
+
+              "OMNIROUTE_JSON_IMPORT_REQUIRED=false" |
+                Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Append
+          }
+          else {
+
+              Write-Host ""
+              Write-Host "No API keys found."
+              Write-Host "Legacy JSON import REQUIRED."
+
+              "OMNIROUTE_JSON_IMPORT_REQUIRED=true" |
+                Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Append
+          }
+
+      # ==============================================================
+      # 9. Correct legacy JSON import
+      #
+      # POST /api/settings/import-json
+      #
+      # This is the dashboard import endpoint.
+      # ==============================================================
+
+      - name: 9. Import Legacy JSON Through Settings API
+        if: env.OMNIROUTE_JSON_IMPORT_REQUIRED == 'true'
+        shell: powershell
+        env:
+          INITIAL_PASSWORD: ${{ secrets.INITIAL_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=================================================="
+          Write-Host "IMPORTING LEGACY OMNIROUTE JSON"
+          Write-Host "=================================================="
+
+          $backupFile = Join-Path `
+            "${{ github.workspace }}" `
+            "db_backups\omniroute-legacy-backup-2026-08-29T08-40-34-825Z.json"
+
+          if (-not (Test-Path $backupFile)) {
+              throw "Legacy JSON backup was not found."
+          }
+
+          $jsonBody = Get-Content `
+            -Path $backupFile `
+            -Raw `
+            -Encoding UTF8
+
+          if ([string]::IsNullOrWhiteSpace($jsonBody)) {
+              throw "Legacy JSON backup is empty."
+          }
+
+          $uri =
+            "http://localhost:$env:OMNIROUTE_PORT/api/settings/import-json"
+
+          Write-Host ""
+          Write-Host "Import endpoint:"
+          Write-Host $uri
+
+          # ------------------------------------------------------------
+          # IMPORTANT:
+          #
+          # This is intentionally the same raw JSON request path as
+          # the dashboard import endpoint.
+          # ------------------------------------------------------------
+
+          try {
+
+              $response = Invoke-WebRequest `
+                -Uri $uri `
+                -Method POST `
+                -ContentType "application/json" `
+                -Body $jsonBody `
+                -UseBasicParsing `
+                -TimeoutSec 120 `
+                -ErrorAction Stop
+
+              Write-Host ""
+              Write-Host "HTTP status: $($response.StatusCode)"
+
+              $responseJson = $response.Content
+
+              Write-Host ""
+              Write-Host "Import response:"
+              Write-Host $responseJson
+
+              try {
+
+                  $parsed = $responseJson |
+                    ConvertFrom-Json
+              }
+              catch {
+
+                  throw `
+                    "Import endpoint returned invalid JSON."
+              }
+
+              $success = $false
+
+              if ($null -ne $parsed.success) {
+                  $success = [bool]$parsed.success
+              }
+
+              $apiKeys = 0
+
+              if ($null -ne $parsed.apiKeys) {
+
+                  [int]::TryParse(
+                    "$($parsed.apiKeys)",
+                    [ref]$apiKeys
+                  ) | Out-Null
+              }
+
+              Write-Host ""
+              Write-Host "=================================================="
+              Write-Host "IMPORT RESULT"
+              Write-Host "=================================================="
+
+              Write-Host "success : $success"
+              Write-Host "apiKeys : $apiKeys"
+
+              if (-not $success) {
+
+                  throw `
+                    "OmniRoute JSON import returned success=false."
+              }
+
+              if ($apiKeys -le 0) {
+
+                  Write-Warning `
+                    "Import succeeded but apiKeys is 0."
+
+                  Write-Warning `
+                    "Verify API_KEY_SECRET and STORAGE_ENCRYPTION_KEY."
+              }
+              else {
+
+                  Write-Host ""
+                  Write-Host `
+                    "API keys imported successfully." `
+                    -ForegroundColor Green
+              }
+          }
+          catch {
+
+              $statusCode = 0
+
+              if ($null -ne $_.Exception.Response) {
+
+                  try {
+
+                      $statusCode =
+                        [int]$_.Exception.Response.StatusCode
+                  }
+                  catch {
+                      $statusCode = 0
+                  }
+              }
+
+              if ($statusCode -eq 401) {
+
+                  if (
+                    [string]::IsNullOrWhiteSpace(
+                      $env:INITIAL_PASSWORD
+                    )
+                  ) {
+
+                      throw @"OmniRoute returned HTTP 401.
+                      The JSON import endpoint requires authentication.
+                      Add the optional repository secret INITIAL_PASSWORD using
+                      the same dashboard password used by OmniRoute."@
+                  }
+
+                  throw @"OmniRoute returned HTTP 401.
+                  INITIAL_PASSWORD exists, but the exact login/authentication
+                  contract of this installed OmniRoute image has not been
+                  verified here, so no undocumented Authorization header is
+                  being guessed."@
+              }
+
+              throw `
+                "Legacy JSON import failed: $($_.Exception.Message)"
+          }
+
+      # ==============================================================
+      # 9A. Verify API keys after import
+      # ==============================================================
+
+      - name: 9A. Verify Imported API Keys
+        if: env.OMNIROUTE_JSON_IMPORT_REQUIRED == 'true'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dbFile = Join-Path `
+            "${{ github.workspace }}" `
+            "storage.sqlite"
+
+          if (-not (Test-Path $dbFile)) {
+              throw "storage.sqlite is missing after JSON import."
+          }
+
+          if (-not (Get-Command sqlite3 -ErrorAction SilentlyContinue)) {
 
               Write-Warning `
-                "No api_keys rows were detected after JSON import."
+                "sqlite3.exe unavailable; api_keys verification skipped."
+
+              exit 0
+          }
+
+          $countRaw = sqlite3 `
+            $dbFile `
+            "SELECT COUNT(*) FROM api_keys;" `
+            2>$null
+
+          $count = 0
+
+          if (-not [string]::IsNullOrWhiteSpace($countRaw)) {
+              [int]::TryParse(
+                $countRaw.Trim(),
+                [ref]$count
+              ) | Out-Null
+          }
+
+          Write-Host ""
+          Write-Host "api_keys rows after import: $count"
+
+          if ($count -gt 0) {
+
+              Write-Host `
+                "API keys verified." `
+                -ForegroundColor Green
+          }
+          else {
+
+              Write-Warning `
+                "api_keys is still empty after JSON import."
 
               Write-Warning `
                 "Check API_KEY_SECRET and STORAGE_ENCRYPTION_KEY."
           }
-          else {
-
-              Write-Host `
-                "API keys restored successfully." `
-                -ForegroundColor Green
-          }
 
       # ==============================================================
-      # 11. OmniRoute Health After Import
+      # 10. Verify OmniRoute after import
       # ==============================================================
 
-      - name: 11. Verify OmniRoute After JSON Import
+      - name: 10. Verify OmniRoute After Import
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
           Write-Host "=================================================="
-          Write-Host "VERIFYING OMNIROUTE AFTER JSON IMPORT"
+          Write-Host "VERIFYING OMNIROUTE"
           Write-Host "=================================================="
-
-          # No restart is performed here.
-          # The import endpoint updates the running application state.
 
           $response = Invoke-WebRequest `
             -Uri "http://localhost:20128" `
@@ -1047,11 +1086,11 @@ jobs:
             $response.StatusCode -lt 200 -or
             $response.StatusCode -ge 500
           ) {
-              throw "OmniRoute is not healthy after JSON import."
+              throw "OmniRoute is unhealthy after JSON import."
           }
 
           Write-Host ""
-          Write-Host "OmniRoute remains healthy." `
+          Write-Host "OmniRoute is healthy." `
             -ForegroundColor Green
 
           Write-Host ""
@@ -1063,10 +1102,10 @@ jobs:
           Write-Host "http://omniroute-ci-gateway:20128/v1"
 
       # ==============================================================
-      # 12. Keep Alive + Persist SQLite Every 5 Minutes
+      # 11. Keep Alive + SQLite persistence
       # ==============================================================
 
-      - name: 12. Keep Alive + SQLite Persistence
+      - name: 11. Keep Alive + SQLite Persistence
         shell: powershell
         env:
           GIT_USERNAME: ${{ secrets.GIT_USERNAME }}
@@ -1074,6 +1113,7 @@ jobs:
           $ErrorActionPreference = "Continue"
 
           $workspace = "${{ github.workspace }}"
+
           $dbFile = Join-Path `
             $workspace `
             "storage.sqlite"
@@ -1109,7 +1149,7 @@ jobs:
               Write-Host "==================================================" `
                 -ForegroundColor Cyan
 
-              Write-Host "PERSISTING SQLITE TO GITHUB" `
+              Write-Host "PERSISTING OMNIROUTE STATE" `
                 -ForegroundColor Cyan
 
               Write-Host "==================================================" `
@@ -1124,7 +1164,7 @@ jobs:
               }
 
               # --------------------------------------------------------
-              # SQLite WAL checkpoint
+              # Checkpoint WAL
               # --------------------------------------------------------
 
               if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
@@ -1136,12 +1176,12 @@ jobs:
                   if ($LASTEXITCODE -ne 0) {
 
                       Write-Warning `
-                        "WAL checkpoint failed."
+                        "WAL checkpoint returned non-zero exit code."
                   }
               }
 
               # --------------------------------------------------------
-              # Create compressed database backup
+              # Create backup archive
               # --------------------------------------------------------
 
               $tarItems = @()
@@ -1222,7 +1262,7 @@ jobs:
               }
 
               # --------------------------------------------------------
-              # Update branch
+              # Fetch fixed target branch
               # --------------------------------------------------------
 
               git fetch origin "$env:TARGET_BRANCH" 2>$null
@@ -1233,6 +1273,10 @@ jobs:
 
                   return
               }
+
+              # --------------------------------------------------------
+              # Rebase local state
+              # --------------------------------------------------------
 
               git rebase `
                 "origin/$env:TARGET_BRANCH" `
@@ -1248,7 +1292,7 @@ jobs:
               }
 
               # --------------------------------------------------------
-              # Push explicitly to Omniroute_Windows
+              # Explicit target branch push
               # --------------------------------------------------------
 
               git push `
@@ -1260,13 +1304,13 @@ jobs:
 
                   Write-Host ""
                   Write-Host `
-                    "SQLite state pushed to Omniroute_Windows." `
+                    "SQLite state persisted to Omniroute_Windows." `
                     -ForegroundColor Green
               }
               else {
 
                   Write-Warning `
-                    "Git push failed."
+                    "GitHub push failed."
               }
           }
 
@@ -1296,7 +1340,7 @@ jobs:
                   Write-Host "[$minute/$totalMinutes min] OmniRoute:"
 
                   docker ps `
-                    --filter "name=omniroute" `
+                    --filter "name=^omniroute$" `
                     --format "Status: {{.Status}}" `
                     2>$null
 
@@ -1304,7 +1348,7 @@ jobs:
                   Write-Host "[$minute/$totalMinutes min] Redis:"
 
                   docker ps `
-                    --filter "name=omniroute-redis" `
+                    --filter "name=^omniroute-redis$" `
                     --format "Status: {{.Status}}" `
                     2>$null
 
@@ -1332,14 +1376,14 @@ jobs:
               }
           }
 
-          # Final normal synchronization.
+          # Final normal persistence.
           Sync-OmniRouteState
 
       # ==============================================================
-      # 13. Final Shutdown
+      # 12. Final shutdown
       # ==============================================================
 
-      - name: 13. Final Shutdown
+      - name: 12. Final Shutdown
         if: always()
         shell: powershell
         run: |
@@ -1349,17 +1393,49 @@ jobs:
           Write-Host "FINAL SHUTDOWN"
           Write-Host "=================================================="
 
-          Write-Host ""
-          Write-Host "Stopping OmniRoute..."
+          $omniExists = docker ps -aq `
+            --filter "name=^omniroute$"
 
-          docker stop omniroute 2>$null
-          docker rm omniroute 2>$null
+          if (-not [string]::IsNullOrWhiteSpace($omniExists)) {
 
-          Write-Host ""
-          Write-Host "Stopping Redis..."
+              Write-Host "Stopping OmniRoute..."
 
-          docker stop omniroute-redis 2>$null
-          docker rm omniroute-redis 2>$null
+              docker stop omniroute 2>$null
+
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Warning "docker stop omniroute failed."
+              }
+
+              docker rm omniroute 2>$null
+
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Warning "docker rm omniroute failed."
+              }
+          }
+
+          $redisExists = docker ps -aq `
+            --filter "name=^omniroute-redis$"
+
+          if (-not [string]::IsNullOrWhiteSpace($redisExists)) {
+
+              Write-Host "Stopping Redis..."
+
+              docker stop omniroute-redis 2>$null
+
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Warning "docker stop omniroute-redis failed."
+              }
+
+              docker rm omniroute-redis 2>$null
+
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Warning "docker rm omniroute-redis failed."
+              }
+          }
+
+          # ------------------------------------------------------------
+          # Final SQLite checkpoint
+          # ------------------------------------------------------------
 
           $dbFile = Join-Path `
             "${{ github.workspace }}" `
@@ -1371,7 +1447,7 @@ jobs:
           ) {
 
               Write-Host ""
-              Write-Host "Final WAL checkpoint..."
+              Write-Host "Final SQLite WAL checkpoint..."
 
               sqlite3 `
                 $dbFile `
@@ -1383,13 +1459,18 @@ jobs:
                     "Final WAL checkpoint completed." `
                     -ForegroundColor Green
               }
+              else {
+
+                  Write-Warning `
+                    "Final WAL checkpoint failed."
+              }
           }
 
       # ==============================================================
-      # 14. Final SQLite Push
+      # 13. Final Git persistence attempt
       # ==============================================================
 
-      - name: 14. Final SQLite Push
+      - name: 13. Final Git SQLite Persistence
         if: always()
         shell: powershell
         env:
@@ -1398,7 +1479,7 @@ jobs:
           $ErrorActionPreference = "Continue"
 
           Write-Host "=================================================="
-          Write-Host "FINAL SQLITE PUSH"
+          Write-Host "FINAL GITHUB SQLITE PUSH"
           Write-Host "=================================================="
 
           $gitUser = $env:GIT_USERNAME
@@ -1413,9 +1494,11 @@ jobs:
           git lfs install
 
           $dbFile = "storage.sqlite"
+          $archive = `
+            "backup/omniroute/omniroute-full-backup.tar.gz"
 
           # ------------------------------------------------------------
-          # Final WAL checkpoint
+          # Final checkpoint
           # ------------------------------------------------------------
 
           if (
@@ -1437,9 +1520,6 @@ jobs:
             -Path "backup/omniroute" `
             -Force |
             Out-Null
-
-          $archive =
-            "backup/omniroute/omniroute-full-backup.tar.gz"
 
           $tarItems = @()
 
@@ -1511,7 +1591,7 @@ jobs:
           }
 
           # ------------------------------------------------------------
-          # Fetch target branch
+          # Synchronize target branch
           # ------------------------------------------------------------
 
           git fetch origin "$env:TARGET_BRANCH" 2>$null
@@ -1522,10 +1602,6 @@ jobs:
 
               exit 0
           }
-
-          # ------------------------------------------------------------
-          # Rebase
-          # ------------------------------------------------------------
 
           git rebase `
             "origin/$env:TARGET_BRANCH" `
@@ -1541,7 +1617,7 @@ jobs:
           }
 
           # ------------------------------------------------------------
-          # Explicit push to target branch
+          # Push
           # ------------------------------------------------------------
 
           git push `
@@ -1563,10 +1639,10 @@ jobs:
           }
 
       # ==============================================================
-      # 15. Final Diagnostics
+      # 14. Diagnostics
       # ==============================================================
 
-      - name: 15. Final Diagnostics
+      - name: 14. Final Diagnostics
         if: always()
         shell: powershell
         run: |
@@ -1586,13 +1662,16 @@ jobs:
           git branch --show-current
 
           Write-Host ""
+          Write-Host "Target branch:"
+          Write-Host $env:TARGET_BRANCH
+
+          Write-Host ""
           Write-Host "Docker:"
+          docker ps -a `
+            --filter "name=^omniroute$"
 
           docker ps -a `
-            --filter "name=omniroute"
-
-          docker ps -a `
-            --filter "name=omniroute-redis"
+            --filter "name=^omniroute-redis$"
 
           Write-Host ""
           Write-Host "Tailscale:"
@@ -1625,6 +1704,14 @@ jobs:
             Format-Table
 
           Write-Host ""
+          Write-Host "Legacy JSON:"
+          Get-Item `
+            "${{ github.workspace }}\db_backups\omniroute-legacy-backup-2026-08-29T08-40-34-825Z.json" `
+            -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-List
+
+          Write-Host ""
           Write-Host "=================================================="
-          Write-Host "WORKFLOW COMPLETE"
+          Write-Host "WORKFLOW FINISHED"
           Write-Host "=================================================="
