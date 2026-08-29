@@ -1,3 +1,4 @@
+```yaml
 name: OmniRoute Windows Gateway Win
 
 on:
@@ -69,6 +70,7 @@ jobs:
 
           Write-Host ""
           Write-Host "Windows:"
+
           Get-CimInstance Win32_OperatingSystem |
             Select-Object Caption, Version, BuildNumber |
             Format-List
@@ -79,6 +81,7 @@ jobs:
 
           Write-Host ""
           Write-Host "Architecture:"
+
           Write-Host (
             [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
           )
@@ -440,29 +443,26 @@ jobs:
           Write-Host $dockerText
 
           if ($dockerText -match 'OSType:\s*windows') {
-throw @"
-Docker is running in Windows-container mode.
 
-This workflow requires Linux containers because:
-- redis:7-alpine is a Linux image
-- OmniRoute uses the Linux image:
-  diegosouzapw/omniroute:latest
-
-A GitHub-hosted windows-2022 runner cannot be reliably
-converted here into a Docker Desktop Linux-container host.
-
-Use a Linux runner for OmniRoute, or use a persistent/self-hosted
-Windows machine with a Linux container runtime.
-"@
+            throw (
+              "Docker is running in Windows-container mode.`n" +
+              "This workflow requires Linux containers because:`n" +
+              "- redis:7-alpine is a Linux image.`n" +
+              "- OmniRoute uses the Linux image: diegosouzapw/omniroute:latest.`n`n" +
+              "A GitHub-hosted windows-2022 runner cannot be reliably " +
+              "converted into a Docker Desktop Linux-container host here.`n" +
+              "Use a Linux runner for OmniRoute, or use a persistent/self-hosted " +
+              "Windows machine with a Linux container runtime."
+            )
           }
 
           if ($dockerText -notmatch 'OSType:\s*linux') {
-throw @"
-Docker container type could not be verified as Linux.
 
-Docker info output:
-$dockerText
-"@
+            throw (
+              "Docker container type could not be verified as Linux.`n" +
+              "Docker info output:`n" +
+              $dockerText
+            )
           }
 
           Write-Host ""
@@ -675,11 +675,13 @@ $dockerText
 
             Write-Host ""
             Write-Host "Redis containers:"
+
             docker ps -a `
               --filter "name=^omniroute-redis$"
 
             Write-Host ""
             Write-Host "Redis logs:"
+
             docker logs omniroute-redis
 
             throw "Redis health check failed."
@@ -1050,14 +1052,12 @@ $dockerText
 
             if ($statusCode -eq 401) {
 
-throw @"
-OmniRoute returned HTTP 401 for:
-
-POST /api/settings/import-json
-
-The installed OmniRoute instance requires authentication
-for this endpoint.
-"@
+              throw (
+                "OmniRoute returned HTTP 401 for:`n" +
+                "POST /api/settings/import-json`n" +
+                "The installed OmniRoute instance requires authentication " +
+                "for this endpoint."
+              )
             }
 
             throw `
@@ -1686,3 +1686,4 @@ for this endpoint.
           Write-Host "=================================================="
           Write-Host "WORKFLOW COMPLETE"
           Write-Host "=================================================="
+```
