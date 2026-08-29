@@ -1,4 +1,4 @@
-
+```yaml
 name: OmniRoute Windows Gateway Win
 
 on:
@@ -38,6 +38,7 @@ jobs:
   run-omniroute:
 
     runs-on: windows-2022
+
     timeout-minutes: 360
 
     steps:
@@ -55,7 +56,7 @@ jobs:
           token: ${{ secrets.GIT_TOKEN || github.token }}
 
       # ==============================================================
-      # 2. Verify host
+      # 2. Verify Windows Host
       # ==============================================================
 
       - name: 2. Verify Windows Host
@@ -67,15 +68,20 @@ jobs:
           Write-Host "VERIFYING GITHUB WINDOWS RUNNER"
           Write-Host "=================================================="
 
+          Write-Host ""
+          Write-Host "Windows:"
+
           Get-CimInstance Win32_OperatingSystem |
             Select-Object Caption, Version, BuildNumber |
             Format-List
 
           Write-Host ""
-          Write-Host "Computer: $env:COMPUTERNAME"
+          Write-Host "Computer:"
+          Write-Host $env:COMPUTERNAME
 
           Write-Host ""
           Write-Host "Architecture:"
+
           Write-Host (
             [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
           )
@@ -98,6 +104,7 @@ jobs:
 
           Write-Host ""
           Write-Host "SQLite:"
+
           if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
             sqlite3 --version
           }
@@ -105,8 +112,13 @@ jobs:
             Write-Warning "sqlite3.exe not found. WAL checkpoint will be skipped."
           }
 
+          Write-Host ""
+          Write-Host "=================================================="
+          Write-Host "HOST VERIFIED"
+          Write-Host "=================================================="
+
       # ==============================================================
-      # 3. Tailscale
+      # 3. Connect Tailscale
       # ==============================================================
 
       - name: 3. Connect Tailscale
@@ -117,12 +129,17 @@ jobs:
           tags: tag:ci
           hostname: omniroute-ci-gateway
 
+      # ==============================================================
+      # 3A. Verify Tailscale
+      # ==============================================================
+
       - name: 3A. Verify Tailscale
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          $tailscale = Get-Command tailscale.exe `
+          $tailscale = Get-Command `
+            tailscale.exe `
             -ErrorAction SilentlyContinue
 
           if ($null -eq $tailscale) {
@@ -138,14 +155,18 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "Tailscale hostname: omniroute-ci-gateway"
-          Write-Host "Tailscale IPv4    : $tailscaleIp"
+          Write-Host "=================================================="
+          Write-Host "TAILSCALE READY"
+          Write-Host "=================================================="
+
+          Write-Host "Hostname : omniroute-ci-gateway"
+          Write-Host "IPv4     : $tailscaleIp"
 
           Write-Host ""
           tailscale status --peers=false
 
       # ==============================================================
-      # 4. RDP
+      # 4. Enable Remote Desktop
       # ==============================================================
 
       - name: 4. Enable Remote Desktop
@@ -220,6 +241,13 @@ jobs:
             -Name 'TermService' `
             -ErrorAction SilentlyContinue
 
+          $service = Get-Service `
+            -Name 'TermService'
+
+          if ($service.Status -ne 'Running') {
+            throw "TermService is not running."
+          }
+
           $securePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD `
             -AsPlainText `
@@ -231,6 +259,8 @@ jobs:
 
           if ($null -eq $existingUser) {
 
+            Write-Host "Creating RDP user..."
+
             New-LocalUser `
               -Name $env:RDP_USERNAME `
               -Password $securePassword `
@@ -240,6 +270,8 @@ jobs:
               Out-Null
           }
           else {
+
+            Write-Host "Updating RDP user..."
 
             Set-LocalUser `
               -Name $env:RDP_USERNAME `
@@ -259,19 +291,22 @@ jobs:
             -Member $env:RDP_USERNAME `
             -ErrorAction SilentlyContinue
 
-          $service = Get-Service -Name 'TermService'
-
-          if ($service.Status -ne 'Running') {
-            throw "TermService is not running."
-          }
-
           Write-Host ""
-          Write-Host "RDP configured." -ForegroundColor Green
+          Write-Host "Remote Desktop configured." `
+            -ForegroundColor Green
+
+      # ==============================================================
+      # 4A. Verify Remote Desktop
+      # ==============================================================
 
       - name: 4A. Verify Remote Desktop
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+
+          Write-Host "=================================================="
+          Write-Host "VERIFYING REMOTE DESKTOP"
+          Write-Host "=================================================="
 
           $rdpDenied = Get-ItemPropertyValue `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
@@ -289,10 +324,20 @@ jobs:
             throw "RDP NLA is disabled."
           }
 
-          $service = Get-Service -Name 'TermService'
+          $service = Get-Service `
+            -Name 'TermService'
 
           if ($service.Status -ne 'Running') {
             throw "TermService is not running."
+          }
+
+          $firewallRules = Get-NetFirewallRule `
+            -DisplayGroup 'Remote Desktop' `
+            -ErrorAction SilentlyContinue |
+            Where-Object Enabled -eq 'True'
+
+          if ($null -eq $firewallRules) {
+            throw "Remote Desktop firewall rules are not enabled."
           }
 
           $port = Get-NetTCPConnection `
@@ -304,16 +349,25 @@ jobs:
             throw "TCP 3389 is not listening."
           }
 
+          Write-Host ""
           Write-Host "RDP service : Running" -ForegroundColor Green
           Write-Host "RDP NLA     : Enabled" -ForegroundColor Green
-          Write-Host "RDP TCP 3389: Listening" -ForegroundColor Green
+          Write-Host "RDP firewall: Enabled" -ForegroundColor Green
+          Write-Host "RDP 3389    : Listening" -ForegroundColor Green
+
+      # ==============================================================
+      # 4B. Display RDP Information
+      # ==============================================================
 
       - name: 4B. Display RDP Information
         shell: powershell
         env:
           RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
         run: |
-          $tailscale = Get-Command tailscale.exe `
+          $ErrorActionPreference = "Stop"
+
+          $tailscale = Get-Command `
+            tailscale.exe `
             -ErrorAction SilentlyContinue
 
           if ($null -eq $tailscale) {
@@ -324,6 +378,10 @@ jobs:
             & $tailscale.Source ip -4 2>$null
           ).Trim()
 
+          if ([string]::IsNullOrWhiteSpace($tailscaleIp)) {
+            throw "Tailscale IP could not be detected."
+          }
+
           Write-Host ""
           Write-Host "=================================================="
           Write-Host "REMOTE DESKTOP READY"
@@ -332,170 +390,79 @@ jobs:
           Write-Host ""
           Write-Host "Tailscale IP : $tailscaleIp"
           Write-Host "Hostname     : omniroute-ci-gateway"
-          Write-Host "Port         : 3389"
+          Write-Host "RDP Port     : 3389"
 
           Write-Host ""
           Write-Host "RDP command:"
           Write-Host "mstsc /v:omniroute-ci-gateway"
 
           Write-Host ""
-          Write-Host "Username:"
+          Write-Host "RDP Username:"
           Write-Host $env:RDP_USERNAME
 
+          Write-Host ""
+          Write-Host "The GitHub-hosted VM is ephemeral."
+          Write-Host "RDP exists only while this job is running."
+
       # ==============================================================
-      # 5. Ensure Docker Linux Container Mode
+      # 5. Verify Docker Linux Container Support
       # ==============================================================
 
-      - name: 5. Configure Docker for Linux Containers
+      - name: 5. Verify Docker Linux Container Support
         shell: powershell
         run: |
-          $ErrorActionPreference = "Continue"
+          $ErrorActionPreference = "Stop"
 
           Write-Host "=================================================="
-          Write-Host "CHECKING DOCKER CONTAINER MODE"
+          Write-Host "VERIFYING DOCKER"
           Write-Host "=================================================="
+
+          $ready = $false
+
+          for ($i = 1; $i -le 30; $i++) {
+
+            docker info *> $null
+
+            if ($LASTEXITCODE -eq 0) {
+              $ready = $true
+              break
+            }
+
+            Write-Host "Waiting for Docker daemon... ($i/30)"
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $ready) {
+            throw "Docker daemon is not available."
+          }
 
           $dockerInfo = docker info 2>&1
-
-          if ($LASTEXITCODE -ne 0) {
-
-            Write-Host ""
-            Write-Host "Docker daemon is not ready. Waiting..."
-
-            $dockerReady = $false
-
-            for ($i = 1; $i -le 30; $i++) {
-
-              $dockerInfo = docker info 2>&1
-
-              if ($LASTEXITCODE -eq 0) {
-
-                $dockerReady = $true
-                break
-              }
-
-              Start-Sleep -Seconds 2
-            }
-
-            if (-not $dockerReady) {
-
-              Write-Host ""
-              Write-Host "Docker info output:"
-              $dockerInfo
-
-              throw "Docker daemon is not available."
-            }
-          }
-
-          $dockerInfoText = ($dockerInfo | Out-String)
+          $dockerText = $dockerInfo | Out-String
 
           Write-Host ""
-          Write-Host $dockerInfoText
+          Write-Host $dockerText
 
-          if ($dockerInfoText -match 'OSType:\s*windows') {
+          if ($dockerText -match 'OSType:\s*windows') {
 
-            Write-Host ""
-            Write-Host "Docker is currently using Windows containers."
-            Write-Host "Attempting to switch to Linux containers..."
-
-            $dockerDesktopCli = $null
-
-            $candidates = @(
-              "$env:ProgramFiles\Docker\Docker\DockerCli.exe",
-              "$env:ProgramFiles\Docker\Docker\resources\bin\DockerCli.exe",
-              "$env:LOCALAPPDATA\Programs\Docker\Docker\DockerCli.exe"
+            throw (
+              "Docker is running in Windows-container mode.`n" +
+              "This workflow requires Linux containers because:`n" +
+              "- redis:7-alpine is a Linux image.`n" +
+              "- OmniRoute uses the Linux image: diegosouzapw/omniroute:latest.`n`n" +
+              "A GitHub-hosted windows-2022 runner cannot be reliably " +
+              "converted into a Docker Desktop Linux-container host here.`n" +
+              "Use a Linux runner for OmniRoute, or use a persistent/self-hosted " +
+              "Windows machine with a Linux container runtime."
             )
-
-            foreach ($candidate in $candidates) {
-
-              if (Test-Path $candidate) {
-
-                $dockerDesktopCli = $candidate
-                break
-              }
-            }
-
-            if ($null -eq $dockerDesktopCli) {
-
-              Write-Host ""
-              Write-Host "DockerCli.exe was not found."
-
-              Write-Host ""
-              Write-Host "Installed Docker-related processes:"
-
-              Get-Process |
-                Where-Object {
-                  $_.ProcessName -match 'docker'
-                } |
-                Select-Object ProcessName, Id |
-                Format-Table
-
-              throw @"
-Docker is running in Windows-container mode.
-
-OmniRoute and redis:7-alpine require Linux containers.
-This GitHub Windows runner does not provide a usable
-Docker Linux engine in its current state.
-"@
-            }
-
-            Write-Host ""
-            Write-Host "Docker Desktop CLI:"
-            Write-Host $dockerDesktopCli
-
-            Write-Host ""
-            Write-Host "Switching to Linux containers..."
-
-            & $dockerDesktopCli -SwitchLinuxEngine
-
-            if ($LASTEXITCODE -ne 0) {
-
-              throw "Docker failed to switch to Linux container mode."
-            }
-
-            Write-Host ""
-            Write-Host "Waiting for Docker Linux engine..."
-
-            $linuxReady = $false
-
-            for ($i = 1; $i -le 60; $i++) {
-
-              Start-Sleep -Seconds 2
-
-              $info = docker info 2>&1
-              $text = ($info | Out-String)
-
-              if (
-                ($LASTEXITCODE -eq 0) -and
-                ($text -match 'OSType:\s*linux')
-              ) {
-
-                $linuxReady = $true
-                break
-              }
-
-              Write-Host "Waiting for Linux engine... ($i/60)"
-            }
-
-            if (-not $linuxReady) {
-
-              Write-Host ""
-              Write-Host "Docker info after Linux switch:"
-              docker info 2>&1
-
-              throw "Docker Linux container engine could not be activated."
-            }
           }
 
-          $finalInfo = docker info 2>&1
-          $finalText = ($finalInfo | Out-String)
+          if ($dockerText -notmatch 'OSType:\s*linux') {
 
-          Write-Host ""
-          Write-Host "Final Docker mode:"
-          Write-Host $finalText
-
-          if ($finalText -notmatch 'OSType:\s*linux') {
-            throw "Docker is NOT running in Linux-container mode."
+            throw (
+              "Docker container type could not be verified as Linux.`n" +
+              "Docker info output:`n" +
+              $dockerText
+            )
           }
 
           Write-Host ""
@@ -506,7 +473,7 @@ Docker Linux engine in its current state.
       # 6. Verify Existing SQLite
       # ==============================================================
 
-      - name: 6. Verify Existing SQLite State
+      - name: 6. Verify Existing SQLite
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -516,7 +483,7 @@ Docker Linux engine in its current state.
             "storage.sqlite"
 
           Write-Host "=================================================="
-          Write-Host "CHECKING SQLITE"
+          Write-Host "VERIFYING SQLITE STATE"
           Write-Host "=================================================="
 
           if (-not (Test-Path $dbFile)) {
@@ -530,19 +497,20 @@ Docker Linux engine in its current state.
 
             Write-Host ""
             Write-Host "Database:"
-            Write-Host $db.FullName
-            Write-Host "Size: $($db.Length) bytes"
+            Write-Host "Path : $($db.FullName)"
+            Write-Host "Size : $($db.Length) bytes"
 
             if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
 
-              $result = sqlite3 `
+              $integrity = sqlite3 `
                 $dbFile `
                 "PRAGMA integrity_check;"
 
               Write-Host ""
-              Write-Host $result
+              Write-Host "Integrity:"
+              Write-Host $integrity
 
-              if ($result -notmatch "^ok$") {
+              if ($integrity -notmatch "^ok$") {
                 throw "SQLite integrity check failed."
               }
             }
@@ -560,7 +528,7 @@ Docker Linux engine in its current state.
           $ErrorActionPreference = "Stop"
 
           Write-Host "=================================================="
-          Write-Host "DOWNLOADING LEGACY JSON"
+          Write-Host "DOWNLOADING LEGACY OMNIROUTE JSON"
           Write-Host "=================================================="
 
           $backupDir = Join-Path `
@@ -588,10 +556,10 @@ Docker Linux engine in its current state.
             "$env:LEGACY_BACKUP_BRANCH"
 
           $headers = @{
-            "Accept"               = "application/vnd.github.raw+json"
-            "Authorization"        = "Bearer $env:GIT_TOKEN"
+            "Accept" = "application/vnd.github.raw+json"
+            "Authorization" = "Bearer $env:GIT_TOKEN"
             "X-GitHub-Api-Version" = "2022-11-28"
-            "User-Agent"           = "OmniRoute-Windows-Gateway"
+            "User-Agent" = "OmniRoute-Windows-Gateway"
           }
 
           Invoke-WebRequest `
@@ -626,7 +594,8 @@ Docker Linux engine in its current state.
           }
           catch {
 
-            throw "Legacy JSON validation failed: $($_.Exception.Message)"
+            throw `
+              "Legacy JSON validation failed: $($_.Exception.Message)"
           }
 
           Write-Host ""
@@ -704,8 +673,14 @@ Docker Linux engine in its current state.
 
           if (-not $redisReady) {
 
+            Write-Host ""
+            Write-Host "Redis containers:"
+
             docker ps -a `
               --filter "name=^omniroute-redis$"
+
+            Write-Host ""
+            Write-Host "Redis logs:"
 
             docker logs omniroute-redis
 
@@ -753,11 +728,19 @@ Docker Linux engine in its current state.
 
           if (-not [string]::IsNullOrWhiteSpace($existingOmni)) {
 
+            Write-Host "Removing existing OmniRoute container..."
+
             docker rm -f omniroute
 
             if ($LASTEXITCODE -ne 0) {
               throw "Failed to remove existing OmniRoute container."
             }
+          }
+
+          docker pull diegosouzapw/omniroute:latest
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to pull OmniRoute image."
           }
 
           docker run -d `
@@ -785,7 +768,7 @@ Docker Linux engine in its current state.
             --filter "name=^omniroute$"
 
       # ==============================================================
-      # 9A. Wait for OmniRoute
+      # 9A. Wait For OmniRoute
       # ==============================================================
 
       - name: 9A. Wait For OmniRoute
@@ -871,7 +854,7 @@ Docker Linux engine in its current state.
 
           if (-not (Test-Path $dbFile)) {
 
-            Write-Host "No SQLite database found."
+            Write-Host "storage.sqlite does not exist."
             Write-Host "JSON import required."
 
             "OMNIROUTE_JSON_IMPORT_REQUIRED=true" |
@@ -885,7 +868,10 @@ Docker Linux engine in its current state.
           if (-not (Get-Command sqlite3 -ErrorAction SilentlyContinue)) {
 
             Write-Warning `
-              "sqlite3 unavailable; JSON import will be skipped."
+              "sqlite3.exe unavailable."
+
+            Write-Warning `
+              "Skipping automatic JSON import."
 
             "OMNIROUTE_JSON_IMPORT_REQUIRED=false" |
               Out-File `
@@ -920,10 +906,13 @@ Docker Linux engine in its current state.
 
           $count = 0
 
-          [int]::TryParse(
-            $countRaw.Trim(),
-            [ref]$count
-          ) | Out-Null
+          if (-not [string]::IsNullOrWhiteSpace($countRaw)) {
+
+            [int]::TryParse(
+              $countRaw.Trim(),
+              [ref]$count
+            ) | Out-Null
+          }
 
           Write-Host ""
           Write-Host "Existing api_keys rows: $count"
@@ -950,10 +939,7 @@ Docker Linux engine in its current state.
           }
 
       # ==============================================================
-      # 11. Import Legacy JSON
-      #
-      # Correct endpoint:
-      # POST /api/settings/import-json
+      # 11. Import Legacy JSON Settings
       # ==============================================================
 
       - name: 11. Import Legacy JSON Settings
@@ -1036,13 +1022,14 @@ Docker Linux engine in its current state.
             if ($apiKeys -gt 0) {
 
               Write-Host ""
-              Write-Host "API keys imported successfully." `
+              Write-Host `
+                "API keys imported successfully." `
                 -ForegroundColor Green
             }
             else {
 
               Write-Warning `
-                "Import completed but apiKeys is 0."
+                "Import returned apiKeys=0."
 
               Write-Warning `
                 "Verify API_KEY_SECRET and STORAGE_ENCRYPTION_KEY."
@@ -1065,14 +1052,12 @@ Docker Linux engine in its current state.
 
             if ($statusCode -eq 401) {
 
-              throw @"
-OmniRoute returned HTTP 401 for /api/settings/import-json.
-
-If your OmniRoute instance requires login for this endpoint,
-create the optional INITIAL_PASSWORD secret using the same
-dashboard password and configure the exact authentication
-mechanism required by your OmniRoute image.
-"@
+              throw (
+                "OmniRoute returned HTTP 401 for:`n" +
+                "POST /api/settings/import-json`n" +
+                "The installed OmniRoute instance requires authentication " +
+                "for this endpoint."
+              )
             }
 
             throw `
@@ -1080,7 +1065,7 @@ mechanism required by your OmniRoute image.
           }
 
       # ==============================================================
-      # 11A. Verify API Keys
+      # 11A. Verify API Key State
       # ==============================================================
 
       - name: 11A. Verify API Key State
@@ -1094,11 +1079,14 @@ mechanism required by your OmniRoute image.
             "storage.sqlite"
 
           if (-not (Test-Path $dbFile)) {
-            throw "storage.sqlite does not exist after import."
+            throw "storage.sqlite does not exist after JSON import."
           }
 
           if (-not (Get-Command sqlite3 -ErrorAction SilentlyContinue)) {
-            Write-Warning "sqlite3 unavailable."
+
+            Write-Warning `
+              "sqlite3 unavailable. API key verification skipped."
+
             exit 0
           }
 
@@ -1117,26 +1105,26 @@ mechanism required by your OmniRoute image.
           Write-Host ""
           Write-Host "api_keys rows after import: $count"
 
-          if ($count -eq 0) {
-
-            Write-Warning `
-              "api_keys remains empty."
-
-            Write-Warning `
-              "Check API_KEY_SECRET and STORAGE_ENCRYPTION_KEY."
-          }
-          else {
+          if ($count -gt 0) {
 
             Write-Host `
               "API keys are present." `
               -ForegroundColor Green
           }
+          else {
+
+            Write-Warning `
+              "api_keys is still empty."
+
+            Write-Warning `
+              "Check API_KEY_SECRET and STORAGE_ENCRYPTION_KEY."
+          }
 
       # ==============================================================
-      # 12. Verify OmniRoute After Import
+      # 12. Verify OmniRoute
       # ==============================================================
 
-      - name: 12. Verify OmniRoute After Import
+      - name: 12. Verify OmniRoute
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -1151,6 +1139,7 @@ mechanism required by your OmniRoute image.
             $response.StatusCode -lt 200 -or
             $response.StatusCode -ge 500
           ) {
+
             throw "OmniRoute is unhealthy."
           }
 
@@ -1179,6 +1168,7 @@ mechanism required by your OmniRoute image.
           $ErrorActionPreference = "Continue"
 
           $workspace = "${{ github.workspace }}"
+
           $dbFile = Join-Path `
             $workspace `
             "storage.sqlite"
@@ -1228,10 +1218,6 @@ mechanism required by your OmniRoute image.
               return
             }
 
-            # ----------------------------------------------------------
-            # WAL checkpoint
-            # ----------------------------------------------------------
-
             if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
 
               sqlite3 `
@@ -1244,10 +1230,6 @@ mechanism required by your OmniRoute image.
                   "SQLite WAL checkpoint failed."
               }
             }
-
-            # ----------------------------------------------------------
-            # Backup archive
-            # ----------------------------------------------------------
 
             $tarItems = @()
 
@@ -1287,10 +1269,6 @@ mechanism required by your OmniRoute image.
               }
             }
 
-            # ----------------------------------------------------------
-            # Stage
-            # ----------------------------------------------------------
-
             git add `
               .gitattributes `
               storage.sqlite `
@@ -1311,10 +1289,6 @@ mechanism required by your OmniRoute image.
               return
             }
 
-            # ----------------------------------------------------------
-            # Commit
-            # ----------------------------------------------------------
-
             git commit `
               -m "chore: persist OmniRoute SQLite state [skip ci]" `
               2>$null
@@ -1325,10 +1299,6 @@ mechanism required by your OmniRoute image.
 
               return
             }
-
-            # ----------------------------------------------------------
-            # Sync target branch
-            # ----------------------------------------------------------
 
             git fetch origin "$env:TARGET_BRANCH" 2>$null
 
@@ -1352,10 +1322,6 @@ mechanism required by your OmniRoute image.
               return
             }
 
-            # ----------------------------------------------------------
-            # Push explicitly to Omniroute_Windows
-            # ----------------------------------------------------------
-
             git push `
               origin `
               "HEAD:$env:TARGET_BRANCH" `
@@ -1371,15 +1337,15 @@ mechanism required by your OmniRoute image.
             else {
 
               Write-Warning `
-                "Git push failed."
+                "GitHub push failed."
             }
           }
 
           Write-Host ""
           Write-Host "=================================================="
           Write-Host "KEEP-ALIVE STARTED"
-          Write-Host "355 minutes"
-          Write-Host "SQLite persistence every $interval minutes"
+          Write-Host "Duration: 355 minutes"
+          Write-Host "SQLite persistence: every $interval minutes"
           Write-Host "=================================================="
 
           for ($minute = 1; $minute -le $totalMinutes; $minute++) {
@@ -1433,7 +1399,7 @@ mechanism required by your OmniRoute image.
           Sync-OmniRouteState
 
       # ==============================================================
-      # 14. Shutdown
+      # 14. Final Shutdown
       # ==============================================================
 
       - name: 14. Final Shutdown
@@ -1511,6 +1477,9 @@ mechanism required by your OmniRoute image.
 
           $dbFile = "storage.sqlite"
 
+          $archive = `
+            "backup/omniroute/omniroute-full-backup.tar.gz"
+
           if (
             (Test-Path $dbFile) -and
             (Get-Command sqlite3 -ErrorAction SilentlyContinue)
@@ -1526,9 +1495,6 @@ mechanism required by your OmniRoute image.
             -Path "backup/omniroute" `
             -Force |
             Out-Null
-
-          $archive =
-            "backup/omniroute/omniroute-full-backup.tar.gz"
 
           $tarItems = @()
 
@@ -1632,7 +1598,7 @@ mechanism required by your OmniRoute image.
           }
 
       # ==============================================================
-      # 16. Diagnostics
+      # 16. Final Diagnostics
       # ==============================================================
 
       - name: 16. Final Diagnostics
@@ -1655,7 +1621,12 @@ mechanism required by your OmniRoute image.
           git branch --show-current
 
           Write-Host ""
+          Write-Host "Target branch:"
+          Write-Host $env:TARGET_BRANCH
+
+          Write-Host ""
           Write-Host "Docker:"
+
           docker ps -a `
             --filter "name=^omniroute$"
 
@@ -1663,16 +1634,19 @@ mechanism required by your OmniRoute image.
             --filter "name=^omniroute-redis$"
 
           Write-Host ""
-          Write-Host "Docker info:"
+          Write-Host "Docker mode:"
+
           docker info 2>$null |
             Select-String "Operating System|OSType|Server Version"
 
           Write-Host ""
           Write-Host "Tailscale:"
+
           tailscale status --peers=false 2>$null
 
           Write-Host ""
           Write-Host "RDP service:"
+
           Get-Service `
             -Name TermService `
             -ErrorAction SilentlyContinue |
@@ -1681,6 +1655,7 @@ mechanism required by your OmniRoute image.
 
           Write-Host ""
           Write-Host "RDP TCP 3389:"
+
           Get-NetTCPConnection `
             -LocalPort 3389 `
             -State Listen `
@@ -1690,6 +1665,7 @@ mechanism required by your OmniRoute image.
 
           Write-Host ""
           Write-Host "SQLite:"
+
           Get-ChildItem `
             -Path "${{ github.workspace }}" `
             -Filter "storage.sqlite*" `
@@ -1698,6 +1674,16 @@ mechanism required by your OmniRoute image.
             Format-Table
 
           Write-Host ""
+          Write-Host "Legacy JSON:"
+
+          Get-Item `
+            "${{ github.workspace }}\db_backups\omniroute-legacy-backup-2026-08-29T08-40-34-825Z.json" `
+            -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-List
+
+          Write-Host ""
           Write-Host "=================================================="
           Write-Host "WORKFLOW COMPLETE"
           Write-Host "=================================================="
+```
