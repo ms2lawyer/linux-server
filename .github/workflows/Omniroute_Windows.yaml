@@ -1,5 +1,5 @@
 
-name: OmniRoute CI Gateway (GitHub Windows 2022)
+name: OmniRoute CI Gateway Win (GitHub Windows 2022)
 
 on:
   schedule:
@@ -22,24 +22,18 @@ env:
   OMNIROUTE_PORT: 20128
   REDIS_PORT: 6379
   RDP_PORT: 3389
-  SSH_PORT: 22
 
-  # Legacy OmniRoute backup stored in this repository.
+  SQLITE_SYNC_INTERVAL_MINUTES: 5
+
   LEGACY_BACKUP_BRANCH: "Omniroute_Windows"
   LEGACY_BACKUP_PATH: "db_backups/omniroute-legacy-backup-2026-08-29T08-40-34-825Z.json"
-
-  # Persist SQLite frequently so cancellation does not lose the
-  # entire 6-hour session.
-  SQLITE_SYNC_INTERVAL_MINUTES: 5
 
 jobs:
 
   run-omniroute:
 
-    # GitHub-hosted Windows runner.
     runs-on: windows-2022
 
-    # Maximum job duration.
     timeout-minutes: 360
 
     steps:
@@ -65,14 +59,14 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           Write-Host "=================================================="
-          Write-Host "VERIFYING GITHUB-HOSTED WINDOWS RUNNER"
+          Write-Host "VERIFYING GITHUB WINDOWS RUNNER"
           Write-Host "=================================================="
 
           Write-Host ""
           Write-Host "Windows:"
           Get-CimInstance Win32_OperatingSystem |
-            Select-Object Caption, Version, BuildNumber |
-            Format-List
+              Select-Object Caption, Version, BuildNumber |
+              Format-List
 
           Write-Host ""
           Write-Host "Computer:"
@@ -81,7 +75,7 @@ jobs:
           Write-Host ""
           Write-Host "Architecture:"
           Write-Host (
-            [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+              [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
           )
 
           Write-Host ""
@@ -106,12 +100,12 @@ jobs:
               sqlite3 --version
           }
           else {
-              Write-Warning "sqlite3.exe was not found. SQLite WAL checkpoint will be skipped."
+              Write-Warning "sqlite3.exe was not found. WAL checkpoint will be skipped."
           }
 
           Write-Host ""
           Write-Host "=================================================="
-          Write-Host "HOST PREREQUISITES VERIFIED"
+          Write-Host "HOST VERIFICATION COMPLETE"
           Write-Host "=================================================="
 
       # ==============================================================
@@ -119,7 +113,7 @@ jobs:
       # ==============================================================
 
       - name: 3. Connect Tailscale VPN
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -130,7 +124,7 @@ jobs:
       # 3A. Verify Tailscale
       # ==============================================================
 
-      - name: 3A. Verify Tailscale Connection
+      - name: 3A. Verify Tailscale
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -139,9 +133,7 @@ jobs:
           Write-Host "VERIFYING TAILSCALE"
           Write-Host "=================================================="
 
-          $tailscale = Get-Command `
-            tailscale.exe `
-            -ErrorAction SilentlyContinue
+          $tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
 
           if ($null -eq $tailscale) {
               throw "tailscale.exe was not found."
@@ -152,7 +144,7 @@ jobs:
           tailscale version
 
           $tailscaleIp = (
-            & $tailscale.Source ip -4 2>$null
+              & $tailscale.Source ip -4 2>$null
           ).Trim()
 
           if ([string]::IsNullOrWhiteSpace($tailscaleIp)) {
@@ -168,7 +160,7 @@ jobs:
           tailscale status --peers=false
 
           Write-Host ""
-          Write-Host "Hostname:"
+          Write-Host "MagicDNS hostname:"
           Write-Host "omniroute-ci-gateway"
 
           Write-Host ""
@@ -177,288 +169,10 @@ jobs:
           Write-Host "=================================================="
 
       # ==============================================================
-      # 4. Enable OpenSSH
+      # 4. Enable Remote Desktop ONLY
       # ==============================================================
 
-      - name: 4. Enable SSH Access
-        shell: powershell
-        env:
-          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
-          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "=================================================="
-          Write-Host "CONFIGURING WINDOWS OPENSSH"
-          Write-Host "=================================================="
-
-          if ([string]::IsNullOrWhiteSpace($env:SSH_USERNAME)) {
-              throw "SSH_USERNAME secret is missing."
-          }
-
-          if ([string]::IsNullOrWhiteSpace($env:SSH_PASSWORD)) {
-              throw "SSH_PASSWORD secret is missing."
-          }
-
-          # ------------------------------------------------------------
-          # Password validation
-          # ------------------------------------------------------------
-
-          $password = $env:SSH_PASSWORD
-
-          if ($password.Length -lt 16) {
-              throw "SSH_PASSWORD must be at least 16 characters. Recommended: 20-24."
-          }
-
-          if ($password -notmatch '[A-Z]') {
-              throw "SSH_PASSWORD must contain an uppercase letter."
-          }
-
-          if ($password -notmatch '[a-z]') {
-              throw "SSH_PASSWORD must contain a lowercase letter."
-          }
-
-          if ($password -notmatch '\d') {
-              throw "SSH_PASSWORD must contain a number."
-          }
-
-          if ($password -notmatch '[^a-zA-Z0-9]') {
-              throw "SSH_PASSWORD must contain a special character."
-          }
-
-          Write-Host "SSH password policy pre-check: PASSED"
-
-          # ------------------------------------------------------------
-          # Install OpenSSH
-          # ------------------------------------------------------------
-
-          $sshCapability = Get-WindowsCapability -Online |
-            Where-Object {
-              $_.Name -eq "OpenSSH.Server~~~~0.0.1.0"
-            }
-
-          if ($null -eq $sshCapability) {
-              throw "OpenSSH Server capability was not found."
-          }
-
-          if ($sshCapability.State -ne "Installed") {
-
-              Write-Host "Installing OpenSSH Server..."
-
-              Add-WindowsCapability `
-                -Online `
-                -Name "OpenSSH.Server~~~~0.0.1.0"
-
-              if ($LASTEXITCODE -ne 0) {
-                  throw "OpenSSH Server installation failed."
-              }
-          }
-
-          # ------------------------------------------------------------
-          # SSH paths
-          # ------------------------------------------------------------
-
-          $sshRoot = Join-Path $env:ProgramData "ssh"
-          $configFile = Join-Path $sshRoot "sshd_config"
-
-          $sshdExe = Join-Path `
-            $env:WINDIR `
-            "System32\OpenSSH\sshd.exe"
-
-          $sshKeygenExe = Join-Path `
-            $env:WINDIR `
-            "System32\OpenSSH\ssh-keygen.exe"
-
-          if (-not (Test-Path $sshdExe)) {
-              throw "sshd.exe was not found."
-          }
-
-          New-Item `
-            -ItemType Directory `
-            -Path $sshRoot `
-            -Force |
-            Out-Null
-
-          # ------------------------------------------------------------
-          # SSH user
-          # ------------------------------------------------------------
-
-          $securePassword = ConvertTo-SecureString `
-            $env:SSH_PASSWORD `
-            -AsPlainText `
-            -Force
-
-          $existingUser = Get-LocalUser `
-            -Name $env:SSH_USERNAME `
-            -ErrorAction SilentlyContinue
-
-          if ($null -eq $existingUser) {
-
-              New-LocalUser `
-                -Name $env:SSH_USERNAME `
-                -Password $securePassword `
-                -Description "GitHub Actions OmniRoute SSH user" `
-                -AccountNeverExpires `
-                -PasswordNeverExpires |
-                Out-Null
-          }
-          else {
-
-              Set-LocalUser `
-                -Name $env:SSH_USERNAME `
-                -Password $securePassword
-
-              Enable-LocalUser `
-                -Name $env:SSH_USERNAME
-          }
-
-          # ------------------------------------------------------------
-          # Administrators
-          # ------------------------------------------------------------
-
-          $adminGroup = Get-LocalGroup -SID "S-1-5-32-544"
-
-          $isAdmin = Get-LocalGroupMember `
-            -Group $adminGroup.Name `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.Name -eq "$env:COMPUTERNAME\$env:SSH_USERNAME"
-            }
-
-          if ($null -eq $isAdmin) {
-
-              Add-LocalGroupMember `
-                -Group $adminGroup.Name `
-                -Member $env:SSH_USERNAME
-          }
-
-          # ------------------------------------------------------------
-          # Generate host keys
-          # ------------------------------------------------------------
-
-          & $sshKeygenExe -A
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "OpenSSH host key generation failed."
-          }
-
-          # ------------------------------------------------------------
-          # Create sshd_config
-          # ------------------------------------------------------------
-
-          $configContent = @"
-          Port 22
-          ListenAddress 0.0.0.0
-
-          PubkeyAuthentication yes
-          PasswordAuthentication yes
-          PermitEmptyPasswords no
-
-          MaxAuthTries 3
-          LoginGraceTime 30
-
-          AllowTcpForwarding no
-          AllowAgentForwarding no
-
-          HostKey C:/ProgramData/ssh/ssh_host_rsa_key
-          HostKey C:/ProgramData/ssh/ssh_host_ecdsa_key
-          HostKey C:/ProgramData/ssh/ssh_host_ed25519_key
-
-          Subsystem sftp sftp-server.exe
-          "@
-
-          Set-Content `
-            -Path $configFile `
-            -Value $configContent `
-            -Encoding ascii `
-            -Force
-
-          # ------------------------------------------------------------
-          # Validate configuration
-          # ------------------------------------------------------------
-
-          & $sshdExe `
-            -t `
-            -f $configFile
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "OpenSSH configuration validation failed."
-          }
-
-          # ------------------------------------------------------------
-          # Start service
-          # ------------------------------------------------------------
-
-          Set-Service `
-            -Name sshd `
-            -StartupType Automatic
-
-          $service = Get-Service `
-            -Name sshd
-
-          if ($service.Status -eq "Running") {
-              Restart-Service -Name sshd -Force
-          }
-          else {
-              Start-Service -Name sshd
-          }
-
-          Start-Sleep -Seconds 2
-
-          $service = Get-Service -Name sshd
-
-          if ($service.Status -ne "Running") {
-              throw "OpenSSH service failed to start."
-          }
-
-          # ------------------------------------------------------------
-          # Firewall
-          # ------------------------------------------------------------
-
-          $rule = Get-NetFirewallRule `
-            -Name "OpenSSH-Server-In-TCP" `
-            -ErrorAction SilentlyContinue
-
-          if ($null -eq $rule) {
-
-              New-NetFirewallRule `
-                -Name "OpenSSH-Server-In-TCP" `
-                -DisplayName "OpenSSH Server (TCP 22)" `
-                -Enabled True `
-                -Direction Inbound `
-                -Protocol TCP `
-                -LocalPort 22 `
-                -Action Allow |
-                Out-Null
-          }
-          else {
-              Enable-NetFirewallRule `
-                -Name "OpenSSH-Server-In-TCP"
-          }
-
-          $sshPort = Get-NetTCPConnection `
-            -LocalPort 22 `
-            -State Listen `
-            -ErrorAction SilentlyContinue
-
-          if ($null -eq $sshPort) {
-              throw "SSH port 22 is not listening."
-          }
-
-          Write-Host ""
-          Write-Host "=================================================="
-          Write-Host "OPENSSH READY"
-          Write-Host "=================================================="
-
-          Write-Host "SSH user : $env:SSH_USERNAME"
-          Write-Host "SSH host : omniroute-ci-gateway"
-          Write-Host "SSH port : 22"
-
-      # ==============================================================
-      # 4A. Enable Remote Desktop
-      # ==============================================================
-
-      - name: 4A. Enable Remote Desktop
+      - name: 4. Enable Remote Desktop
         shell: powershell
         env:
           RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
@@ -479,29 +193,29 @@ jobs:
           }
 
           # ------------------------------------------------------------
-          # Password validation
+          # Validate password
           # ------------------------------------------------------------
 
           $password = $env:RDP_PASSWORD
 
           if ($password.Length -lt 16) {
-              throw "RDP_PASSWORD must be at least 16 characters. Recommended: 20-24."
+              throw "RDP_PASSWORD must be at least 16 characters. Recommended: 20-24 characters."
           }
 
           if ($password -notmatch '[A-Z]') {
-              throw "RDP_PASSWORD must contain an uppercase letter."
+              throw "RDP_PASSWORD must contain at least one uppercase letter."
           }
 
           if ($password -notmatch '[a-z]') {
-              throw "RDP_PASSWORD must contain a lowercase letter."
+              throw "RDP_PASSWORD must contain at least one lowercase letter."
           }
 
           if ($password -notmatch '\d') {
-              throw "RDP_PASSWORD must contain a number."
+              throw "RDP_PASSWORD must contain at least one number."
           }
 
           if ($password -notmatch '[^a-zA-Z0-9]') {
-              throw "RDP_PASSWORD must contain a special character."
+              throw "RDP_PASSWORD must contain at least one special character."
           }
 
           Write-Host "RDP password policy pre-check: PASSED"
@@ -511,93 +225,100 @@ jobs:
           # ------------------------------------------------------------
 
           Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' `
-            -Value 0
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name 'fDenyTSConnections' `
+              -Value 0
 
           Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' `
-            -Value 1
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name 'UserAuthentication' `
+              -Value 1
 
           # ------------------------------------------------------------
           # Firewall
           # ------------------------------------------------------------
 
           Enable-NetFirewallRule `
-            -DisplayGroup 'Remote Desktop'
+              -DisplayGroup 'Remote Desktop'
 
           # ------------------------------------------------------------
           # TermService
           # ------------------------------------------------------------
 
           Set-Service `
-            -Name 'TermService' `
-            -StartupType Automatic
+              -Name 'TermService' `
+              -StartupType Automatic
 
           Start-Service `
-            -Name 'TermService' `
-            -ErrorAction SilentlyContinue
+              -Name 'TermService' `
+              -ErrorAction SilentlyContinue
 
           $service = Get-Service `
-            -Name 'TermService'
+              -Name 'TermService'
 
           if ($service.Status -ne 'Running') {
               throw "TermService is not running."
           }
 
           # ------------------------------------------------------------
-          # Create/update RDP user
+          # Create / update RDP account
           # ------------------------------------------------------------
 
           $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
+              $env:RDP_PASSWORD `
+              -AsPlainText `
+              -Force
 
           $existingUser = Get-LocalUser `
-            -Name $env:RDP_USERNAME `
-            -ErrorAction SilentlyContinue
+              -Name $env:RDP_USERNAME `
+              -ErrorAction SilentlyContinue
 
           if ($null -eq $existingUser) {
 
+              Write-Host "Creating RDP user..."
+
               New-LocalUser `
-                -Name $env:RDP_USERNAME `
-                -Password $securePassword `
-                -PasswordNeverExpires `
-                -AccountNeverExpires `
-                -Description "GitHub Actions RDP Administrator" |
-                Out-Null
+                  -Name $env:RDP_USERNAME `
+                  -Password $securePassword `
+                  -PasswordNeverExpires `
+                  -AccountNeverExpires `
+                  -Description "GitHub Actions RDP Administrator" |
+                  Out-Null
           }
           else {
 
+              Write-Host "Updating RDP user password..."
+
               Set-LocalUser `
-                -Name $env:RDP_USERNAME `
-                -Password $securePassword
+                  -Name $env:RDP_USERNAME `
+                  -Password $securePassword
 
               Enable-LocalUser `
-                -Name $env:RDP_USERNAME
+                  -Name $env:RDP_USERNAME
           }
 
-          Add-LocalGroupMember `
-            -Group 'Administrators' `
-            -Member $env:RDP_USERNAME `
-            -ErrorAction SilentlyContinue
+          # ------------------------------------------------------------
+          # Add groups
+          # ------------------------------------------------------------
 
           Add-LocalGroupMember `
-            -Group 'Remote Desktop Users' `
-            -Member $env:RDP_USERNAME `
-            -ErrorAction SilentlyContinue
+              -Group 'Administrators' `
+              -Member $env:RDP_USERNAME `
+              -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+              -Group 'Remote Desktop Users' `
+              -Member $env:RDP_USERNAME `
+              -ErrorAction SilentlyContinue
 
           Write-Host ""
-          Write-Host "Remote Desktop enabled." `
-            -ForegroundColor Green
+          Write-Host "Remote Desktop configured." -ForegroundColor Green
 
       # ==============================================================
-      # 4B. Verify Remote Desktop
+      # 4A. Verify Remote Desktop
       # ==============================================================
 
-      - name: 4B. Verify Remote Desktop
+      - name: 4A. Verify Remote Desktop
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -607,72 +328,81 @@ jobs:
           Write-Host "=================================================="
 
           $rdpDenied = Get-ItemPropertyValue `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections'
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name 'fDenyTSConnections'
 
           if ($rdpDenied -ne 0) {
               throw "RDP is disabled."
           }
 
           $nla = Get-ItemPropertyValue `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication'
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name 'UserAuthentication'
 
           if ($nla -ne 1) {
               throw "RDP NLA is not enabled."
           }
 
-          $service = Get-Service `
-            -Name 'TermService'
+          $service = Get-Service -Name 'TermService'
 
           if ($service.Status -ne 'Running') {
               throw "TermService is not running."
           }
 
           $rules = Get-NetFirewallRule `
-            -DisplayGroup 'Remote Desktop' `
-            -ErrorAction SilentlyContinue |
-            Where-Object Enabled -eq 'True'
+              -DisplayGroup 'Remote Desktop' `
+              -ErrorAction SilentlyContinue |
+              Where-Object Enabled -eq 'True'
 
           if ($null -eq $rules) {
               throw "RDP firewall rules are not enabled."
           }
 
-          $port = Get-NetTCPConnection `
-            -LocalPort 3389 `
-            -State Listen `
-            -ErrorAction SilentlyContinue
+          $rdpPort = $null
 
-          if ($null -eq $port) {
-              throw "RDP TCP 3389 is not listening."
+          for ($i = 1; $i -le 15; $i++) {
+
+              $rdpPort = Get-NetTCPConnection `
+                  -LocalPort 3389 `
+                  -State Listen `
+                  -ErrorAction SilentlyContinue
+
+              if ($null -ne $rdpPort) {
+                  break
+              }
+
+              Start-Sleep -Seconds 1
           }
 
+          if ($null -eq $rdpPort) {
+              throw "TCP 3389 is not listening."
+          }
+
+          Write-Host ""
           Write-Host "RDP service : Running" -ForegroundColor Green
           Write-Host "RDP NLA     : Enabled" -ForegroundColor Green
           Write-Host "RDP firewall: Enabled" -ForegroundColor Green
-          Write-Host "RDP port    : Listening" -ForegroundColor Green
+          Write-Host "RDP port    : LISTENING" -ForegroundColor Green
 
       # ==============================================================
-      # 4C. RDP Connection Information
+      # 4B. Display RDP Connection Information
       # ==============================================================
 
-      - name: 4C. Display Remote Desktop Connection Information
+      - name: 4B. Display Remote Desktop Connection Information
         shell: powershell
         env:
           RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $tailscale = Get-Command `
-            tailscale.exe `
-            -ErrorAction SilentlyContinue
+          $tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
 
           if ($null -eq $tailscale) {
               throw "tailscale.exe was not found."
           }
 
           $tailscaleIp = (
-            & $tailscale.Source ip -4 2>$null
+              & $tailscale.Source ip -4 2>$null
           ).Trim()
 
           if ([string]::IsNullOrWhiteSpace($tailscaleIp)) {
@@ -681,17 +411,17 @@ jobs:
 
           Write-Host ""
           Write-Host "=================================================="
-          Write-Host "REMOTE DESKTOP IS READY"
+          Write-Host "REMOTE DESKTOP READY"
           Write-Host "=================================================="
 
           Write-Host ""
-          Write-Host "Tailscale IP : $tailscaleIp" -ForegroundColor Yellow
-          Write-Host "RDP endpoint : ${tailscaleIp}:3389" -ForegroundColor Yellow
-          Write-Host "RDP hostname : omniroute-ci-gateway" -ForegroundColor Yellow
+          Write-Host "Tailscale IP : $tailscaleIp"
+          Write-Host "RDP endpoint : ${tailscaleIp}:3389"
+          Write-Host "RDP hostname : omniroute-ci-gateway"
 
           Write-Host ""
           Write-Host "RDP command:"
-          Write-Host "mstsc /v:omniroute-ci-gateway" -ForegroundColor Magenta
+          Write-Host "mstsc /v:omniroute-ci-gateway"
 
           Write-Host ""
           Write-Host "RDP username:"
@@ -699,11 +429,11 @@ jobs:
 
           Write-Host ""
           Write-Host "WARNING:"
-          Write-Host "This is an ephemeral GitHub-hosted VM."
-          Write-Host "RDP exists only while this GitHub Actions job is running."
+          Write-Host "The GitHub-hosted VM is ephemeral."
+          Write-Host "RDP exists only while this job is running."
 
       # ==============================================================
-      # 5. Download Legacy OmniRoute JSON Backup
+      # 5. Download Legacy JSON Backup
       # ==============================================================
 
       - name: 5. Download Legacy OmniRoute JSON Backup
@@ -714,128 +444,81 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           Write-Host "=================================================="
-          Write-Host "DOWNLOADING LEGACY OMNIROUTE BACKUP"
+          Write-Host "DOWNLOADING LEGACY OMNIROUTE JSON BACKUP"
           Write-Host "=================================================="
 
           $backupDir = Join-Path `
-            "${{ github.workspace }}" `
-            "db_backups"
+              "${{ github.workspace }}" `
+              "db_backups"
+
+          $backupName = Split-Path `
+              "$env:LEGACY_BACKUP_PATH" `
+              -Leaf
 
           $backupFile = Join-Path `
-            $backupDir `
-            "omniroute-legacy-backup-2026-08-29T08-40-34-825Z.json"
+              $backupDir `
+              $backupName
 
           New-Item `
-            -ItemType Directory `
-            -Path $backupDir `
-            -Force |
-            Out-Null
+              -ItemType Directory `
+              -Path $backupDir `
+              -Force |
+              Out-Null
 
-          $apiUrl = "https://api.github.com/repos/ms2lawyer/linux-server/contents/$env:LEGACY_BACKUP_PATH?ref=$env:LEGACY_BACKUP_BRANCH"
+          $encodedPath = [System.Uri]::EscapeDataString(
+              $env:LEGACY_BACKUP_PATH
+          )
+
+          $apiUrl =
+              "https://api.github.com/repos/ms2lawyer/linux-server/contents/" +
+              $encodedPath +
+              "?ref=" +
+              $env:LEGACY_BACKUP_BRANCH
 
           $headers = @{
-            "Accept"               = "application/vnd.github.raw+json"
-            "Authorization"        = "Bearer $env:GIT_TOKEN"
-            "X-GitHub-Api-Version" = "2022-11-28"
-            "User-Agent"           = "OmniRoute-CI-Gateway"
+              "Accept"               = "application/vnd.github.raw+json"
+              "Authorization"        = "Bearer $env:GIT_TOKEN"
+              "X-GitHub-Api-Version" = "2022-11-28"
+              "User-Agent"           = "OmniRoute-CI-Gateway"
           }
-
-          Write-Host "Repository: ms2lawyer/linux-server"
-          Write-Host "Branch    : $env:LEGACY_BACKUP_BRANCH"
-          Write-Host "File      : $env:LEGACY_BACKUP_PATH"
 
           Invoke-WebRequest `
-            -Uri $apiUrl `
-            -Headers $headers `
-            -OutFile $backupFile `
-            -UseBasicParsing
+              -Uri $apiUrl `
+              -Headers $headers `
+              -OutFile $backupFile `
+              -UseBasicParsing
 
           if (-not (Test-Path $backupFile)) {
-              throw "Legacy backup file was not downloaded."
+              throw "Legacy JSON backup was not downloaded."
           }
 
-          $fileInfo = Get-Item $backupFile
+          $info = Get-Item $backupFile
 
-          if ($fileInfo.Length -lt 10) {
-              throw "Downloaded legacy backup is suspiciously small."
+          if ($info.Length -lt 10) {
+              throw "Downloaded JSON backup is suspiciously small."
           }
 
           Write-Host ""
-          Write-Host "Legacy backup downloaded:"
-          Write-Host $fileInfo.FullName
-          Write-Host "Size: $($fileInfo.Length) bytes"
-
-          # ------------------------------------------------------------
-          # Validate JSON
-          # ------------------------------------------------------------
+          Write-Host "Backup downloaded:"
+          Write-Host $info.FullName
+          Write-Host "Size: $($info.Length) bytes"
 
           try {
 
-              $json = Get-Content `
-                -Path $backupFile `
-                -Raw `
-                -Encoding UTF8 |
-                ConvertFrom-Json
-
-              if ($null -eq $json) {
-                  throw "JSON is empty."
-              }
-
-              Write-Host ""
-              Write-Host "JSON validation: PASSED" `
-                -ForegroundColor Green
+              Get-Content `
+                  -Path $backupFile `
+                  -Raw `
+                  -Encoding UTF8 |
+                  ConvertFrom-Json |
+                  Out-Null
           }
           catch {
 
-              throw "Legacy OmniRoute backup is not valid JSON: $($_.Exception.Message)"
+              throw "Downloaded legacy backup is invalid JSON: $($_.Exception.Message)"
           }
 
-      # ==============================================================
-      # 5A. Verify Git SQLite State
-      # ==============================================================
-
-      - name: 5A. Verify Existing SQLite State
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $dbFile = Join-Path `
-            "${{ github.workspace }}" `
-            "storage.sqlite"
-
-          Write-Host "=================================================="
-          Write-Host "VERIFYING GIT SQLITE STATE"
-          Write-Host "=================================================="
-
-          if (Test-Path $dbFile) {
-
-              $db = Get-Item $dbFile
-
-              Write-Host "SQLite database found:"
-              Write-Host $db.FullName
-              Write-Host "Size: $($db.Length) bytes"
-
-              if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
-
-                  Write-Host ""
-                  Write-Host "SQLite integrity check:"
-
-                  $result = sqlite3 `
-                    $dbFile `
-                    "PRAGMA integrity_check;"
-
-                  Write-Host $result
-
-                  if ($result -notmatch "ok") {
-                      throw "SQLite integrity check failed."
-                  }
-              }
-          }
-          else {
-
-              Write-Warning `
-                "No storage.sqlite exists in Git checkout yet."
-          }
+          Write-Host ""
+          Write-Host "JSON validation: PASSED" -ForegroundColor Green
 
       # ==============================================================
       # 6. Start Redis
@@ -857,14 +540,14 @@ jobs:
           }
 
           docker run -d `
-            --name omniroute-redis `
-            --restart unless-stopped `
-            -p 6379:6379 `
-            --health-cmd "redis-cli ping" `
-            --health-interval 10s `
-            --health-timeout 5s `
-            --health-retries 3 `
-            redis:7-alpine
+              --name omniroute-redis `
+              --restart unless-stopped `
+              -p 6379:6379 `
+              --health-cmd "redis-cli ping" `
+              --health-interval 10s `
+              --health-timeout 5s `
+              --health-retries 3 `
+              redis:7-alpine
 
           if ($LASTEXITCODE -ne 0) {
               throw "Failed to start Redis."
@@ -875,9 +558,9 @@ jobs:
           for ($i = 1; $i -le 30; $i++) {
 
               $health = docker inspect `
-                --format "{{.State.Health.Status}}" `
-                omniroute-redis `
-                2>$null
+                  --format "{{.State.Health.Status}}" `
+                  omniroute-redis `
+                  2>$null
 
               if ($health -eq "healthy") {
 
@@ -898,7 +581,7 @@ jobs:
           Write-Host "Redis is healthy." -ForegroundColor Green
 
       # ==============================================================
-      # 7. Start OmniRoute Using Git SQLite State
+      # 7. Start OmniRoute
       # ==============================================================
 
       - name: 7. Start OmniRoute Container
@@ -935,32 +618,34 @@ jobs:
           $workspace = "${{ github.workspace }}"
 
           docker run -d `
-            --name omniroute `
-            --restart unless-stopped `
-            -p 20128:20128 `
-            -e "NODE_ENV=production" `
-            -e "JWT_SECRET=$env:OMNI_JWT_SECRET" `
-            -e "API_KEY_SECRET=$env:OMNI_API_KEY_SECRET" `
-            -e "STORAGE_ENCRYPTION_KEY=$env:OMNI_STORAGE_ENCRYPTION_KEY" `
-            -e "REDIS_URL=redis://host.docker.internal:6379" `
-            -e "DATA_DIR=/root/.omniroute" `
-            -e "DISABLE_SQLITE_AUTO_BACKUP=false" `
-            --add-host=host.docker.internal:host-gateway `
-            -v "${workspace}:/root/.omniroute" `
-            -v "${workspace}:/app/data" `
-            diegosouzapw/omniroute:latest
+              --name omniroute `
+              --restart unless-stopped `
+              -p 20128:20128 `
+              -e "NODE_ENV=production" `
+              -e "PORT=20128" `
+              -e "HOSTNAME=0.0.0.0" `
+              -e "JWT_SECRET=$env:OMNI_JWT_SECRET" `
+              -e "API_KEY_SECRET=$env:OMNI_API_KEY_SECRET" `
+              -e "STORAGE_ENCRYPTION_KEY=$env:OMNI_STORAGE_ENCRYPTION_KEY" `
+              -e "REDIS_URL=redis://host.docker.internal:6379" `
+              -e "DATA_DIR=/root/.omniroute" `
+              --add-host=host.docker.internal:host-gateway `
+              -v "${workspace}:/root/.omniroute" `
+              -v "${workspace}:/app/data" `
+              diegosouzapw/omniroute:latest
 
           if ($LASTEXITCODE -ne 0) {
               throw "Failed to start OmniRoute."
           }
 
-          docker ps --filter "name=omniroute"
+          docker ps `
+              --filter "name=omniroute"
 
       # ==============================================================
-      # 7A. Wait for OmniRoute
+      # 7A. Verify OmniRoute Health
       # ==============================================================
 
-      - name: 7A. Wait for OmniRoute Health
+      - name: 7A. Wait for OmniRoute
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -974,14 +659,14 @@ jobs:
               try {
 
                   $response = Invoke-WebRequest `
-                    -Uri "http://localhost:20128" `
-                    -UseBasicParsing `
-                    -TimeoutSec 5 `
-                    -ErrorAction Stop
+                      -Uri "http://localhost:20128" `
+                      -UseBasicParsing `
+                      -TimeoutSec 5 `
+                      -ErrorAction Stop
 
                   if (
-                    $response.StatusCode -ge 200 -and
-                    $response.StatusCode -lt 500
+                      $response.StatusCode -ge 200 -and
+                      $response.StatusCode -lt 500
                   ) {
 
                       $healthy = $true
@@ -998,7 +683,7 @@ jobs:
           if (-not $healthy) {
 
               docker ps -a `
-                --filter "name=omniroute"
+                  --filter "name=omniroute"
 
               docker logs omniroute
 
@@ -1009,173 +694,149 @@ jobs:
           Write-Host "OmniRoute is live." -ForegroundColor Green
 
       # ==============================================================
-      # 8. Import / Restore Legacy JSON Backup
+      # 8. Register Legacy JSON Backup With OmniRoute
       #
-      # The backup is copied into OmniRoute's native db_backups
-      # directory and restored with OmniRoute's native CLI.
+      # OmniRoute's documented restore mechanism works with named
+      # backups through:
       #
-      # IMPORTANT:
-      # OmniRoute restore replaces the active database state.
+      #   omniroute restore <name>
+      #
+      # We copy the legacy snapshot into OmniRoute's backup directory.
       # ==============================================================
 
-      - name: 8. Restore Legacy OmniRoute JSON Backup
+      - name: 8. Restore Legacy OmniRoute Backup
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
           Write-Host "=================================================="
-          Write-Host "RESTORING LEGACY OMNIROUTE JSON BACKUP"
+          Write-Host "RESTORING LEGACY OMNIROUTE BACKUP"
           Write-Host "=================================================="
 
           $workspace = "${{ github.workspace }}"
-
-          $backupName = "omniroute-legacy-backup-2026-08-29T08-40-34-825Z.json"
+          $backupName = Split-Path `
+              "$env:LEGACY_BACKUP_PATH" `
+              -Leaf
 
           $hostBackup = Join-Path `
-            $workspace `
-            "db_backups\$backupName"
+              $workspace `
+              "db_backups\$backupName"
 
           if (-not (Test-Path $hostBackup)) {
-              throw "Legacy backup was not found at $hostBackup"
+              throw "Legacy backup not found: $hostBackup"
+          }
+
+          Write-Host ""
+          Write-Host "Legacy backup:"
+          Write-Host $hostBackup
+
+          # ------------------------------------------------------------
+          # Ensure OmniRoute backup directory exists.
+          # ------------------------------------------------------------
+
+          docker exec `
+              omniroute `
+              sh -lc `
+              "mkdir -p /root/.omniroute/backups"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unable to create OmniRoute backup directory."
           }
 
           # ------------------------------------------------------------
-          # Stop OmniRoute before modifying its SQLite database.
+          # Copy legacy JSON into OmniRoute data directory.
           # ------------------------------------------------------------
 
-          Write-Host "Stopping OmniRoute before restore..."
+          $containerBackup =
+              "/root/.omniroute/backups/$backupName"
 
-          docker stop omniroute | Out-Null
+          Copy-Item `
+              $hostBackup `
+              (Join-Path $workspace "backups\$backupName") `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+          New-Item `
+              -ItemType Directory `
+              -Path (Join-Path $workspace "backups") `
+              -Force |
+              Out-Null
+
+          Copy-Item `
+              $hostBackup `
+              (Join-Path $workspace "backups\$backupName") `
+              -Force
 
           # ------------------------------------------------------------
-          # Make sure the backup is visible inside the mounted
-          # OmniRoute DATA_DIR.
+          # Verify inside container.
           # ------------------------------------------------------------
 
-          $containerBackup = "/root/.omniroute/db_backups/$backupName"
+          docker exec `
+              omniroute `
+              sh -lc `
+              "test -s '$containerBackup'"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Legacy backup is not visible inside OmniRoute."
+          }
 
           Write-Host ""
-          Write-Host "Legacy backup inside container:"
+          Write-Host "Legacy backup is available inside OmniRoute:"
           Write-Host $containerBackup
 
-          docker start omniroute | Out-Null
-
-          Start-Sleep -Seconds 3
-
           # ------------------------------------------------------------
-          # Verify OmniRoute CLI exists.
+          # Show restore command supported by installed OmniRoute.
           # ------------------------------------------------------------
 
-          $cliCheck = docker exec `
-            omniroute `
-            sh -lc "command -v omniroute || command -v node"
+          Write-Host ""
+          Write-Host "Checking OmniRoute restore command..."
+
+          docker exec `
+              omniroute `
+              sh -lc `
+              "omniroute restore --help"
+
+          # ------------------------------------------------------------
+          # IMPORTANT:
+          # The backup is named using the filename without extension.
+          # OmniRoute's documented CLI is:
+          #
+          #   omniroute restore <name>
+          #
+          # ------------------------------------------------------------
+
+          $restoreName = [System.IO.Path]::GetFileNameWithoutExtension(
+              $backupName
+          )
+
+          Write-Host ""
+          Write-Host "Restore name:"
+          Write-Host $restoreName
+
+          docker exec `
+              omniroute `
+              sh -lc `
+              "omniroute restore '$restoreName'"
 
           if ($LASTEXITCODE -ne 0) {
 
-              docker logs omniroute
-
-              throw `
-                "OmniRoute CLI was not found inside the container."
-          }
-
-          Write-Host ""
-          Write-Host "OmniRoute command detected."
-
-          # ------------------------------------------------------------
-          # Show restore help.
-          # ------------------------------------------------------------
-
-          Write-Host ""
-          Write-Host "OmniRoute restore help:"
-
-          docker exec `
-            omniroute `
-            sh -lc "omniroute restore --help"
-
-          # ------------------------------------------------------------
-          # Stop the server again.
-          #
-          # The CLI is executed against the mounted data directory.
-          # ------------------------------------------------------------
-
-          Write-Host ""
-          Write-Host "Stopping OmniRoute for database restore..."
-
-          docker stop omniroute | Out-Null
-
-          # ------------------------------------------------------------
-          # Restore using the backup timestamp.
-          #
-          # OmniRoute's CLI accepts a timestamp for restore.
-          # ------------------------------------------------------------
-
-          $restoreTimestamp =
-            "2026-08-29T08-40-34-825Z"
-
-          Write-Host ""
-          Write-Host "Restoring backup:"
-          Write-Host $restoreTimestamp
-
-          docker start omniroute | Out-Null
-
-          Start-Sleep -Seconds 2
-
-          docker exec `
-            omniroute `
-            sh -lc `
-              "omniroute restore '$restoreTimestamp'"
-
-          $restoreExitCode = $LASTEXITCODE
-
-          if ($restoreExitCode -ne 0) {
+              Write-Host ""
+              Write-Host "Native restore command failed."
 
               Write-Host ""
-              Write-Host "Native timestamp restore failed."
-
-              Write-Host ""
-              Write-Host "Trying restore using full backup filename..."
-
-              docker stop omniroute | Out-Null
-
-              docker start omniroute | Out-Null
-
-              Start-Sleep -Seconds 2
+              Write-Host "Available backup files:"
 
               docker exec `
-                omniroute `
-                sh -lc `
-                  "omniroute restore '$backupName'"
+                  omniroute `
+                  sh -lc `
+                  "find /root/.omniroute -maxdepth 3 -type f \( -name '*.json' -o -name '*.sqlite' -o -name '*.tar.gz' \) -print"
 
-              $restoreExitCode = $LASTEXITCODE
-          }
-
-          if ($restoreExitCode -ne 0) {
-
-              Write-Host ""
-              Write-Host "=================================================="
-              Write-Host "LEGACY RESTORE FAILED"
-              Write-Host "=================================================="
-
-              Write-Host ""
-              Write-Host "Available db_backups files:"
-
-              docker exec `
-                omniroute `
-                sh -lc `
-                  "find /root/.omniroute/db_backups -maxdepth 1 -type f -printf '%f\n'"
-
-              Write-Host ""
-              Write-Host "OmniRoute logs:"
-
-              docker logs omniroute
-
-              throw `
-                "OmniRoute legacy JSON restore failed."
+              throw "Legacy OmniRoute restore failed."
           }
 
           Write-Host ""
           Write-Host "=================================================="
-          Write-Host "LEGACY OMNIROUTE BACKUP RESTORED"
+          Write-Host "LEGACY OMNIROUTE RESTORE COMPLETED"
           Write-Host "=================================================="
 
       # ==============================================================
@@ -1187,9 +848,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "=================================================="
-          Write-Host "RESTARTING OMNIROUTE AFTER RESTORE"
-          Write-Host "=================================================="
+          Write-Host "Restarting OmniRoute after restore..."
 
           docker restart omniroute | Out-Null
 
@@ -1200,14 +859,14 @@ jobs:
               try {
 
                   $response = Invoke-WebRequest `
-                    -Uri "http://localhost:20128" `
-                    -UseBasicParsing `
-                    -TimeoutSec 5 `
-                    -ErrorAction Stop
+                      -Uri "http://localhost:20128" `
+                      -UseBasicParsing `
+                      -TimeoutSec 5 `
+                      -ErrorAction Stop
 
                   if (
-                    $response.StatusCode -ge 200 -and
-                    $response.StatusCode -lt 500
+                      $response.StatusCode -ge 200 -and
+                      $response.StatusCode -lt 500
                   ) {
 
                       $healthy = $true
@@ -1223,66 +882,59 @@ jobs:
           if (-not $healthy) {
 
               docker ps -a `
-                --filter "name=omniroute"
+                  --filter "name=omniroute"
 
               docker logs omniroute
 
-              throw "OmniRoute failed after legacy restore."
+              throw "OmniRoute failed after restore."
           }
 
-          Write-Host ""
-          Write-Host "OmniRoute is healthy after restore." `
-            -ForegroundColor Green
+          Write-Host `
+              "OmniRoute is healthy after restore." `
+              -ForegroundColor Green
 
       # ==============================================================
-      # 8B. Verify Restored Database
+      # 8B. Verify SQLite
       # ==============================================================
 
-      - name: 8B. Verify Restored OmniRoute Database
+      - name: 8B. Verify Restored SQLite Database
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "=================================================="
-          Write-Host "VERIFYING RESTORED DATABASE"
-          Write-Host "=================================================="
-
           $dbFile = Join-Path `
-            "${{ github.workspace }}" `
-            "storage.sqlite"
+              "${{ github.workspace }}" `
+              "storage.sqlite"
 
           if (-not (Test-Path $dbFile)) {
-              throw "storage.sqlite does not exist after restore."
+              throw "storage.sqlite was not found."
           }
 
-          $dbInfo = Get-Item $dbFile
+          $info = Get-Item $dbFile
 
           Write-Host ""
-          Write-Host "SQLite:"
-          Write-Host "Path : $($dbInfo.FullName)"
-          Write-Host "Size : $($dbInfo.Length) bytes"
+          Write-Host "SQLite database:"
+          Write-Host $info.FullName
+          Write-Host "Size: $($info.Length) bytes"
 
           if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
 
-              $integrity = sqlite3 `
-                $dbFile `
-                "PRAGMA integrity_check;"
-
               Write-Host ""
-              Write-Host "Integrity:"
-              Write-Host $integrity
+              Write-Host "SQLite integrity check:"
 
-              if ($integrity -notmatch "ok") {
-                  throw "Restored SQLite database failed integrity check."
+              $result = sqlite3 `
+                  $dbFile `
+                  "PRAGMA integrity_check;"
+
+              Write-Host $result
+
+              if ($result -notmatch "^ok$") {
+                  throw "SQLite integrity check failed."
               }
           }
 
-          Write-Host ""
-          Write-Host "Restore verification completed." `
-            -ForegroundColor Green
-
       # ==============================================================
-      # 9. Keep Alive + Persist SQLite Every 5 Minutes
+      # 9. Keep Alive + SQLite Persistence
       # ==============================================================
 
       - name: 9. Keep-Alive + Periodic SQLite Persistence
@@ -1293,13 +945,14 @@ jobs:
           $ErrorActionPreference = "Continue"
 
           $workspace = "${{ github.workspace }}"
+
           $dbFile = Join-Path `
-            $workspace `
-            "storage.sqlite"
+              $workspace `
+              "storage.sqlite"
 
           $archive = Join-Path `
-            $workspace `
-            "backup/omniroute/omniroute-full-backup.tar.gz"
+              $workspace `
+              "backup/omniroute/omniroute-full-backup.tar.gz"
 
           $interval = [int]$env:SQLITE_SYNC_INTERVAL_MINUTES
           $counter = 0
@@ -1317,27 +970,26 @@ jobs:
           git lfs install
 
           New-Item `
-            -ItemType Directory `
-            -Path (Join-Path $workspace "backup/omniroute") `
-            -Force |
-            Out-Null
+              -ItemType Directory `
+              -Path (Join-Path $workspace "backup/omniroute") `
+              -Force |
+              Out-Null
 
           function Sync-OmniRouteState {
 
               Write-Host ""
               Write-Host "==================================================" `
-                -ForegroundColor Cyan
+                  -ForegroundColor Cyan
 
               Write-Host "PERSISTING OMNIROUTE SQLITE STATE" `
-                -ForegroundColor Cyan
+                  -ForegroundColor Cyan
 
               Write-Host "==================================================" `
-                -ForegroundColor Cyan
+                  -ForegroundColor Cyan
 
               if (-not (Test-Path $dbFile)) {
 
-                  Write-Warning `
-                    "storage.sqlite does not exist."
+                  Write-Warning "storage.sqlite does not exist."
 
                   return
               }
@@ -1349,18 +1001,18 @@ jobs:
               if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
 
                   sqlite3 `
-                    $dbFile `
-                    "PRAGMA wal_checkpoint(TRUNCATE);"
+                      $dbFile `
+                      "PRAGMA wal_checkpoint(TRUNCATE);"
 
                   if ($LASTEXITCODE -ne 0) {
 
                       Write-Warning `
-                        "SQLite WAL checkpoint failed."
+                          "SQLite WAL checkpoint failed."
                   }
               }
 
               # --------------------------------------------------------
-              # Create backup archive
+              # Create compressed backup
               # --------------------------------------------------------
 
               $tarItems = @()
@@ -1384,35 +1036,35 @@ jobs:
               if ($tarItems.Count -gt 0) {
 
                   Remove-Item `
-                    $archive `
-                    -Force `
-                    -ErrorAction SilentlyContinue
+                      $archive `
+                      -Force `
+                      -ErrorAction SilentlyContinue
 
                   tar -czf $archive `
-                    --exclude=logs `
-                    --exclude=call_logs `
-                    --exclude=server `
-                    @tarItems
+                      --exclude=logs `
+                      --exclude=call_logs `
+                      --exclude=server `
+                      @tarItems
 
                   if ($LASTEXITCODE -ne 0) {
 
                       Write-Warning `
-                        "Backup archive creation failed."
+                          "Backup archive creation failed."
                   }
               }
 
               # --------------------------------------------------------
-              # Stage
+              # Stage database state
               # --------------------------------------------------------
 
               git add `
-                .gitattributes `
-                storage.sqlite `
-                storage.sqlite-wal `
-                storage.sqlite-shm `
-                backup/omniroute/omniroute-full-backup.tar.gz `
-                db_backups/ `
-                2>$null
+                  .gitattributes `
+                  storage.sqlite `
+                  storage.sqlite-wal `
+                  storage.sqlite-shm `
+                  backup/omniroute/omniroute-full-backup.tar.gz `
+                  db_backups/ `
+                  2>$null
 
               git diff --cached --quiet
 
@@ -1430,19 +1082,18 @@ jobs:
               # --------------------------------------------------------
 
               git commit `
-                -m "chore: persist OmniRoute SQLite state [skip ci]" `
-                2>$null
+                  -m "chore: persist OmniRoute SQLite state [skip ci]" `
+                  2>$null
 
               if ($LASTEXITCODE -ne 0) {
 
-                  Write-Warning `
-                    "Git commit failed."
+                  Write-Warning "Git commit failed."
 
                   return
               }
 
               # --------------------------------------------------------
-              # Synchronize branch
+              # Synchronize remote branch
               # --------------------------------------------------------
 
               git fetch origin "${{ github.ref_name }}" 2>$null
@@ -1455,8 +1106,8 @@ jobs:
               }
 
               git rebase `
-                "origin/${{ github.ref_name }}" `
-                2>$null
+                  "origin/${{ github.ref_name }}" `
+                  2>$null
 
               if ($LASTEXITCODE -ne 0) {
 
@@ -1472,28 +1123,29 @@ jobs:
               # --------------------------------------------------------
 
               git push `
-                origin `
-                "HEAD:${{ github.ref_name }}" `
-                2>$null
+                  origin `
+                  "HEAD:${{ github.ref_name }}" `
+                  2>$null
 
               if ($LASTEXITCODE -eq 0) {
 
                   Write-Host ""
                   Write-Host `
-                    "SQLite state persisted to GitHub." `
-                    -ForegroundColor Green
+                      "SQLite state persisted to GitHub." `
+                      -ForegroundColor Green
               }
               else {
 
                   Write-Warning `
-                    "GitHub push failed."
+                      "GitHub push failed."
               }
           }
 
           Write-Host ""
           Write-Host "=================================================="
-          Write-Host "355-MINUTE KEEP-ALIVE"
-          Write-Host "SQLite sync interval: $interval minutes"
+          Write-Host "KEEP-ALIVE STARTED"
+          Write-Host "Duration: 355 minutes"
+          Write-Host "SQLite persistence: every $interval minutes"
           Write-Host "=================================================="
 
           for ($minute = 1; $minute -le $totalMinutes; $minute++) {
@@ -1515,37 +1167,39 @@ jobs:
                   Write-Host "[$minute/$totalMinutes min] OmniRoute:"
 
                   docker ps `
-                    --filter "name=omniroute" `
-                    --format "Status: {{.Status}}" `
-                    2>$null
+                      --filter "name=omniroute" `
+                      --format "Status: {{.Status}}" `
+                      2>$null
 
                   Write-Host ""
                   Write-Host "[$minute/$totalMinutes min] Redis:"
 
                   docker ps `
-                    --filter "name=omniroute-redis" `
-                    --format "Status: {{.Status}}" `
-                    2>$null
+                      --filter "name=omniroute-redis" `
+                      --format "Status: {{.Status}}" `
+                      2>$null
 
                   Write-Host ""
                   Write-Host "[$minute/$totalMinutes min] Tailscale:"
 
                   tailscale status `
-                    --peers=false `
-                    2>$null
+                      --peers=false `
+                      2>$null
 
                   Write-Host ""
                   Write-Host "[$minute/$totalMinutes min] RDP:"
 
-                  $rdp = Get-NetTCPConnection `
-                    -LocalPort 3389 `
-                    -State Listen `
-                    -ErrorAction SilentlyContinue
+                  $rdpPort = Get-NetTCPConnection `
+                      -LocalPort 3389 `
+                      -State Listen `
+                      -ErrorAction SilentlyContinue
 
-                  if ($null -ne $rdp) {
+                  if ($null -ne $rdpPort) {
+
                       Write-Host "RDP: LISTENING"
                   }
                   else {
+
                       Write-Warning "RDP: NOT LISTENING"
                   }
               }
@@ -1555,7 +1209,7 @@ jobs:
           Sync-OmniRouteState
 
       # ==============================================================
-      # 10. Final Shutdown + SQLite Checkpoint
+      # 10. Final Shutdown
       # ==============================================================
 
       - name: 10. Final Shutdown + SQLite Checkpoint
@@ -1568,46 +1222,46 @@ jobs:
           Write-Host "FINAL SHUTDOWN"
           Write-Host "=================================================="
 
+          Write-Host "Stopping OmniRoute..."
+
           docker stop omniroute 2>$null
           docker rm omniroute 2>$null
+
+          Write-Host "Stopping Redis..."
 
           docker stop omniroute-redis 2>$null
           docker rm omniroute-redis 2>$null
 
           $dbFile = Join-Path `
-            "${{ github.workspace }}" `
-            "storage.sqlite"
+              "${{ github.workspace }}" `
+              "storage.sqlite"
 
           if (Test-Path $dbFile) {
 
-              Write-Host ""
-              Write-Host "Final SQLite checkpoint..."
-
               if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
 
+                  Write-Host "Running final WAL checkpoint..."
+
                   sqlite3 `
-                    $dbFile `
-                    "PRAGMA wal_checkpoint(TRUNCATE);"
+                      $dbFile `
+                      "PRAGMA wal_checkpoint(TRUNCATE);"
 
                   if ($LASTEXITCODE -eq 0) {
 
                       Write-Host `
-                        "Final WAL checkpoint completed." `
-                        -ForegroundColor Green
+                          "Final WAL checkpoint completed." `
+                          -ForegroundColor Green
                   }
                   else {
 
                       Write-Warning `
-                        "Final WAL checkpoint failed."
+                          "Final WAL checkpoint failed."
                   }
               }
           }
 
       # ==============================================================
       # 11. Final GitHub Persistence
-      #
-      # This is the last attempt after success/failure/cancellation.
-      # The primary protection is still the 5-minute sync above.
       # ==============================================================
 
       - name: 11. Final GitHub SQLite Persistence
@@ -1634,33 +1288,31 @@ jobs:
           git lfs install
 
           New-Item `
-            -ItemType Directory `
-            -Path "backup/omniroute" `
-            -Force |
-            Out-Null
-
-          $dbFile = "storage.sqlite"
+              -ItemType Directory `
+              -Path "backup/omniroute" `
+              -Force |
+              Out-Null
 
           # ------------------------------------------------------------
-          # Final checkpoint
+          # Final SQLite checkpoint
           # ------------------------------------------------------------
 
           if (
-            (Test-Path $dbFile) -and
-            (Get-Command sqlite3 -ErrorAction SilentlyContinue)
+              (Test-Path "storage.sqlite") -and
+              (Get-Command sqlite3 -ErrorAction SilentlyContinue)
           ) {
 
               sqlite3 `
-                $dbFile `
-                "PRAGMA wal_checkpoint(TRUNCATE);"
+                  "storage.sqlite" `
+                  "PRAGMA wal_checkpoint(TRUNCATE);"
           }
 
           # ------------------------------------------------------------
-          # Final archive
+          # Final backup archive
           # ------------------------------------------------------------
 
-          $archive = `
-            "backup/omniroute/omniroute-full-backup.tar.gz"
+          $archive =
+              "backup/omniroute/omniroute-full-backup.tar.gz"
 
           $tarItems = @()
 
@@ -1683,35 +1335,35 @@ jobs:
           if ($tarItems.Count -gt 0) {
 
               Remove-Item `
-                $archive `
-                -Force `
-                -ErrorAction SilentlyContinue
+                  $archive `
+                  -Force `
+                  -ErrorAction SilentlyContinue
 
               tar -czf $archive `
-                --exclude=logs `
-                --exclude=call_logs `
-                --exclude=server `
-                @tarItems
+                  --exclude=logs `
+                  --exclude=call_logs `
+                  --exclude=server `
+                  @tarItems
           }
 
           # ------------------------------------------------------------
-          # Stage everything that represents persistent OmniRoute state
+          # Stage
           # ------------------------------------------------------------
 
           git add `
-            .gitattributes `
-            storage.sqlite `
-            storage.sqlite-wal `
-            storage.sqlite-shm `
-            backup/omniroute/omniroute-full-backup.tar.gz `
-            db_backups/ `
-            2>$null
+              .gitattributes `
+              storage.sqlite `
+              storage.sqlite-wal `
+              storage.sqlite-shm `
+              backup/omniroute/omniroute-full-backup.tar.gz `
+              db_backups/ `
+              2>$null
 
           git diff --cached --quiet
 
           if ($LASTEXITCODE -eq 0) {
 
-              Write-Host "No final SQLite changes detected."
+              Write-Host "No final database changes."
 
               exit 0
           }
@@ -1721,39 +1373,36 @@ jobs:
           # ------------------------------------------------------------
 
           git commit `
-            -m "chore: final OmniRoute DB state backup [skip ci]" `
-            2>$null
+              -m "chore: final OmniRoute DB state backup [skip ci]" `
+              2>$null
 
           if ($LASTEXITCODE -ne 0) {
 
-              Write-Warning `
-                "Final Git commit failed."
+              Write-Warning "Final Git commit failed."
 
               exit 0
           }
 
           # ------------------------------------------------------------
-          # Fetch + rebase
+          # Fetch and rebase
           # ------------------------------------------------------------
 
           git fetch origin "${{ github.ref_name }}" 2>$null
 
           if ($LASTEXITCODE -ne 0) {
 
-              Write-Warning `
-                "Final git fetch failed."
+              Write-Warning "Final git fetch failed."
 
               exit 0
           }
 
           git rebase `
-            "origin/${{ github.ref_name }}" `
-            2>$null
+              "origin/${{ github.ref_name }}" `
+              2>$null
 
           if ($LASTEXITCODE -ne 0) {
 
-              Write-Warning `
-                "Final git rebase failed."
+              Write-Warning "Final git rebase failed."
 
               git rebase --abort 2>$null
 
@@ -1765,21 +1414,21 @@ jobs:
           # ------------------------------------------------------------
 
           git push `
-            origin `
-            "HEAD:${{ github.ref_name }}" `
-            2>$null
+              origin `
+              "HEAD:${{ github.ref_name }}" `
+              2>$null
 
           if ($LASTEXITCODE -eq 0) {
 
               Write-Host ""
               Write-Host `
-                "FINAL SQLITE STATE PUSHED SUCCESSFULLY." `
-                -ForegroundColor Green
+                  "FINAL SQLITE STATE PUSHED SUCCESSFULLY." `
+                  -ForegroundColor Green
           }
           else {
 
               Write-Warning `
-                "Final GitHub push failed."
+                  "Final GitHub push failed."
           }
 
       # ==============================================================
@@ -1804,56 +1453,43 @@ jobs:
           Write-Host ""
           Write-Host "Docker:"
           docker ps -a `
-            --filter "name=omniroute"
+              --filter "name=omniroute"
 
           docker ps -a `
-            --filter "name=omniroute-redis"
+              --filter "name=omniroute-redis"
 
           Write-Host ""
           Write-Host "Tailscale:"
           tailscale status --peers=false 2>$null
 
           Write-Host ""
-          Write-Host "SSH:"
+          Write-Host "RDP service:"
+
           Get-Service `
-            -Name sshd `
-            -ErrorAction SilentlyContinue |
-            Select-Object Name, Status, StartType |
-            Format-Table
+              -Name TermService `
+              -ErrorAction SilentlyContinue |
+              Select-Object Name, Status, StartType |
+              Format-Table
 
           Write-Host ""
-          Write-Host "RDP:"
-          Get-Service `
-            -Name TermService `
-            -ErrorAction SilentlyContinue |
-            Select-Object Name, Status, StartType |
-            Format-Table
+          Write-Host "RDP TCP 3389:"
 
-          Write-Host ""
-          Write-Host "RDP Port:"
           Get-NetTCPConnection `
-            -LocalPort 3389 `
-            -State Listen `
-            -ErrorAction SilentlyContinue |
-            Select-Object LocalAddress, LocalPort, State |
-            Format-Table
+              -LocalPort 3389 `
+              -State Listen `
+              -ErrorAction SilentlyContinue |
+              Select-Object LocalAddress, LocalPort, State |
+              Format-Table
 
           Write-Host ""
           Write-Host "SQLite:"
-          Get-ChildItem `
-            -Path "${{ github.workspace }}" `
-            -Filter "storage.sqlite*" `
-            -ErrorAction SilentlyContinue |
-            Select-Object Name, Length, LastWriteTime |
-            Format-Table
 
-          Write-Host ""
-          Write-Host "Legacy JSON:"
-          Get-Item `
-            "${{ github.workspace }}\db_backups\omniroute-legacy-backup-2026-08-29T08-40-34-825Z.json" `
-            -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length, LastWriteTime |
-            Format-List
+          Get-ChildItem `
+              -Path "${{ github.workspace }}" `
+              -Filter "storage.sqlite*" `
+              -ErrorAction SilentlyContinue |
+              Select-Object Name, Length, LastWriteTime |
+              Format-Table
 
           Write-Host ""
           Write-Host "=================================================="
