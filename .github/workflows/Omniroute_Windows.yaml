@@ -471,7 +471,8 @@ jobs:
 
           if ($dockerText -match 'OSType:\s*windows') {
 
-            throw @"Docker is running in Windows-container mode.
+            throw @"
+            Docker is running in Windows-container mode.
             This workflow requires Linux containers because:
             - redis:7-alpine is a Linux image
             - OmniRoute uses the Linux image:
@@ -480,13 +481,16 @@ jobs:
             A GitHub-hosted windows-2022 runner cannot be converted here
             into a Docker Desktop Linux-container host reliably.
             Use a Linux runner for OmniRoute, or use a persistent/self-hosted
-            Windows machine with a Linux container runtime."@
+            Windows machine with a Linux container runtime.
+            "@
           }
 
           if ($dockerText -notmatch 'OSType:\s*linux') {
 
-            throw @"Docker container type could not be verified as Linux.
-            Docker info output:$dockerText"@
+            throw @"
+            Docker container type could not be verified as Linux.
+            Docker info output:$dockerText
+            "@
           }
 
           Write-Host ""
@@ -1075,10 +1079,12 @@ jobs:
 
             if ($statusCode -eq 401) {
 
-              throw @"OmniRoute returned HTTP 401 for:
+              throw @"
+              OmniRoute returned HTTP 401 for:
               POST /api/settings/import-json
               The installed OmniRoute instance requires authentication
-              for this endpoint."@
+              for this endpoint.
+              "@
             }
 
             throw `
