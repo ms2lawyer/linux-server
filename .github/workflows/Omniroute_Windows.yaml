@@ -714,7 +714,18 @@ jobs:
             -ForegroundColor Green
 
       # ==============================================================
-      # 9. Start OmniRoute natively with npm
+      # 9. Start OmniRoute
+      #
+      # Native Windows installation.
+      # No Docker.
+      #
+      # IMPORTANT:
+      # - Use "omniroute serve" explicitly.
+      # - Do not use HOSTNAME.
+      # - Use OMNIROUTE_SERVER_HOST.
+      # - Keep DATA_DIR inside the GitHub repository workspace.
+      # - Require API keys because the server is reachable over
+      #   Tailscale.
       # ==============================================================
 
       - name: 9. Start OmniRoute
@@ -727,70 +738,175 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $workspace = "${{ github.workspace }}"
-          $logFile = Join-Path $env:RUNNER_TEMP "omniroute.log"
-          $errorLogFile = Join-Path $env:RUNNER_TEMP "omniroute-error.log"
+
+          $logFile = Join-Path `
+            $env:RUNNER_TEMP `
+            "omniroute.log"
+
+          $errorLogFile = Join-Path `
+            $env:RUNNER_TEMP `
+            "omniroute-error.log"
 
           Write-Host "=================================================="
-          Write-Host "STARTING OMNIROUTE VIA NPM"
+          Write-Host "STARTING OMNIROUTE"
           Write-Host "=================================================="
+
+          # ----------------------------------------------------------
+          # Validate secrets
+          # ----------------------------------------------------------
 
           if ([string]::IsNullOrWhiteSpace($env:JWT_SECRET)) {
+
             throw "JWT_SECRET secret is missing."
           }
 
           if ([string]::IsNullOrWhiteSpace($env:API_KEY_SECRET)) {
+
             throw "API_KEY_SECRET secret is missing."
           }
 
           if ([string]::IsNullOrWhiteSpace($env:STORAGE_ENCRYPTION_KEY)) {
+
             throw "STORAGE_ENCRYPTION_KEY secret is missing."
           }
 
-          $env:DATA_DIR = $workspace
-          $env:PORT = "$env:OMNIROUTE_PORT"
-          $env:HOSTNAME = "0.0.0.0"
+          # ----------------------------------------------------------
+          # OmniRoute environment
+          # ----------------------------------------------------------
+
           $env:NODE_ENV = "production"
+
+          $env:PORT = "$env:OMNIROUTE_PORT"
+
+          $env:OMNIROUTE_SERVER_HOST = "0.0.0.0"
+
+          $env:DATA_DIR = $workspace
+
+          $env:JWT_SECRET = $env:JWT_SECRET
+
+          $env:API_KEY_SECRET = $env:API_KEY_SECRET
+
+          $env:STORAGE_ENCRYPTION_KEY = $env:STORAGE_ENCRYPTION_KEY
+
+          $env:REQUIRE_API_KEY = "true"
+
+          $env:AUTH_COOKIE_SECURE = "false"
+
+          # Disable unnecessary CI-only health checking.
+          $env:OMNIROUTE_SKIP_DB_HEALTHCHECK = "1"
+
+          # Make sure npm package does not attempt any browser opening.
+          $env:BROWSER = "none"
+
+          # ----------------------------------------------------------
+          # Persist non-secret environment configuration for following
+          # GitHub Actions steps.
+          # ----------------------------------------------------------
+
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "DATA_DIR=$workspace"
+
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "OMNIROUTE_SERVER_HOST=0.0.0.0"
+
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "REQUIRE_API_KEY=true"
+
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "OMNIROUTE_SKIP_DB_HEALTHCHECK=1"
+
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "OMNIROUTE_LOG_FILE=$logFile"
+
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "OMNIROUTE_ERROR_LOG_FILE=$errorLogFile"
+
+          # ----------------------------------------------------------
+          # Locate executable
+          # ----------------------------------------------------------
 
           $omnirouteCommand = Get-Command `
             omniroute.cmd `
             -ErrorAction SilentlyContinue
 
           if ($null -eq $omnirouteCommand) {
+
             $omnirouteCommand = Get-Command `
               omniroute `
               -ErrorAction SilentlyContinue
           }
 
           if ($null -eq $omnirouteCommand) {
-            throw "OmniRoute executable was not found."
+
+            throw "OmniRoute executable was not found in PATH."
           }
 
           Write-Host ""
-          Write-Host "Executable:"
+          Write-Host "OmniRoute executable:"
           Write-Host $omnirouteCommand.Source
 
+          # ----------------------------------------------------------
+          # Clean old logs
+          # ----------------------------------------------------------
+
+          Remove-Item `
+            $logFile `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Remove-Item `
+            $errorLogFile `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          # ----------------------------------------------------------
+          # Print effective non-secret configuration
+          # ----------------------------------------------------------
+
           Write-Host ""
-          Write-Host "DATA_DIR:"
-          Write-Host $env:DATA_DIR
+          Write-Host "Configuration:"
+          Write-Host "NODE_ENV                 : $env:NODE_ENV"
+          Write-Host "PORT                     : $env:PORT"
+          Write-Host "OMNIROUTE_SERVER_HOST    : $env:OMNIROUTE_SERVER_HOST"
+          Write-Host "DATA_DIR                 : $env:DATA_DIR"
+          Write-Host "REQUIRE_API_KEY          : $env:REQUIRE_API_KEY"
+          Write-Host "OMNIROUTE_SKIP_DB_HEALTHCHECK : $env:OMNIROUTE_SKIP_DB_HEALTHCHECK"
 
-          if (Test-Path $logFile) {
-            Remove-Item $logFile -Force -ErrorAction SilentlyContinue
-          }
+          Write-Host ""
+          Write-Host "Repository:"
+          Write-Host $workspace
 
-          if (Test-Path $errorLogFile) {
-            Remove-Item $errorLogFile -Force -ErrorAction SilentlyContinue
-          }
+          # ----------------------------------------------------------
+          # Start explicit server command
+          # ----------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Starting:"
+          Write-Host "omniroute serve --port $env:OMNIROUTE_PORT --no-open --log"
 
           $process = Start-Process `
             -FilePath $omnirouteCommand.Source `
-            -ArgumentList @("--port", "$env:OMNIROUTE_PORT") `
+            -ArgumentList @(
+              "serve",
+              "--port",
+              "$env:OMNIROUTE_PORT",
+              "--no-open",
+              "--log"
+            ) `
             -WorkingDirectory $workspace `
             -RedirectStandardOutput $logFile `
             -RedirectStandardError $errorLogFile `
             -PassThru
 
           if ($null -eq $process) {
-            throw "Failed to start OmniRoute process."
+
+            throw "Failed to create the OmniRoute process."
           }
 
           Write-Host ""
@@ -801,19 +917,11 @@ jobs:
             -Path $env:GITHUB_ENV `
             -Value "OMNIROUTE_PID=$($process.Id)"
 
-          Add-Content `
-            -Path $env:GITHUB_ENV `
-            -Value "OMNIROUTE_LOG_FILE=$logFile"
-
-          Add-Content `
-            -Path $env:GITHUB_ENV `
-            -Value "OMNIROUTE_ERROR_LOG_FILE=$errorLogFile"
-
           Write-Host ""
           Write-Host "OmniRoute process started."
 
       # ==============================================================
-      # 9A. Wait for OmniRoute
+      # 9A. Wait For OmniRoute
       # ==============================================================
 
       - name: 9A. Wait For OmniRoute
@@ -821,67 +929,249 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          $workspace = "${{ github.workspace }}"
+          $baseUrl = "http://127.0.0.1:$env:OMNIROUTE_PORT"
+
           Write-Host "=================================================="
           Write-Host "WAITING FOR OMNIROUTE"
           Write-Host "=================================================="
 
+          Write-Host ""
+          Write-Host "URL      : $baseUrl"
+          Write-Host "PID      : $env:OMNIROUTE_PID"
+          Write-Host "DATA_DIR : $env:DATA_DIR"
+
           $healthy = $false
 
-          for ($i = 1; $i -le 60; $i++) {
+          for ($i = 1; $i -le 90; $i++) {
 
-            $response = $null
+            # --------------------------------------------------------
+            # Process check
+            # --------------------------------------------------------
 
-            try {
+            $process = Get-Process `
+              -Id $env:OMNIROUTE_PID `
+              -ErrorAction SilentlyContinue
 
-              $response = Invoke-WebRequest `
-                -Uri "http://127.0.0.1:$env:OMNIROUTE_PORT" `
-                -UseBasicParsing `
-                -TimeoutSec 5 `
-                -ErrorAction Stop
+            if ($null -eq $process) {
 
-              if (
-                $response.StatusCode -ge 200 -and
-                $response.StatusCode -lt 500
-              ) {
+              Write-Host ""
+              Write-Host "=================================================="
+              Write-Host "OMNIROUTE PROCESS TERMINATED"
+              Write-Host "=================================================="
 
-                $healthy = $true
-                break
+              Write-Host ""
+              Write-Host "Standard output:"
+
+              if (Test-Path $env:OMNIROUTE_LOG_FILE) {
+
+                Get-Content `
+                  $env:OMNIROUTE_LOG_FILE `
+                  -Tail 200 `
+                  -ErrorAction SilentlyContinue
+              }
+
+              Write-Host ""
+              Write-Host "Error output:"
+
+              if (Test-Path $env:OMNIROUTE_ERROR_LOG_FILE) {
+
+                Get-Content `
+                  $env:OMNIROUTE_ERROR_LOG_FILE `
+                  -Tail 200 `
+                  -ErrorAction SilentlyContinue
+              }
+
+              throw (
+                "OmniRoute process terminated before the HTTP server " +
+                "became available. PID: $env:OMNIROUTE_PID"
+              )
+            }
+
+            # --------------------------------------------------------
+            # TCP listener check
+            # --------------------------------------------------------
+
+            $listener = Get-NetTCPConnection `
+              -LocalAddress "0.0.0.0" `
+              -LocalPort $env:OMNIROUTE_PORT `
+              -State Listen `
+              -ErrorAction SilentlyContinue
+
+            if ($null -eq $listener) {
+
+              $listener = Get-NetTCPConnection `
+                -LocalAddress "127.0.0.1" `
+                -LocalPort $env:OMNIROUTE_PORT `
+                -State Listen `
+                -ErrorAction SilentlyContinue
+            }
+
+            if ($null -ne $listener) {
+
+              Write-Host ""
+              Write-Host "TCP listener detected."
+
+              Write-Host "LocalAddress : $($listener.LocalAddress)"
+              Write-Host "LocalPort    : $($listener.LocalPort)"
+              Write-Host "State        : $($listener.State)"
+
+              # ------------------------------------------------------
+              # HTTP check
+              # ------------------------------------------------------
+
+              try {
+
+                $response = Invoke-WebRequest `
+                  -Uri $baseUrl `
+                  -UseBasicParsing `
+                  -TimeoutSec 10 `
+                  -ErrorAction Stop
+
+                if (
+                  $response.StatusCode -ge 200 -and
+                  $response.StatusCode -lt 500
+                ) {
+
+                  $healthy = $true
+
+                  Write-Host ""
+                  Write-Host "HTTP endpoint is responding."
+
+                  Write-Host "HTTP status : $($response.StatusCode)"
+                  Write-Host "PID         : $($process.Id)"
+
+                  break
+                }
+              }
+              catch {
+
+                Write-Host `
+                  "TCP is listening but HTTP is not ready yet..."
               }
             }
-            catch {
+            else {
+
+              Write-Host `
+                "OmniRoute is still starting... ($i/90)"
             }
 
-            Write-Host "Waiting... ($i/60)"
+            # --------------------------------------------------------
+            # Diagnostics every 10 seconds
+            # --------------------------------------------------------
 
-            if (
-              ($i -ge 5) -and
-              (Test-Path $env:OMNIROUTE_ERROR_LOG_FILE)
-            ) {
+            if (($i % 10) -eq 0) {
 
-              $errorContent = Get-Content `
-                $env:OMNIROUTE_ERROR_LOG_FILE `
-                -Tail 10 `
-                -ErrorAction SilentlyContinue
+              Write-Host ""
+              Write-Host "--------------------------------------------------"
+              Write-Host "Startup diagnostics ($i/90)"
+              Write-Host "--------------------------------------------------"
 
-              if ($errorContent) {
-                Write-Host ""
-                Write-Host "Recent OmniRoute errors:"
-                $errorContent
+              Write-Host ""
+              Write-Host "Process:"
+              Write-Host "PID    : $($process.Id)"
+              Write-Host "Status : $($process.Responding)"
+
+              Write-Host ""
+              Write-Host "TCP $env:OMNIROUTE_PORT:"
+
+              Get-NetTCPConnection `
+                -LocalPort $env:OMNIROUTE_PORT `
+                -ErrorAction SilentlyContinue |
+                Select-Object LocalAddress, LocalPort, State, OwningProcess |
+                Format-Table
+
+              Write-Host ""
+              Write-Host "Repository database:"
+
+              Get-ChildItem `
+                -Path $workspace `
+                -Filter "storage.sqlite*" `
+                -ErrorAction SilentlyContinue |
+                Select-Object Name, Length, LastWriteTime |
+                Format-Table
+
+              Write-Host ""
+              Write-Host "Recent OmniRoute output:"
+
+              if (Test-Path $env:OMNIROUTE_LOG_FILE) {
+
+                Get-Content `
+                  $env:OMNIROUTE_LOG_FILE `
+                  -Tail 20 `
+                  -ErrorAction SilentlyContinue
+              }
+
+              Write-Host ""
+              Write-Host "Recent OmniRoute errors:"
+
+              if (Test-Path $env:OMNIROUTE_ERROR_LOG_FILE) {
+
+                Get-Content `
+                  $env:OMNIROUTE_ERROR_LOG_FILE `
+                  -Tail 20 `
+                  -ErrorAction SilentlyContinue
               }
             }
 
             Start-Sleep -Seconds 2
           }
 
+          # ----------------------------------------------------------
+          # Final failure
+          # ----------------------------------------------------------
+
           if (-not $healthy) {
+
+            Write-Host ""
+            Write-Host "=================================================="
+            Write-Host "OMNIROUTE STARTUP FAILED"
+            Write-Host "=================================================="
+
+            $process = Get-Process `
+              -Id $env:OMNIROUTE_PID `
+              -ErrorAction SilentlyContinue
+
+            Write-Host ""
+            Write-Host "Process:"
+
+            if ($null -ne $process) {
+
+              Write-Host "PID    : $($process.Id)"
+              Write-Host "Status : RUNNING"
+            }
+            else {
+
+              Write-Host "Status : STOPPED"
+            }
+
+            Write-Host ""
+            Write-Host "TCP listener:"
+
+            Get-NetTCPConnection `
+              -LocalPort $env:OMNIROUTE_PORT `
+              -ErrorAction SilentlyContinue |
+              Select-Object LocalAddress, LocalPort, State, OwningProcess |
+              Format-Table
+
+            Write-Host ""
+            Write-Host "Repository database:"
+
+            Get-ChildItem `
+              -Path $workspace `
+              -Filter "storage.sqlite*" `
+              -ErrorAction SilentlyContinue |
+              Select-Object FullName, Length, LastWriteTime |
+              Format-Table
 
             Write-Host ""
             Write-Host "OmniRoute output:"
 
             if (Test-Path $env:OMNIROUTE_LOG_FILE) {
+
               Get-Content `
                 $env:OMNIROUTE_LOG_FILE `
-                -Tail 100 `
+                -Tail 200 `
                 -ErrorAction SilentlyContinue
             }
 
@@ -889,18 +1179,45 @@ jobs:
             Write-Host "OmniRoute errors:"
 
             if (Test-Path $env:OMNIROUTE_ERROR_LOG_FILE) {
+
               Get-Content `
                 $env:OMNIROUTE_ERROR_LOG_FILE `
-                -Tail 100 `
+                -Tail 200 `
                 -ErrorAction SilentlyContinue
             }
 
-            throw "OmniRoute did not become healthy."
+            throw (
+              "OmniRoute did not become healthy within 180 seconds. " +
+              "Expected endpoint: $baseUrl"
+            )
           }
 
           Write-Host ""
-          Write-Host "OmniRoute is healthy." `
-            -ForegroundColor Green
+          Write-Host "=================================================="
+          Write-Host "OMNIROUTE IS HEALTHY"
+          Write-Host "=================================================="
+
+          Write-Host ""
+          Write-Host "Endpoint:"
+          Write-Host $baseUrl
+
+          Write-Host ""
+          Write-Host "PID:"
+          Write-Host $env:OMNIROUTE_PID
+
+          Write-Host ""
+          Write-Host "DATA_DIR:"
+          Write-Host $env:DATA_DIR
+
+          Write-Host ""
+          Write-Host "Repository database:"
+
+          Get-ChildItem `
+            -Path $workspace `
+            -Filter "storage.sqlite*" `
+            -ErrorAction SilentlyContinue |
+            Select-Object Name, Length, LastWriteTime |
+            Format-Table
 
       # ==============================================================
       # 10. Determine whether JSON import is required
