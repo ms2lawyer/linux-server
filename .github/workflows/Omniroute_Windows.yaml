@@ -390,13 +390,14 @@ jobs:
           Write-Host "RDP exists only while this job is running."
 
       # ==============================================================
-      # 5. Install Node.js LTS + Latest npm + OmniRoute
+      # 5. Install Node.js LTS
       #
-      # IMPORTANT:
-      # - Docker is intentionally not used.
-      # - Node 24.x is the recommended OmniRoute runtime.
-      # - npm is upgraded to the latest available release.
-      # - OmniRoute postinstall warm-up is disabled for CI.
+      # Node 24.x is used because Node 20 is deprecated on
+      # GitHub Actions runners.
+      #
+      # npm cache is intentionally disabled because this repository
+      # does not contain a package-lock.json / npm-shrinkwrap.json /
+      # yarn.lock file.
       # ==============================================================
 
       - name: 5. Install Node.js LTS
@@ -404,7 +405,10 @@ jobs:
         with:
           node-version: "24.x"
           check-latest: true
-          cache: "npm"
+
+      # ==============================================================
+      # 5A. Update npm + Install OmniRoute
+      # ==============================================================
 
       - name: 5A. Update npm and Install OmniRoute
         shell: powershell
@@ -426,7 +430,9 @@ jobs:
           Write-Host ""
           Write-Host "Updating npm to latest..."
 
-          npm install --global npm@latest `
+          npm install `
+            --global `
+            npm@latest `
             --no-audit `
             --no-fund
 
@@ -435,7 +441,7 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "Node.js after npm update:"
+          Write-Host "Node.js:"
           node --version
 
           Write-Host ""
@@ -443,12 +449,14 @@ jobs:
           npm --version
 
           Write-Host ""
-          Write-Host "Configuring OmniRoute for CI installation..."
-
-          $env:OMNIROUTE_SKIP_POSTINSTALL = "1"
+          Write-Host "Configuring npm for CI..."
 
           npm config set audit false
           npm config set fund false
+
+          # OmniRoute documents this flag for CI/headless installation
+          # to avoid post-install warm-up work.
+          $env:OMNIROUTE_SKIP_POSTINSTALL = "1"
 
           Write-Host ""
           Write-Host "Installing latest OmniRoute..."
@@ -498,6 +506,7 @@ jobs:
           Write-Host "=================================================="
           Write-Host "NODE + NPM + OMNIROUTE READY"
           Write-Host "=================================================="
+
 
       # ==============================================================
       # 6. Configure OmniRoute repository-backed storage
