@@ -1,3 +1,4 @@
+
 name: OmniRoute CI Gateway (Windows 10 Restored State)
 
 on:
@@ -5,28 +6,18 @@ on:
     - cron: '0 */6 * * *'
   workflow_dispatch:
   push:
-    branches: ["Omniroute_Windows"]
-
-permissions:
-  contents: write
+    branches: ["main", "master"]
 
 concurrency:
   group: omniroute-ci-gateway-windows
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   run-omniroute:
-    # IMPORTANT:
-    # This must be a Windows 10 self-hosted GitHub Actions runner.
-    #
-    # Default GitHub labels:
-    #   self-hosted, windows, x64
-    #
-    # For strict Windows 10 targeting, you can additionally create
-    # a custom runner label "windows-10" and uncomment it below.
     runs-on: [self-hosted, windows, x64]
-    # runs-on: [self-hosted, windows, x64, windows-10]
-
     timeout-minutes: 360
 
     steps:
@@ -50,7 +41,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           Write-Host "=================================================="
-          Write-Host "VERIFYING WINDOWS 10 HOST"
+          Write-Host "VERIFYING WINDOWS HOST"
           Write-Host "=================================================="
 
           Write-Host ""
@@ -94,7 +85,7 @@ jobs:
           Write-Host "=================================================="
 
       # ==============================================================
-      # 3. Connect Tailscale VPN
+      # 3. Connect Tailscale VPN (OAuth)
       # ==============================================================
       - name: 3. Connect Tailscale VPN (OAuth)
         uses: tailscale/github-action@v3
@@ -105,7 +96,7 @@ jobs:
           hostname: omniroute-ci-gateway
 
       # ==============================================================
-      # 4. Enable Windows OpenSSH Server
+      # 4. Enable SSH Access (hardened)
       # ==============================================================
       - name: 4. Enable SSH Access (hardened)
         shell: powershell
@@ -127,20 +118,13 @@ jobs:
               throw "SSH_PASSWORD secret is missing."
           }
 
-          # ------------------------------------------------------------
-          # Install OpenSSH Server if necessary
-          # ------------------------------------------------------------
           $sshCapability = Get-WindowsCapability -Online |
               Where-Object Name -like "OpenSSH.Server*"
 
           if ($sshCapability.State -ne "Installed") {
-              Write-Host "Installing OpenSSH Server..."
               Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
           }
 
-          # ------------------------------------------------------------
-          # Create/update dedicated SSH user
-          # ------------------------------------------------------------
           $securePassword = ConvertTo-SecureString `
               $env:SSH_PASSWORD `
               -AsPlainText `
@@ -151,8 +135,6 @@ jobs:
               -ErrorAction SilentlyContinue
 
           if ($null -eq $existingUser) {
-              Write-Host "Creating SSH user: $env:SSH_USERNAME"
-
               New-LocalUser `
                   -Name $env:SSH_USERNAME `
                   -Password $securePassword `
@@ -162,18 +144,11 @@ jobs:
                   -UserMayNotChangePassword:$false | Out-Null
           }
           else {
-              Write-Host "Updating password for existing SSH user."
-
               Set-LocalUser `
                   -Name $env:SSH_USERNAME `
                   -Password $securePassword
           }
 
-          # ------------------------------------------------------------
-          # Grant local Administrators membership
-          # ------------------------------------------------------------
-          # Resolve built-in Administrators group by SID so this also
-          # works on localized Windows installations.
           $adminGroup = Get-LocalGroup -SID "S-1-5-32-544"
 
           $isAdmin = Get-LocalGroupMember `
@@ -189,9 +164,6 @@ jobs:
                   -Member $env:SSH_USERNAME
           }
 
-          # ------------------------------------------------------------
-          # Prepare sshd configuration
-          # ------------------------------------------------------------
           $sshRoot = "$env:ProgramData\ssh"
           $configFile = "$sshRoot\sshd_config"
           $dropInDir = "$sshRoot\sshd_config.d"
@@ -218,9 +190,6 @@ jobs:
               -Value $configContent `
               -Encoding ascii
 
-          # ------------------------------------------------------------
-          # Ensure the drop-in directory is included.
-          # ------------------------------------------------------------
           $existingConfig = Get-Content `
               -Path $configFile `
               -Raw `
@@ -242,23 +211,14 @@ jobs:
                   -Encoding ascii
           }
 
-          # ------------------------------------------------------------
-          # Validate sshd configuration
-          # ------------------------------------------------------------
           & "$env:WINDIR\System32\OpenSSH\sshd.exe" -t
 
-          # ------------------------------------------------------------
-          # Enable and start SSH service
-          # ------------------------------------------------------------
           Set-Service `
               -Name sshd `
               -StartupType Automatic
 
           Start-Service sshd
 
-          # ------------------------------------------------------------
-          # Windows Firewall
-          # ------------------------------------------------------------
           $firewallRule = Get-NetFirewallRule `
               -Name "OpenSSH-Server-In-TCP" `
               -ErrorAction SilentlyContinue
@@ -279,18 +239,222 @@ jobs:
                   -Name "OpenSSH-Server-In-TCP"
           }
 
-          Write-Host ""
-          Write-Host "SSH Service:"
-          Get-Service sshd | Format-Table -AutoSize
-
-          Write-Host ""
-          Write-Host "SSH Endpoint:"
-          Write-Host "$env:SSH_USERNAME@omniroute-ci-gateway"
-
+          Write-Host "SSH Endpoint: $env:SSH_USERNAME@omniroute-ci-gateway"
           Write-Host "=================================================="
 
       # ==============================================================
-      # 5. Start Redis
+      # 4A. Enable Remote Desktop
+      # ONLY ADDED STEP
+      # ==============================================================
+      - name: 4A. Enable Remote Desktop
+        shell: powershell
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "CONFIGURING WINDOWS REMOTE DESKTOP" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Cyan
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_USERNAME)) {
+              throw "RDP_USERNAME secret is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "RDP_PASSWORD secret is missing."
+          }
+
+          # ------------------------------------------------------------
+          # Enable Remote Desktop
+          # ------------------------------------------------------------
+          Set-ItemProperty `
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name 'fDenyTSConnections' `
+              -Value 0
+
+          Set-ItemProperty `
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name 'UserAuthentication' `
+              -Value 1
+
+          # ------------------------------------------------------------
+          # Enable Windows Firewall rules
+          # ------------------------------------------------------------
+          Enable-NetFirewallRule `
+              -DisplayGroup 'Remote Desktop'
+
+          # ------------------------------------------------------------
+          # Configure Remote Desktop service
+          # ------------------------------------------------------------
+          Set-Service `
+              -Name 'TermService' `
+              -StartupType Automatic
+
+          Start-Service `
+              -Name 'TermService' `
+              -ErrorAction SilentlyContinue
+
+          $service = Get-Service `
+              -Name 'TermService'
+
+          if ($service.Status -ne 'Running') {
+              throw 'TermService is not running.'
+          }
+
+          # ------------------------------------------------------------
+          # Create / update RDP user
+          # ------------------------------------------------------------
+          $securePassword = ConvertTo-SecureString `
+              $env:RDP_PASSWORD `
+              -AsPlainText `
+              -Force
+
+          $existing = Get-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -ErrorAction SilentlyContinue
+
+          if ($null -eq $existing) {
+
+              New-LocalUser `
+                  -Name $env:RDP_USERNAME `
+                  -Password $securePassword `
+                  -PasswordNeverExpires `
+                  -AccountNeverExpires `
+                  -Description 'GitHub Actions RDP Administrator' |
+                  Out-Null
+          }
+          else {
+
+              Set-LocalUser `
+                  -Name $env:RDP_USERNAME `
+                  -Password $securePassword
+
+              Enable-LocalUser `
+                  -Name $env:RDP_USERNAME
+          }
+
+          # Administrators
+          Add-LocalGroupMember `
+              -Group 'Administrators' `
+              -Member $env:RDP_USERNAME `
+              -ErrorAction SilentlyContinue
+
+          # Remote Desktop Users
+          Add-LocalGroupMember `
+              -Group 'Remote Desktop Users' `
+              -Member $env:RDP_USERNAME `
+              -ErrorAction SilentlyContinue
+
+          Write-Host ""
+          Write-Host "Remote Desktop enabled." -ForegroundColor Green
+          Write-Host "RDP User: $env:RDP_USERNAME"
+
+      # ==============================================================
+      # 4B. Verify Remote Desktop
+      # ONLY ADDED STEP
+      # ==============================================================
+      - name: 4B. Verify Remote Desktop
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "VERIFYING REMOTE DESKTOP" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Cyan
+
+          $rdpDenied = Get-ItemPropertyValue `
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name 'fDenyTSConnections'
+
+          if ($rdpDenied -ne 0) {
+              throw "RDP is disabled."
+          }
+
+          $service = Get-Service `
+              -Name 'TermService'
+
+          if ($service.Status -ne 'Running') {
+              throw "TermService is not running."
+          }
+
+          $firewallRules = Get-NetFirewallRule `
+              -DisplayGroup 'Remote Desktop' `
+              -ErrorAction SilentlyContinue |
+              Where-Object Enabled -eq 'True'
+
+          if ($null -eq $firewallRules) {
+              throw "Remote Desktop firewall rules are not enabled."
+          }
+
+          Write-Host "RDP service : Running" -ForegroundColor Green
+          Write-Host "RDP registry: Enabled" -ForegroundColor Green
+          Write-Host "RDP firewall: Enabled" -ForegroundColor Green
+
+      # ==============================================================
+      # 4C. Display RDP Connection Information
+      # ONLY ADDED STEP
+      # ==============================================================
+      - name: 4C. Display Remote Desktop Connection Information
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "REMOTE DESKTOP IS READY" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+
+          $tailscale = Get-Command `
+              tailscale.exe `
+              -ErrorAction SilentlyContinue
+
+          $tailscaleIp = ""
+
+          if ($null -ne $tailscale) {
+
+              $tailscaleIp = (
+                  & $tailscale.Source ip -4 2>$null
+              ).Trim()
+          }
+
+          if ([string]::IsNullOrWhiteSpace($tailscaleIp)) {
+
+              Write-Host `
+                  "Tailscale IP could not be detected." `
+                  -ForegroundColor Yellow
+
+              Write-Host `
+                  "Hostname : omniroute-ci-gateway" `
+                  -ForegroundColor Yellow
+
+              Write-Host `
+                  "RDP port : 3389" `
+                  -ForegroundColor Yellow
+          }
+          else {
+
+              Write-Host `
+                  "Tailscale IP : $tailscaleIp" `
+                  -ForegroundColor Yellow
+
+              Write-Host `
+                  "RDP endpoint : ${tailscaleIp}:3389" `
+                  -ForegroundColor Yellow
+
+              Write-Host `
+                  "RDP command  : mstsc /v:${tailscaleIp}" `
+                  -ForegroundColor Magenta
+          }
+
+          Write-Host ""
+          Write-Host "RDP Username : $env:RDP_USERNAME"
+
+      # ==============================================================
+      # 5. Start Redis Container
       # ==============================================================
       - name: 5. Start Redis Container
         shell: powershell
@@ -301,7 +465,6 @@ jobs:
           Write-Host "STARTING REDIS"
           Write-Host "=================================================="
 
-          # Remove stale containers from a previous failed workflow.
           docker rm -f omniroute-redis 2>$null
           if ($LASTEXITCODE -ne 0) {
               $global:LASTEXITCODE = 0
@@ -373,7 +536,6 @@ jobs:
               throw "STORAGE_ENCRYPTION_KEY secret is missing."
           }
 
-          # Remove stale OmniRoute container from a previous failed run.
           docker rm -f omniroute 2>$null
           if ($LASTEXITCODE -ne 0) {
               $global:LASTEXITCODE = 0
@@ -381,20 +543,6 @@ jobs:
 
           $workspace = "${{ github.workspace }}"
 
-          Write-Host "Workspace:"
-          Write-Host $workspace
-
-          # Keep the same persisted-state model as the Linux workflow.
-          #
-          # /root/.omniroute -> GitHub workspace
-          # /app/data       -> GitHub workspace
-          #
-          # This preserves:
-          #   storage.sqlite
-          #   storage.sqlite-wal
-          #   storage.sqlite-shm
-          #   db_backups/
-          #   other OmniRoute persisted state
           docker run -d `
               --name omniroute `
               --restart unless-stopped `
@@ -440,7 +588,6 @@ jobs:
                   }
               }
               catch {
-                  # OmniRoute is still starting.
               }
 
               Start-Sleep -Seconds 2
@@ -460,8 +607,7 @@ jobs:
 
           Write-Host ""
           Write-Host "OmniRoute initialization failed."
-          Write-Host ""
-          Write-Host "Container status:"
+
           docker ps -a --filter "name=omniroute"
 
           Write-Host ""
@@ -471,7 +617,7 @@ jobs:
           throw "OmniRoute health check failed."
 
       # ==============================================================
-      # 8. Keep Alive - 355 Minutes
+      # 8. Keep-Alive (355-Minute Loop)
       # ==============================================================
       - name: 8. Keep-Alive (355-Minute Loop)
         shell: powershell
@@ -540,7 +686,8 @@ jobs:
 
               Write-Host ""
               Write-Host "SQLite database found:"
-              Get-Item $dbFile | Select-Object FullName, Length, LastWriteTime
+              Get-Item $dbFile |
+                  Select-Object FullName, Length, LastWriteTime
 
               if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
 
@@ -596,14 +743,6 @@ jobs:
               -Path "backup/omniroute" `
               -Force | Out-Null
 
-          # ------------------------------------------------------------
-          # Create full OmniRoute state backup.
-          #
-          # IMPORTANT:
-          # The SQLite DB contains encrypted/stored configuration.
-          # The encryption-related GitHub secrets must remain identical
-          # between workflow runs.
-          # ------------------------------------------------------------
           Write-Host "Creating compressed backup archive..."
 
           $archive = "backup/omniroute/omniroute-full-backup.tar.gz"
@@ -628,10 +767,6 @@ jobs:
 
           if ($tarItems.Count -gt 0) {
 
-              # Windows 10 includes bsdtar through modern Windows/Git tooling
-              # on most runner installations. Use tar directly.
-              #
-              # Excluded paths mirror the Linux workflow intent.
               tar -czf $archive `
                   --exclude=logs `
                   --exclude=call_logs `
@@ -643,23 +778,18 @@ jobs:
               }
               else {
                   Write-Host "Backup archive created:"
-                  Get-Item $archive | Format-List FullName, Length, LastWriteTime
+                  Get-Item $archive |
+                      Format-List FullName, Length, LastWriteTime
               }
           }
           else {
-              Write-Warning "No SQLite/database artifacts were found. Backup archive was not created."
+              Write-Warning "No SQLite/database artifacts were found."
           }
 
-          # ------------------------------------------------------------
-          # Save local/untracked state before synchronizing with origin.
-          # ------------------------------------------------------------
           git stash push `
               --include-untracked `
               -m "omniroute-backup-stash" 2>$null
 
-          # ------------------------------------------------------------
-          # Synchronize with remote branch.
-          # ------------------------------------------------------------
           git fetch origin "${{ github.ref_name }}"
 
           git rebase "origin/${{ github.ref_name }}"
@@ -669,18 +799,10 @@ jobs:
               Write-Warning "Git rebase failed. Attempting rebase abort..."
 
               git rebase --abort 2>$null
-
-              Write-Warning "Remote synchronization failed."
           }
 
-          # Restore generated state.
           git stash pop 2>$null
 
-          # ------------------------------------------------------------
-          # Stage ONLY database artifacts and backup archive.
-          #
-          # .env is intentionally never staged.
-          # ------------------------------------------------------------
           git add `
               .gitattributes `
               storage.sqlite `
@@ -689,9 +811,6 @@ jobs:
               backup/omniroute/omniroute-full-backup.tar.gz `
               db_backups/ 2>$null
 
-          # ------------------------------------------------------------
-          # Check whether anything changed.
-          # ------------------------------------------------------------
           git diff --cached --quiet
           $hasChanges = ($LASTEXITCODE -ne 0)
 
