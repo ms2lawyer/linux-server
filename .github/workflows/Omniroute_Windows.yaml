@@ -391,24 +391,32 @@ jobs:
 
       # ==============================================================
       # 5. Install Node.js LTS + Latest npm + OmniRoute
+      #
+      # IMPORTANT:
+      # - Docker is intentionally not used.
+      # - Node 24.x is the recommended OmniRoute runtime.
+      # - npm is upgraded to the latest available release.
+      # - OmniRoute postinstall warm-up is disabled for CI.
       # ==============================================================
 
-      - name: 5. Install Node.js LTS, npm and OmniRoute
+      - name: 5. Install Node.js LTS
         uses: actions/setup-node@v4
         with:
           node-version: "24.x"
+          check-latest: true
+          cache: "npm"
 
-      - name: 5A. Update npm and install OmniRoute
+      - name: 5A. Update npm and Install OmniRoute
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
           Write-Host "=================================================="
-          Write-Host "INSTALLING NODE.JS LTS + NPM + OMNIROUTE"
+          Write-Host "INSTALLING NODE.JS LTS + LATEST NPM + OMNIROUTE"
           Write-Host "=================================================="
 
           Write-Host ""
-          Write-Host "Node before npm update:"
+          Write-Host "Node.js:"
           node --version
 
           Write-Host ""
@@ -417,28 +425,47 @@ jobs:
 
           Write-Host ""
           Write-Host "Updating npm to latest..."
-          npm install --global npm@latest
+
+          npm install --global npm@latest `
+            --no-audit `
+            --no-fund
 
           if ($LASTEXITCODE -ne 0) {
             throw "Failed to update npm to the latest version."
           }
 
           Write-Host ""
-          Write-Host "Node:"
+          Write-Host "Node.js after npm update:"
           node --version
 
           Write-Host ""
-          Write-Host "npm:"
+          Write-Host "npm after update:"
           npm --version
 
           Write-Host ""
-          Write-Host "Installing latest OmniRoute package..."
+          Write-Host "Configuring OmniRoute for CI installation..."
 
-          npm install --global omniroute@latest
+          $env:OMNIROUTE_SKIP_POSTINSTALL = "1"
+
+          npm config set audit false
+          npm config set fund false
+
+          Write-Host ""
+          Write-Host "Installing latest OmniRoute..."
+
+          npm install `
+            --global `
+            omniroute@latest `
+            --no-audit `
+            --no-fund `
+            --loglevel warn
 
           if ($LASTEXITCODE -ne 0) {
             throw "Failed to install OmniRoute."
           }
+
+          Write-Host ""
+          Write-Host "Locating OmniRoute executable..."
 
           $omnirouteCommand = Get-Command `
             omniroute.cmd `
@@ -464,7 +491,7 @@ jobs:
           & $omnirouteCommand.Source --version
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Unable to execute OmniRoute."
+            throw "OmniRoute executable could not be executed."
           }
 
           Write-Host ""
