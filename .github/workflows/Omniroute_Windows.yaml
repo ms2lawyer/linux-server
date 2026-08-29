@@ -1,5 +1,5 @@
 
-name: OmniRoute Windows Gateway
+name: OmniRoute Windows Gateway Win
 
 on:
   workflow_dispatch:
