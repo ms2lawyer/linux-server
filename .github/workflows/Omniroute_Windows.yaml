@@ -1,4 +1,4 @@
-```yaml
+
 name: OmniRoute Windows Gateway Win
 
 on:
@@ -1686,4 +1686,3 @@ jobs:
           Write-Host "=================================================="
           Write-Host "WORKFLOW COMPLETE"
           Write-Host "=================================================="
-```
