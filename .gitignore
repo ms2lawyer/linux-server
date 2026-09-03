@@ -1,0 +1,16 @@
+ # Secrets
+    .env
+    .env.*
+    **/.env
+    **/.env.*
+
+    # Runtime logs
+    *.log
+    logs/
+    **/logs/
+
+    # SQLite transient files
+    *.sqlite-wal
+    *.sqlite-shm
+    **/*.sqlite-wal
+    **/*.sqlite-shm
