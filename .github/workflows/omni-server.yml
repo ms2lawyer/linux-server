@@ -12,7 +12,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 380
 
     permissions:
       contents: write
@@ -24,6 +24,7 @@ jobs:
       OMNIROUTE_BACKUP_PATH: 'backup/omniroute/omniroute-full-backup.tar.gz'
 
     steps:
+
       # ============================================================
       # 01. Checkout repository
       # ============================================================
@@ -34,7 +35,7 @@ jobs:
           fetch-depth: 0
 
       # ============================================================
-      # 02. Validate GitHub configuration before changing the runner
+      # 02. Validate GitHub configuration
       # ============================================================
       - name: 02. Validate GitHub Configuration
         env:
@@ -43,11 +44,14 @@ jobs:
           OMNIROUTE_ENV: ${{ secrets.OMNIROUTE_ENV }}
           GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
 
           test -n "${SSH_USERNAME:-}" || {
-            echo "ERROR: SSH_USERNAME is empty. Create repository variable SSH_USERNAME (preferred)."
+            echo "ERROR: SSH_USERNAME is empty."
+            echo "Create repository variable SSH_USERNAME (preferred)."
             exit 1
           }
 
@@ -71,6 +75,16 @@ jobs:
             exit 1
           }
 
+          test -n "${TELEGRAM_BOT_TOKEN:-}" || {
+            echo "ERROR: TELEGRAM_BOT_TOKEN secret is empty."
+            exit 1
+          }
+
+          test -n "${TELEGRAM_CHAT_ID:-}" || {
+            echo "ERROR: TELEGRAM_CHAT_ID secret is empty."
+            exit 1
+          }
+
           echo "Required GitHub configuration is present."
           echo "Secret values were not displayed."
 
@@ -82,6 +96,7 @@ jobs:
           set -euo pipefail
 
           sudo apt-get update
+
           sudo apt-get install -y \
             curl \
             wget \
@@ -107,12 +122,15 @@ jobs:
           if command -v gh >/dev/null 2>&1; then
             echo "GitHub CLI already installed."
           else
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            curl -fsSL \
+              https://cli.github.com/packages/githubcli-archive-keyring.gpg \
               | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
 
-            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r \
+              /usr/share/keyrings/githubcli-archive-keyring.gpg
 
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
               | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
 
             sudo apt-get update
@@ -155,6 +173,7 @@ jobs:
           fi
 
           echo "$SSH_USERNAME:$SSH_PASSWORD" | sudo chpasswd
+
           sudo usermod -aG sudo "$SSH_USERNAME"
 
           sudo mkdir -p /run/sshd
@@ -184,14 +203,18 @@ jobs:
           OMNIROUTE_HOME="/home/$SSH_USERNAME/.omniroute"
 
           sudo mkdir -p "$OMNIROUTE_HOME"
-          sudo chown -R "$SSH_USERNAME:$SSH_USERNAME" "$OMNIROUTE_HOME"
+
+          sudo chown -R \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$OMNIROUTE_HOME"
+
           sudo chmod 700 "$OMNIROUTE_HOME"
 
           echo "OmniRoute directory prepared."
 
       # ============================================================
-      # 08. Restore persisted OmniRoute state from Git repository
-      #     .env is deliberately excluded and restored separately.
+      # 08. Restore persisted OmniRoute state from Git
+      #     .env is deliberately excluded.
       # ============================================================
       - name: 08. Restore Persisted OmniRoute State From Git
         env:
@@ -219,16 +242,20 @@ jobs:
               "$OMNIROUTE_HOME/"
           else
             echo "No persisted OmniRoute state exists yet."
+
             sudo mkdir -p "$OMNIROUTE_HOME"
           fi
 
-          sudo chown -R "$SSH_USERNAME:$SSH_USERNAME" "$OMNIROUTE_HOME"
+          sudo chown -R \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$OMNIROUTE_HOME"
+
           sudo chmod 700 "$OMNIROUTE_HOME"
 
           echo "Persisted OmniRoute state restored."
 
       # ============================================================
-      # 09. Restore COMPLETE .env from GitHub Actions Secret
+      # 09. Restore COMPLETE .env from GitHub Secret
       #     .env NEVER goes into Git, cache, or backup.
       # ============================================================
       - name: 09. Restore OmniRoute Environment From Secret
@@ -249,7 +276,6 @@ jobs:
 
           rm -f "$TEMP_ENV"
 
-          # Write the multiline secret without ever printing it.
           printf '%s' "$OMNIROUTE_ENV" > "$TEMP_ENV"
 
           test -s "$TEMP_ENV" || {
@@ -258,12 +284,13 @@ jobs:
             exit 1
           }
 
-          # Validate at least one KEY=VALUE assignment without revealing values.
-          grep -Eq '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' "$TEMP_ENV" || {
-            echo "ERROR: OMNIROUTE_ENV does not look like a valid .env file."
-            rm -f "$TEMP_ENV"
-            exit 1
-          }
+          grep -Eq \
+            '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' \
+            "$TEMP_ENV" || {
+              echo "ERROR: OMNIROUTE_ENV does not look like a valid .env file."
+              rm -f "$TEMP_ENV"
+              exit 1
+            }
 
           sudo install \
             -o "$SSH_USERNAME" \
@@ -274,17 +301,20 @@ jobs:
 
           rm -f "$TEMP_ENV"
 
-          # Verify in the same step that actually created the file.
           sudo test -f "$ENV_FILE"
           sudo test -s "$ENV_FILE"
-          sudo chown "$SSH_USERNAME:$SSH_USERNAME" "$ENV_FILE"
+
+          sudo chown \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$ENV_FILE"
+
           sudo chmod 600 "$ENV_FILE"
 
           echo "OmniRoute .env restored successfully."
           echo "Secret contents were not displayed."
 
       # ============================================================
-      # 10. Verify .env immediately after restoration
+      # 10. Verify .env
       # ============================================================
       - name: 10. Verify OmniRoute Environment
         env:
@@ -296,7 +326,7 @@ jobs:
           ENV_FILE="$OMNIROUTE_HOME/.env"
 
           sudo test -f "$ENV_FILE" || {
-            echo "ERROR: OmniRoute .env does not exist at expected path."
+            echo "ERROR: OmniRoute .env does not exist."
             echo "Expected: $ENV_FILE"
             exit 1
           }
@@ -307,6 +337,7 @@ jobs:
           }
 
           sudo stat "$ENV_FILE"
+
           echo "OmniRoute .env exists and is non-empty."
           echo "Contents are intentionally not displayed."
 
@@ -317,14 +348,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+          curl -fsSL \
+            https://deb.nodesource.com/setup_22.x \
+            | sudo -E bash -
+
           sudo apt-get install -y nodejs
 
           node --version
           npm --version
 
       # ============================================================
-      # 12. Install OmniRoute as SSH user
+      # 12. Install OmniRoute
       # ============================================================
       - name: 12. Install OmniRoute
         env:
@@ -340,16 +374,18 @@ jobs:
           export PATH="$NPM_PREFIX/bin:$PATH"
 
           mkdir -p "$NPM_PREFIX"
+
           npm config set prefix "$NPM_PREFIX"
 
           npm install -g "omniroute@3.8.49"
 
           test -x "$NPM_PREFIX/bin/omniroute"
+
           "$NPM_PREFIX/bin/omniroute" --version
           USER_SCRIPT
 
       # ============================================================
-      # 13. Verify OmniRoute executable and env together
+      # 13. Verify OmniRoute installation
       # ============================================================
       - name: 13. Verify OmniRoute Installation
         env:
@@ -361,7 +397,7 @@ jobs:
           OMNIROUTE_BIN="/home/$SSH_USERNAME/.npm-global/bin/omniroute"
 
           test -x "$OMNIROUTE_BIN" || {
-            echo "ERROR: OmniRoute executable not found at expected path."
+            echo "ERROR: OmniRoute executable not found."
             exit 1
           }
 
@@ -394,8 +430,10 @@ jobs:
 
           [Service]
           Type=simple
+
           User=$SSH_USERNAME
           Group=$SSH_USERNAME
+
           WorkingDirectory=$OMNIROUTE_HOME
 
           Environment=HOME=/home/$SSH_USERNAME
@@ -404,10 +442,12 @@ jobs:
           Environment=PATH=/home/$SSH_USERNAME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
           EnvironmentFile=$OMNIROUTE_HOME/.env
+
           ExecStart=$OMNIROUTE_BIN
 
           Restart=on-failure
           RestartSec=5
+
           NoNewPrivileges=true
 
           [Install]
@@ -427,39 +467,56 @@ jobs:
           set -euo pipefail
 
           sudo systemctl restart omniroute
+
           sleep 5
 
           sudo systemctl --no-pager --full status omniroute || true
 
           if ! sudo systemctl is-active --quiet omniroute; then
             echo "ERROR: OmniRoute failed to start."
+
             echo "===== JOURNAL ====="
-            sudo journalctl -u omniroute --no-pager -n 100 || true
+
+            sudo journalctl \
+              -u omniroute \
+              --no-pager \
+              -n 100 || true
+
             exit 1
           fi
 
           echo "OmniRoute is running."
 
       # ============================================================
-      # 16. Verify listening port
+      # 16. Verify OmniRoute listening port
       # ============================================================
       - name: 16. Verify OmniRoute Port
         run: |
           set -euo pipefail
 
           for i in {1..30}; do
+
             if sudo ss -lntp | grep -q ":$OMNIROUTE_PORT "; then
+
               echo "OmniRoute is listening on port $OMNIROUTE_PORT."
+
               sudo ss -lntp | grep ":$OMNIROUTE_PORT " || true
+
               exit 0
             fi
 
             echo "Waiting for OmniRoute... ($i/30)"
+
             sleep 2
           done
 
           echo "ERROR: OmniRoute did not listen on port $OMNIROUTE_PORT."
-          sudo journalctl -u omniroute --no-pager -n 100 || true
+
+          sudo journalctl \
+            -u omniroute \
+            --no-pager \
+            -n 100 || true
+
           exit 1
 
       # ============================================================
@@ -481,7 +538,12 @@ jobs:
           fi
 
           echo "SQLite database found."
-          sudo -u "$SSH_USERNAME" sqlite3 "$DB" "PRAGMA integrity_check;" | grep -qx "ok"
+
+          sudo -u "$SSH_USERNAME" \
+            sqlite3 "$DB" \
+            "PRAGMA integrity_check;" \
+            | grep -qx "ok"
+
           echo "SQLite integrity check passed."
 
       # ============================================================
@@ -498,10 +560,14 @@ jobs:
             --max-time 10 \
             "http://127.0.0.1:$OMNIROUTE_PORT/v1/models" \
             >/dev/null; then
+
             echo "OmniRoute API responded successfully."
+
           else
+
             echo "WARNING: /v1/models did not return HTTP success."
             echo "The service is running, so continuing."
+
           fi
 
       # ============================================================
@@ -518,7 +584,9 @@ jobs:
             exit 1
           }
 
-          curl -fsSL https://tailscale.com/install.sh | sh
+          curl -fsSL \
+            https://tailscale.com/install.sh \
+            | sh
 
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTHKEY" \
@@ -534,36 +602,150 @@ jobs:
           set -euo pipefail
 
           echo "===== SYSTEMD ====="
+
           sudo systemctl is-active omniroute
 
           echo
           echo "===== PORT ====="
+
           sudo ss -lntp | grep ":$OMNIROUTE_PORT "
 
           echo
-          echo "===== TAILSCALE ====="
-          sudo tailscale ip -4 || true
+          echo "===== TAILSCALE IP ====="
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+
+          test -n "$TAILSCALE_IP"
+
+          echo "$TAILSCALE_IP"
+
+          echo
+          echo "===== TAILSCALE STATUS ====="
+
+          sudo tailscale status
 
           echo
           echo "OmniRoute startup validation completed."
 
       # ============================================================
-      # 21. Keep runner alive for 10 minutes for testing
+      # 21. Send Tailscale connection information to Telegram
       # ============================================================
-      - name: 21. Keep Runner Alive For 10 Minutes
+      - name: 21. Send Tailscale Connection Information To Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          test -n "${TELEGRAM_BOT_TOKEN:-}" || {
+            echo "ERROR: TELEGRAM_BOT_TOKEN secret is empty."
+            exit 1
+          }
+
+          test -n "${TELEGRAM_CHAT_ID:-}" || {
+            echo "ERROR: TELEGRAM_CHAT_ID secret is empty."
+            exit 1
+          }
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+
+          test -n "$TAILSCALE_IP" || {
+            echo "ERROR: Could not determine Tailscale IPv4 address."
+            exit 1
+          }
+
+          TAILSCALE_DNS="$(
+            sudo tailscale dns status 2>/dev/null \
+              | grep -Eo '[A-Za-z0-9._-]+\.ts\.net' \
+              | head -n 1 \
+              || true
+          )"
+
+          if [ -z "$TAILSCALE_DNS" ]; then
+            TAILSCALE_DNS="Not detected"
+          fi
+
+          MESSAGE="$(cat <<EOF
+          🚀 OmniRoute Linux Server is ONLINE
+          ━━━━━━━━━━━━━━━━━━━━
+          Tailscale
+          ━━━━━━━━━━━━━━━━━━━━
+          
+          Hostname:
+          $TAILSCALE_DNS
+          
+          IP:
+          $TAILSCALE_IP
+          
+          ━━━━━━━━━━━━━━━━━━━━
+          SSH
+          ━━━━━━━━━━━━━━━━━━━━
+          ssh ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}@$TAILSCALE_IP
+          
+          Port:
+          22
+
+          ━━━━━━━━━━━━━━━━━━━━
+          OmniRoute
+          ━━━━━━━━━━━━━━━━━━━━
+
+          URL:
+          http://$TAILSCALE_IP:$OMNIROUTE_PORT
+
+          API:
+          http://$TAILSCALE_IP:$OMNIROUTE_PORT/v1
+
+          Port:
+          $OMNIROUTE_PORT
+
+          ━━━━━━━━━━━━━━━━━━━━
+          Status
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Service: RUNNING
+          Runtime: 6 hours
+
+          The GitHub Actions runner is active.
+          EOF
+          )"
+
+          RESPONSE="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 20 \
+              --request POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MESSAGE}"
+          )"
+
+          echo "$RESPONSE" | grep -q '"ok":true' || {
+            echo "ERROR: Telegram API did not report success."
+            exit 1
+          }
+
+          echo "Telegram notification sent successfully."
+
+      # ============================================================
+      # 22. Keep runner alive for 6 hours
+      # ============================================================
+      - name: 22. Keep Runner Alive For 6 Hours
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
           set -euo pipefail
 
           echo "============================================================"
-          echo "TEST MODE"
-          echo "Keeping OmniRoute runner alive for 10 minutes."
+          echo "PRODUCTION MODE"
+          echo "Keeping OmniRoute runner alive for 6 hours."
           echo "============================================================"
 
-          for i in {1..10}; do
+          for i in {1..360}; do
+
             echo
-            echo "===== TEST MINUTE $i / 10 ====="
+            echo "===== RUNTIME MINUTE $i / 360 ====="
 
             echo "OmniRoute service:"
             sudo systemctl is-active omniroute || true
@@ -573,43 +755,62 @@ jobs:
             sudo ss -lntp | grep ":$OMNIROUTE_PORT " || true
 
             echo
+            echo "Tailscale:"
+            sudo tailscale ip -4 || true
+
+            echo
             echo "SQLite:"
+
             if [ -f "/home/$SSH_USERNAME/.omniroute/storage.sqlite" ]; then
-              ls -lh "/home/$SSH_USERNAME/.omniroute/storage.sqlite"
+
+              ls -lh \
+                "/home/$SSH_USERNAME/.omniroute/storage.sqlite"
+
             else
+
               echo "storage.sqlite not present."
+
             fi
 
             echo
-            echo "Waiting..."
+            echo "Waiting 60 seconds..."
+
             sleep 60
+
           done
 
           echo
-          echo "10-minute test period completed."
+          echo "6-hour runtime period completed."
 
       # ============================================================
-      # 22. Stop OmniRoute before persistence
+      # 23. Stop OmniRoute before persistence
       # ============================================================
-      - name: 22. Stop OmniRoute Before Persistence
+      - name: 23. Stop OmniRoute Before Persistence
         run: |
           set -euo pipefail
 
           sudo systemctl stop omniroute
+
           sleep 3
 
           if sudo systemctl is-active --quiet omniroute; then
+
             echo "ERROR: OmniRoute is still running."
-            sudo systemctl --no-pager --full status omniroute || true
+
+            sudo systemctl \
+              --no-pager \
+              --full \
+              status omniroute || true
+
             exit 1
           fi
 
           echo "OmniRoute is stopped."
 
       # ============================================================
-      # 23. SQLite checkpoint
+      # 24. SQLite checkpoint
       # ============================================================
-      - name: 23. Checkpoint SQLite Database
+      - name: 24. Checkpoint SQLite Database
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -623,7 +824,9 @@ jobs:
             exit 0
           fi
 
-          sudo -u "$SSH_USERNAME" sqlite3 "$DB" "PRAGMA wal_checkpoint(TRUNCATE);"
+          sudo -u "$SSH_USERNAME" \
+            sqlite3 "$DB" \
+            "PRAGMA wal_checkpoint(TRUNCATE);"
 
           if [ -f "$DB-wal" ]; then
             echo "WARNING: WAL file still exists."
@@ -636,9 +839,9 @@ jobs:
           echo "SQLite checkpoint completed."
 
       # ============================================================
-      # 24. Validate final SQLite database
+      # 25. Validate final SQLite database
       # ============================================================
-      - name: 24. Validate Final SQLite Database
+      - name: 25. Validate Final SQLite Database
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -651,14 +854,18 @@ jobs:
             exit 0
           fi
 
-          sudo -u "$SSH_USERNAME" sqlite3 "$DB" "PRAGMA integrity_check;" | grep -qx "ok"
+          sudo -u "$SSH_USERNAME" \
+            sqlite3 "$DB" \
+            "PRAGMA integrity_check;" \
+            | grep -qx "ok"
+
           echo "Final SQLite integrity check passed."
 
       # ============================================================
-      # 25. Create final backup
+      # 26. Create final backup
       #     .env is explicitly excluded.
       # ============================================================
-      - name: 25. Create Final OmniRoute Backup
+      - name: 26. Create Final OmniRoute Backup
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -680,16 +887,19 @@ jobs:
             ".omniroute"
 
           test -s "$FINAL_BACKUP"
+
           gzip -t "$FINAL_BACKUP"
+
           tar -tzf "$FINAL_BACKUP" >/dev/null
 
           echo "Final backup created and validated."
+
           ls -lh "$FINAL_BACKUP"
 
       # ============================================================
-      # 26. Authenticate GitHub CLI using GIT_TOKEN over HTTPS
+      # 27. Authenticate GitHub CLI using GIT_TOKEN over HTTPS
       # ============================================================
-      - name: 26. Authenticate GitHub CLI
+      - name: 27. Authenticate GitHub CLI
         env:
           GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
         run: |
@@ -711,41 +921,56 @@ jobs:
           echo "GitHub CLI HTTPS authentication configured."
 
       # ============================================================
-      # 27. Verify GitHub repository
+      # 28. Verify GitHub repository
       # ============================================================
-      - name: 27. Verify GitHub Repository
+      - name: 28. Verify GitHub Repository
         run: |
           set -euo pipefail
 
-          gh repo view "$GITHUB_REPOSITORY" --json nameWithOwner,url
+          gh repo view \
+            "$GITHUB_REPOSITORY" \
+            --json nameWithOwner,url
+
           echo "GitHub repository verified."
 
       # ============================================================
-      # 28. Synchronize repository before modifying persisted state
+      # 29. Synchronize repository before modifying state
       # ============================================================
-      - name: 28. Synchronize Git Repository
+      - name: 29. Synchronize Git Repository
         run: |
           set -euo pipefail
 
           BRANCH="${GITHUB_REF_NAME:-main}"
+
           REMOTE_URL="https://github.com/$GITHUB_REPOSITORY.git"
 
           git remote set-url origin "$REMOTE_URL"
+
           git fetch origin --prune
 
-          if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
-            git checkout -B "$BRANCH" "origin/$BRANCH"
+          if git show-ref \
+            --verify \
+            --quiet \
+            "refs/remotes/origin/$BRANCH"; then
+
+            git checkout -B \
+              "$BRANCH" \
+              "origin/$BRANCH"
+
           else
+
             git checkout -B "$BRANCH"
+
           fi
 
           echo "Repository synchronized with origin/$BRANCH."
+
           git status --short
 
       # ============================================================
-      # 29. Persist OmniRoute state into repository
+      # 30. Persist OmniRoute state into repository
       # ============================================================
-      - name: 29. Persist OmniRoute State
+      - name: 30. Persist OmniRoute State
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -755,9 +980,9 @@ jobs:
           REPO_TARGET="$GITHUB_WORKSPACE/$OMNIROUTE_REPO_PATH"
 
           test -d "$OMNIROUTE_HOME"
+
           mkdir -p "$REPO_TARGET"
 
-          # Never copy secrets/transient runtime files into Git.
           sudo rsync \
             -a \
             --delete \
@@ -769,186 +994,282 @@ jobs:
             "$OMNIROUTE_HOME/" \
             "$REPO_TARGET/"
 
-          sudo chown -R "$(id -u):$(id -g)" "$REPO_TARGET"
+          sudo chown -R \
+            "$(id -u):$(id -g)" \
+            "$REPO_TARGET"
 
-          echo "OmniRoute state persisted to: $OMNIROUTE_REPO_PATH"
-          find "$REPO_TARGET" -type f -print | sort
+          echo "OmniRoute state persisted to:"
+          echo "$OMNIROUTE_REPO_PATH"
+
+          find "$REPO_TARGET" \
+            -type f \
+            -print \
+            | sort
 
       # ============================================================
-      # 30. Persist final backup into repository
+      # 31. Persist final backup
       # ============================================================
-      - name: 30. Persist Final Backup
+      - name: 31. Persist Final Backup
         run: |
           set -euo pipefail
 
-          test -f "$RUNNER_TEMP/omniroute-full-backup.tar.gz"
+          test -f \
+            "$RUNNER_TEMP/omniroute-full-backup.tar.gz"
 
-          mkdir -p "$(dirname "$OMNIROUTE_BACKUP_PATH")"
-          cp "$RUNNER_TEMP/omniroute-full-backup.tar.gz" "$OMNIROUTE_BACKUP_PATH"
+          mkdir -p \
+            "$(dirname "$OMNIROUTE_BACKUP_PATH")"
+
+          cp \
+            "$RUNNER_TEMP/omniroute-full-backup.tar.gz" \
+            "$OMNIROUTE_BACKUP_PATH"
 
           test -s "$OMNIROUTE_BACKUP_PATH"
+
           gzip -t "$OMNIROUTE_BACKUP_PATH"
-          tar -tzf "$OMNIROUTE_BACKUP_PATH" >/dev/null
+
+          tar -tzf \
+            "$OMNIROUTE_BACKUP_PATH" \
+            >/dev/null
 
           echo "Final backup copied to repository."
+
           ls -lh "$OMNIROUTE_BACKUP_PATH"
 
       # ============================================================
-      # 31. Remove forbidden files from repository worktree
+      # 32. Remove forbidden files
       # ============================================================
-      - name: 31. Remove Sensitive And Transient Files
+      - name: 32. Remove Sensitive And Transient Files
         run: |
           set -euo pipefail
 
           TARGET="$GITHUB_WORKSPACE/$OMNIROUTE_REPO_PATH"
 
-          find "$TARGET" -type f -name '.env' -delete
-          find "$TARGET" -type f -name '*.log' -delete
-          find "$TARGET" -type f \( -name 'storage.sqlite-wal' -o -name 'storage.sqlite-shm' \) -delete
-          find "$TARGET" -type d -name 'logs' -prune -exec rm -rf {} +
+          if [ -d "$TARGET" ]; then
 
-          echo "Sensitive and transient files removed from persisted state."
+            find "$TARGET" \
+              -type f \
+              -name '.env' \
+              -delete
+
+            find "$TARGET" \
+              -type f \
+              -name '*.log' \
+              -delete
+
+            find "$TARGET" \
+              -type f \
+              \( \
+                -name 'storage.sqlite-wal' \
+                -o \
+                -name 'storage.sqlite-shm' \
+              \) \
+              -delete
+
+            find "$TARGET" \
+              -type d \
+              -name 'logs' \
+              -prune \
+              -exec rm -rf {} +
+
+          fi
+
+          echo "Sensitive and transient files removed."
 
       # ============================================================
-      # 32. Security check before staging
+      # 33. Security check before staging
       # ============================================================
-      - name: 32. Security Check Before Commit
+      - name: 33. Security Check Before Commit
         run: |
           set -euo pipefail
 
           echo "Checking repository for forbidden files."
 
-          if find "$OMNIROUTE_REPO_PATH" \
-            -type f \
-            \( \
-              -name '.env' \
-              -o -name '*.log' \
-              -o -name 'storage.sqlite-wal' \
-              -o -name 'storage.sqlite-shm' \
-            \) \
-            -print -quit | grep -q .; then
-            echo "ERROR: Forbidden file found in persisted repository directory."
-            exit 1
+          if [ -d "$OMNIROUTE_REPO_PATH" ]; then
+
+            if find "$OMNIROUTE_REPO_PATH" \
+              -type f \
+              \( \
+                -name '.env' \
+                -o \
+                -name '*.log' \
+                -o \
+                -name 'storage.sqlite-wal' \
+                -o \
+                -name 'storage.sqlite-shm' \
+              \) \
+              -print \
+              -quit \
+              | grep -q .; then
+
+              echo "ERROR: Forbidden file found in persisted repository directory."
+
+              exit 1
+            fi
+
           fi
 
-          if git ls-files | grep -E '(^|/)\.env$|(^|/)logs/|\.log$|storage\.sqlite-(wal|shm)$'; then
+          if git ls-files \
+            | grep -E '(^|/)\.env$|(^|/)logs/|\.log$|storage\.sqlite-(wal|shm)$'; then
+
             echo "ERROR: Forbidden files are already tracked by Git."
+
             exit 1
           fi
 
           echo "Security check passed."
 
       # ============================================================
-      # 33. Check file sizes
+      # 34. Check file sizes
       # ============================================================
-      - name: 33. Check GitHub File Size Limits
+      - name: 34. Check GitHub File Size Limits
         run: |
           set -euo pipefail
 
-          LARGE_FILES="$(find "$OMNIROUTE_REPO_PATH" -type f -size +95M -print || true)"
+          if [ -d "$OMNIROUTE_REPO_PATH" ]; then
 
-          if [ -n "$LARGE_FILES" ]; then
-            echo "ERROR: Files larger than 95 MB were found:"
-            echo "$LARGE_FILES"
-            exit 1
+            LARGE_FILES="$(
+              find "$OMNIROUTE_REPO_PATH" \
+                -type f \
+                -size +95M \
+                -print \
+                || true
+            )"
+
+            if [ -n "$LARGE_FILES" ]; then
+
+              echo "ERROR: Files larger than 95 MB were found:"
+              echo "$LARGE_FILES"
+
+              exit 1
+            fi
+
           fi
 
           if [ -f "$OMNIROUTE_BACKUP_PATH" ]; then
-            BACKUP_SIZE="$(stat -c '%s' "$OMNIROUTE_BACKUP_PATH")"
+
+            BACKUP_SIZE="$(
+              stat \
+                -c '%s' \
+                "$OMNIROUTE_BACKUP_PATH"
+            )"
+
             if [ "$BACKUP_SIZE" -gt 99614720 ]; then
+
               echo "ERROR: Backup exceeds 95 MB."
+
               exit 1
             fi
+
           fi
 
           echo "File size check passed."
 
       # ============================================================
-      # 34. Git status
+      # 35. Git status
       # ============================================================
-      - name: 34. Git Status Before Commit
+      - name: 35. Git Status Before Commit
         run: |
           set -euo pipefail
 
           echo "===== GIT STATUS ====="
+
           git status --short
 
           echo
           echo "===== EXISTING FILE COUNT ====="
+
           git ls-files | wc -l
 
       # ============================================================
-      # 35. Git add
+      # 36. Git add
       # ============================================================
-      - name: 35. Git Add Everything
+      - name: 36. Git Add Everything
         run: |
           set -euo pipefail
 
           git add -A
 
           echo "All repository changes staged."
+
           echo
           echo "===== STAGED FILES ====="
+
           git diff --cached --name-status
 
       # ============================================================
-      # 36. Verify staged backup/state and .env exclusion
+      # 37. Verify staged backup/state and .env exclusion
       # ============================================================
-      - name: 36. Verify Backup And State Are Staged
+      - name: 37. Verify Backup And State Are Staged
         run: |
           set -euo pipefail
 
-          git diff --cached --name-only | grep -Fxq "$OMNIROUTE_BACKUP_PATH" || {
-            echo "ERROR: Final backup is not staged."
-            exit 1
-          }
+          git diff --cached --name-only \
+            | grep -Fxq "$OMNIROUTE_BACKUP_PATH" || {
 
-          if ! git diff --cached --name-only | grep -q "^$OMNIROUTE_REPO_PATH/"; then
-            echo "WARNING: No OmniRoute state files are staged."
-          else
+              echo "ERROR: Final backup is not staged."
+
+              exit 1
+            }
+
+          if git diff --cached --name-only \
+            | grep -q "^$OMNIROUTE_REPO_PATH/"; then
+
             echo "OmniRoute state files are staged."
+
+          else
+
+            echo "WARNING: No OmniRoute state files are staged."
+
           fi
 
-          if git diff --cached --name-only | grep -E '(^|/)\.env$'; then
+          if git diff --cached --name-only \
+            | grep -E '(^|/)\.env$'; then
+
             echo "ERROR: .env is staged."
+
             exit 1
           fi
 
           echo ".env is not staged."
 
       # ============================================================
-      # 37. Commit
+      # 38. Commit
       # ============================================================
-      - name: 37. Commit Backup And OmniRoute State
+      - name: 38. Commit Backup And OmniRoute State
         run: |
           set -euo pipefail
 
           if git diff --cached --quiet; then
+
             echo "No changes to commit."
+
             exit 0
           fi
 
-          git commit -m "chore: persist OmniRoute state and backup"
+          git commit \
+            -m "chore: persist OmniRoute state and backup"
 
           echo "Commit created:"
+
           git log -1 --oneline
 
       # ============================================================
-      # 38. Push using GitHub CLI HTTPS credentials
+      # 39. Push using GitHub CLI HTTPS credentials
       # ============================================================
-      - name: 38. Push Using GitHub CLI Authentication
+      - name: 39. Push Using GitHub CLI Authentication
         run: |
           set -euo pipefail
 
           BRANCH="${GITHUB_REF_NAME:-main}"
 
           git push origin "$BRANCH"
+
           echo "Git push completed successfully."
 
       # ============================================================
-      # 39. Verify remote commit
+      # 40. Verify remote commit and final state
       # ============================================================
-      - name: 39. Verify Remote Commit
+      - name: 40. Final Repository Validation
         run: |
           set -euo pipefail
 
@@ -957,33 +1278,46 @@ jobs:
           git fetch origin "$BRANCH"
 
           LOCAL_COMMIT="$(git rev-parse HEAD)"
-          REMOTE_COMMIT="$(git rev-parse "origin/$BRANCH")"
+
+          REMOTE_COMMIT="$(
+            git rev-parse "origin/$BRANCH"
+          )"
 
           echo "Local commit : $LOCAL_COMMIT"
           echo "Remote commit: $REMOTE_COMMIT"
 
           test "$LOCAL_COMMIT" = "$REMOTE_COMMIT"
 
-          echo "Remote push verified successfully."
-
-      # ============================================================
-      # 40. Final repository validation and service state
-      # ============================================================
-      - name: 40. Final Validation
-        run: |
-          set -euo pipefail
-
+          echo
           echo "===== PERSISTED OMNIROUTE FILES ====="
-          git ls-tree -r --name-only HEAD "$OMNIROUTE_REPO_PATH" | sort
+
+          git ls-tree \
+            -r \
+            --name-only \
+            HEAD \
+            "$OMNIROUTE_REPO_PATH" \
+            | sort
 
           echo
           echo "===== FINAL BACKUP ====="
-          git ls-tree -r --name-only HEAD "$OMNIROUTE_BACKUP_PATH"
+
+          git ls-tree \
+            -r \
+            --name-only \
+            HEAD \
+            "$OMNIROUTE_BACKUP_PATH"
 
           echo
           echo "===== VERIFY .env IS NOT IN GIT ====="
-          if git ls-tree -r --name-only HEAD | grep -E '(^|/)\.env$'; then
+
+          if git ls-tree \
+            -r \
+            --name-only \
+            HEAD \
+            | grep -E '(^|/)\.env$'; then
+
             echo "ERROR: .env exists in the Git commit."
+
             exit 1
           fi
 
@@ -991,15 +1325,22 @@ jobs:
 
           echo
           echo "===== FINAL SERVICE STATE ====="
+
           if sudo systemctl is-active --quiet omniroute; then
+
             echo "ERROR: OmniRoute is still running."
+
             exit 1
           fi
 
           echo "OmniRoute is STOPPED."
-          sudo systemctl is-active omniroute || true
+
+          sudo systemctl is-active \
+            omniroute \
+            || true
 
           echo
           echo "=============================================="
-          echo "OMNIROUTE BACKUP TEST COMPLETED SUCCESSFULLY"
+          echo "OMNIROUTE 6-HOUR BACKUP TEST COMPLETED"
+          echo "SUCCESSFULLY"
           echo "=============================================="
