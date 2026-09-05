@@ -473,6 +473,7 @@ jobs:
           # OmniRoute's actual bind-address variable.
           # Do NOT use HOSTNAME here.
           Environment=OMNIROUTE_SERVER_HOST=0.0.0.0
+          Environment=HOSTNAME=0.0.0.0
 
           ExecStart=$OMNIROUTE_BIN
 
