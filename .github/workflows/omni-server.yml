@@ -1,9 +1,9 @@
 name: Linux OmniRoute Server
 
 on:
-  workflow_dispatch:
   schedule:
     - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 concurrency:
   group: permanent-linux-ssh-server
@@ -219,8 +219,7 @@ jobs:
       #   .env
       #   logs/
       #
-      # Therefore the archive is extracted directly into:
-      #   /home/<user>/.omniroute
+      # Everything else is restored.
       # ============================================================
       - name: 08. Restore OmniRoute Archive
         env:
@@ -233,8 +232,8 @@ jobs:
 
           sudo mkdir -p "$OMNIROUTE_HOME"
 
-          # Always start from a clean persisted state.
-          # .env will be restored separately from GitHub Secret.
+          echo "Cleaning existing OmniRoute state."
+
           sudo find "$OMNIROUTE_HOME" \
             -mindepth 1 \
             -maxdepth 1 \
@@ -429,6 +428,13 @@ jobs:
 
       # ============================================================
       # 14. Create systemd service
+      #
+      # IMPORTANT:
+      # OmniRoute >= v3.8.39 uses OMNIROUTE_SERVER_HOST for
+      # omniroute serve.
+      #
+      # Do NOT use HOSTNAME because POSIX shells/systemd environments
+      # already use HOSTNAME for the machine hostname.
       # ============================================================
       - name: 14. Create OmniRoute systemd Service
         env:
@@ -464,8 +470,9 @@ jobs:
 
           EnvironmentFile=$OMNIROUTE_HOME/.env
 
-          # Must come after EnvironmentFile so .env cannot override it.
-          Environment=HOSTNAME=0.0.0.0
+          # OmniRoute's actual bind-address variable.
+          # Do NOT use HOSTNAME here.
+          Environment=OMNIROUTE_SERVER_HOST=0.0.0.0
 
           ExecStart=$OMNIROUTE_BIN
 
@@ -482,6 +489,11 @@ jobs:
           sudo systemctl enable omniroute
 
           echo "OmniRoute systemd service created."
+
+          echo
+          echo "===== SYSTEMD SERVICE ====="
+
+          sudo systemctl cat omniroute
 
       # ============================================================
       # 15. Start OmniRoute
@@ -545,40 +557,65 @@ jobs:
 
       # ============================================================
       # 16A. Verify OmniRoute bind address is 0.0.0.0
+      #
+      # IMPORTANT:
+      # This verifies the REAL socket.
+      # It does not assume an environment variable is sufficient.
       # ============================================================
       - name: 16A. Verify OmniRoute Bind Address
         run: |
           set -euo pipefail
 
-          echo "===== SYSTEMD HOSTNAME ====="
+          echo "===== SYSTEMD OMNIROUTE_SERVER_HOST ====="
 
-          sudo systemctl show omniroute -p Environment --no-pager \
-            | grep -F 'HOSTNAME=0.0.0.0' || {
-              echo "ERROR: systemd omniroute service does not contain HOSTNAME=0.0.0.0."
+          sudo systemctl show \
+            omniroute \
+            -p Environment \
+            --no-pager \
+            | grep -F 'OMNIROUTE_SERVER_HOST=0.0.0.0' || {
+
+              echo "ERROR: systemd omniroute service does not contain:"
+              echo "OMNIROUTE_SERVER_HOST=0.0.0.0"
+
+              echo
               echo "===== SERVICE FILE ====="
+
               sudo systemctl cat omniroute
+
               exit 1
             }
 
-          echo "systemd HOSTNAME=0.0.0.0 confirmed."
+          echo "OMNIROUTE_SERVER_HOST=0.0.0.0 confirmed."
 
+          echo
           echo "===== LISTENING SOCKET ====="
 
-          if sudo ss -lntp \
-            | grep -Eq "0\.0\.0\.0:$OMNIROUTE_PORT[[:space:]]|\[::\]:$OMNIROUTE_PORT[[:space:]]"; then
-
+          LISTENING_SOCKET="$(
             sudo ss -lntp \
-              | grep -E ":$OMNIROUTE_PORT[[:space:]]" || true
+              | grep -E ":$OMNIROUTE_PORT[[:space:]]" \
+              || true
+          )"
 
+          echo "$LISTENING_SOCKET"
+
+          if echo "$LISTENING_SOCKET" \
+            | grep -Eq \
+              "0\.0\.0\.0:$OMNIROUTE_PORT[[:space:]]|\[::\]:$OMNIROUTE_PORT[[:space:]]"; then
+
+            echo
             echo "OmniRoute is listening on an externally reachable interface."
 
           else
 
-            echo "ERROR: OmniRoute is not listening on 0.0.0.0:$OMNIROUTE_PORT or [::]:$OMNIROUTE_PORT."
+            echo
+            echo "ERROR: OmniRoute is NOT listening on 0.0.0.0:$OMNIROUTE_PORT or [::]:$OMNIROUTE_PORT."
 
-            sudo ss -lntp \
-              | grep ":$OMNIROUTE_PORT[[:space:]]" || true
+            echo
+            echo "===== FULL SOCKET INFORMATION ====="
 
+            sudo ss -lntp || true
+
+            echo
             echo "===== JOURNAL ====="
 
             sudo journalctl \
@@ -679,6 +716,13 @@ jobs:
           echo "===== PORT ====="
 
           sudo ss -lntp | grep ":$OMNIROUTE_PORT "
+
+          echo
+          echo "===== BIND ADDRESS ====="
+
+          sudo ss -lntp \
+            | grep -E \
+              "0\.0\.0\.0:$OMNIROUTE_PORT[[:space:]]|\[::\]:$OMNIROUTE_PORT[[:space:]]"
 
           echo
           echo "===== TAILSCALE IP ====="
@@ -926,11 +970,9 @@ jobs:
       # ============================================================
       # 26. Create final OmniRoute backup archive
       #
-      # IMPORTANT:
-      # The archive contains the CONTENTS of .omniroute,
-      # not the .omniroute directory itself.
+      # Archive contains the CONTENTS of .omniroute.
       #
-      # Excluded:
+      # Excluded ONLY:
       #   .env
       #   logs/
       #
@@ -1002,7 +1044,7 @@ jobs:
           echo "GitHub repository verified."
 
       # ============================================================
-      # 29. Synchronize Git repository before modifying backup
+      # 29. Synchronize repository before modifying backup
       # ============================================================
       - name: 29. Synchronize Git Repository
         run: |
@@ -1036,7 +1078,7 @@ jobs:
       # ============================================================
       # 30. Remove legacy individual OmniRoute state
       #
-      # The repository must contain ONLY the backup archive.
+      # New architecture stores ONLY one backup archive.
       # ============================================================
       - name: 30. Remove Legacy OmniRoute State
         run: |
@@ -1104,6 +1146,7 @@ jobs:
             | grep -E '(^|/)\.env$'; then
 
             echo "ERROR: .env exists inside backup archive."
+
             exit 1
           fi
 
@@ -1116,6 +1159,7 @@ jobs:
             | grep -E '(^|/)logs(/|$)'; then
 
             echo "ERROR: logs directory exists inside backup archive."
+
             exit 1
           fi
 
@@ -1216,7 +1260,7 @@ jobs:
           git diff --cached --name-status
 
       # ============================================================
-      # 37. Verify ONLY backup archive is staged
+      # 37. Verify backup is staged
       # ============================================================
       - name: 37. Verify Backup Is Staged
         run: |
