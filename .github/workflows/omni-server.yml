@@ -20,7 +20,6 @@ jobs:
     env:
       OMNIROUTE_PORT: '20128'
       OMNIROUTE_VERSION: '3.8.49'
-      OMNIROUTE_REPO_PATH: 'backup/omniroute/data'
       OMNIROUTE_BACKUP_PATH: 'backup/omniroute/omniroute-full-backup.tar.gz'
 
     steps:
@@ -101,7 +100,6 @@ jobs:
             curl \
             wget \
             git \
-            rsync \
             sqlite3 \
             openssh-server \
             ca-certificates \
@@ -213,37 +211,59 @@ jobs:
           echo "OmniRoute directory prepared."
 
       # ============================================================
-      # 08. Restore persisted OmniRoute state from Git
-      #     .env is deliberately excluded.
+      # 08. Restore OmniRoute archive
+      #
+      # Archive contains the CONTENTS of .omniroute.
+      #
+      # Excluded from archive:
+      #   .env
+      #   logs/
+      #
+      # Therefore the archive is extracted directly into:
+      #   /home/<user>/.omniroute
       # ============================================================
-      - name: 08. Restore Persisted OmniRoute State From Git
+      - name: 08. Restore OmniRoute Archive
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
           set -euo pipefail
 
           OMNIROUTE_HOME="/home/$SSH_USERNAME/.omniroute"
-          REPO_TARGET="$GITHUB_WORKSPACE/$OMNIROUTE_REPO_PATH"
+          BACKUP_FILE="$GITHUB_WORKSPACE/$OMNIROUTE_BACKUP_PATH"
 
           sudo mkdir -p "$OMNIROUTE_HOME"
 
-          if [ -d "$REPO_TARGET" ]; then
-            echo "Restoring persisted OmniRoute state from repository."
+          # Always start from a clean persisted state.
+          # .env will be restored separately from GitHub Secret.
+          sudo find "$OMNIROUTE_HOME" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -exec rm -rf {} +
 
-            sudo rsync \
-              -a \
-              --delete \
-              --exclude='.env' \
-              --exclude='logs/' \
-              --exclude='*.log' \
-              --exclude='storage.sqlite-wal' \
-              --exclude='storage.sqlite-shm' \
-              "$REPO_TARGET/" \
-              "$OMNIROUTE_HOME/"
+          if [ -f "$BACKUP_FILE" ]; then
+
+            echo "OmniRoute backup archive found:"
+            echo "$BACKUP_FILE"
+
+            test -s "$BACKUP_FILE"
+
+            gzip -t "$BACKUP_FILE"
+
+            tar -tzf "$BACKUP_FILE" >/dev/null
+
+            echo "Backup archive validated."
+
+            sudo tar \
+              -xzf "$BACKUP_FILE" \
+              -C "$OMNIROUTE_HOME"
+
+            echo "OmniRoute archive extracted."
+
           else
-            echo "No persisted OmniRoute state exists yet."
 
-            sudo mkdir -p "$OMNIROUTE_HOME"
+            echo "No OmniRoute backup archive exists yet."
+            echo "Starting with an empty .omniroute directory."
+
           fi
 
           sudo chown -R \
@@ -252,11 +272,12 @@ jobs:
 
           sudo chmod 700 "$OMNIROUTE_HOME"
 
-          echo "Persisted OmniRoute state restored."
+          echo "OmniRoute archive restore completed."
 
       # ============================================================
       # 09. Restore COMPLETE .env from GitHub Secret
-      #     .env NEVER goes into Git, cache, or backup.
+      #
+      # .env is NEVER stored in Git or the backup archive.
       # ============================================================
       - name: 09. Restore OmniRoute Environment From Secret
         env:
@@ -443,6 +464,9 @@ jobs:
 
           EnvironmentFile=$OMNIROUTE_HOME/.env
 
+          # Must come after EnvironmentFile so .env cannot override it.
+          Environment=HOSTNAME=0.0.0.0
+
           ExecStart=$OMNIROUTE_BIN
 
           Restart=on-failure
@@ -518,6 +542,52 @@ jobs:
             -n 100 || true
 
           exit 1
+
+      # ============================================================
+      # 16A. Verify OmniRoute bind address is 0.0.0.0
+      # ============================================================
+      - name: 16A. Verify OmniRoute Bind Address
+        run: |
+          set -euo pipefail
+
+          echo "===== SYSTEMD HOSTNAME ====="
+
+          sudo systemctl show omniroute -p Environment --no-pager \
+            | grep -F 'HOSTNAME=0.0.0.0' || {
+              echo "ERROR: systemd omniroute service does not contain HOSTNAME=0.0.0.0."
+              echo "===== SERVICE FILE ====="
+              sudo systemctl cat omniroute
+              exit 1
+            }
+
+          echo "systemd HOSTNAME=0.0.0.0 confirmed."
+
+          echo "===== LISTENING SOCKET ====="
+
+          if sudo ss -lntp \
+            | grep -Eq "0\.0\.0\.0:$OMNIROUTE_PORT[[:space:]]|\[::\]:$OMNIROUTE_PORT[[:space:]]"; then
+
+            sudo ss -lntp \
+              | grep -E ":$OMNIROUTE_PORT[[:space:]]" || true
+
+            echo "OmniRoute is listening on an externally reachable interface."
+
+          else
+
+            echo "ERROR: OmniRoute is not listening on 0.0.0.0:$OMNIROUTE_PORT or [::]:$OMNIROUTE_PORT."
+
+            sudo ss -lntp \
+              | grep ":$OMNIROUTE_PORT[[:space:]]" || true
+
+            echo "===== JOURNAL ====="
+
+            sudo journalctl \
+              -u omniroute \
+              --no-pager \
+              -n 100 || true
+
+            exit 1
+          fi
 
       # ============================================================
       # 17. Verify SQLite database
@@ -670,18 +740,18 @@ jobs:
           ━━━━━━━━━━━━━━━━━━━━
           Tailscale
           ━━━━━━━━━━━━━━━━━━━━
-          
+
           Hostname:
           $TAILSCALE_DNS
-          
+
           IP:
           $TAILSCALE_IP
-          
+
           ━━━━━━━━━━━━━━━━━━━━
           SSH
           ━━━━━━━━━━━━━━━━━━━━
           ssh ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}@$TAILSCALE_IP
-          
+
           Port:
           22
 
@@ -828,14 +898,6 @@ jobs:
             sqlite3 "$DB" \
             "PRAGMA wal_checkpoint(TRUNCATE);"
 
-          if [ -f "$DB-wal" ]; then
-            echo "WARNING: WAL file still exists."
-          fi
-
-          if [ -f "$DB-shm" ]; then
-            echo "WARNING: SHM file still exists."
-          fi
-
           echo "SQLite checkpoint completed."
 
       # ============================================================
@@ -862,8 +924,17 @@ jobs:
           echo "Final SQLite integrity check passed."
 
       # ============================================================
-      # 26. Create final backup
-      #     .env is explicitly excluded.
+      # 26. Create final OmniRoute backup archive
+      #
+      # IMPORTANT:
+      # The archive contains the CONTENTS of .omniroute,
+      # not the .omniroute directory itself.
+      #
+      # Excluded:
+      #   .env
+      #   logs/
+      #
+      # Everything else is included.
       # ============================================================
       - name: 26. Create Final OmniRoute Backup
         env:
@@ -877,14 +948,11 @@ jobs:
           rm -f "$FINAL_BACKUP"
 
           sudo tar \
-            --exclude='.env' \
-            --exclude='logs' \
-            --exclude='*.log' \
-            --exclude='storage.sqlite-wal' \
-            --exclude='storage.sqlite-shm' \
+            --exclude='./.env' \
+            --exclude='./logs' \
             -czf "$FINAL_BACKUP" \
-            -C "/home/$SSH_USERNAME" \
-            ".omniroute"
+            -C "$OMNIROUTE_HOME" \
+            .
 
           test -s "$FINAL_BACKUP"
 
@@ -892,7 +960,7 @@ jobs:
 
           tar -tzf "$FINAL_BACKUP" >/dev/null
 
-          echo "Final backup created and validated."
+          echo "Final OmniRoute backup created and validated."
 
           ls -lh "$FINAL_BACKUP"
 
@@ -934,7 +1002,7 @@ jobs:
           echo "GitHub repository verified."
 
       # ============================================================
-      # 29. Synchronize repository before modifying state
+      # 29. Synchronize Git repository before modifying backup
       # ============================================================
       - name: 29. Synchronize Git Repository
         run: |
@@ -965,51 +1033,30 @@ jobs:
 
           echo "Repository synchronized with origin/$BRANCH."
 
-          git status --short
-
       # ============================================================
-      # 30. Persist OmniRoute state into repository
+      # 30. Remove legacy individual OmniRoute state
+      #
+      # The repository must contain ONLY the backup archive.
       # ============================================================
-      - name: 30. Persist OmniRoute State
-        env:
-          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+      - name: 30. Remove Legacy OmniRoute State
         run: |
           set -euo pipefail
 
-          OMNIROUTE_HOME="/home/$SSH_USERNAME/.omniroute"
-          REPO_TARGET="$GITHUB_WORKSPACE/$OMNIROUTE_REPO_PATH"
+          LEGACY_PATH="$GITHUB_WORKSPACE/backup/omniroute/data"
 
-          test -d "$OMNIROUTE_HOME"
+          if [ -d "$LEGACY_PATH" ]; then
+            echo "Removing legacy individual OmniRoute state:"
+            echo "$LEGACY_PATH"
 
-          mkdir -p "$REPO_TARGET"
+            rm -rf "$LEGACY_PATH"
+          fi
 
-          sudo rsync \
-            -a \
-            --delete \
-            --exclude='.env' \
-            --exclude='logs/' \
-            --exclude='*.log' \
-            --exclude='storage.sqlite-wal' \
-            --exclude='storage.sqlite-shm' \
-            "$OMNIROUTE_HOME/" \
-            "$REPO_TARGET/"
-
-          sudo chown -R \
-            "$(id -u):$(id -g)" \
-            "$REPO_TARGET"
-
-          echo "OmniRoute state persisted to:"
-          echo "$OMNIROUTE_REPO_PATH"
-
-          find "$REPO_TARGET" \
-            -type f \
-            -print \
-            | sort
+          echo "Legacy OmniRoute state removed."
 
       # ============================================================
-      # 31. Persist final backup
+      # 31. Persist ONLY final backup archive
       # ============================================================
-      - name: 31. Persist Final Backup
+      - name: 31. Persist Final Backup Archive
         run: |
           set -euo pipefail
 
@@ -1031,52 +1078,54 @@ jobs:
             "$OMNIROUTE_BACKUP_PATH" \
             >/dev/null
 
-          echo "Final backup copied to repository."
+          echo "Final backup archive copied to repository."
 
           ls -lh "$OMNIROUTE_BACKUP_PATH"
 
       # ============================================================
-      # 32. Remove forbidden files
+      # 32. Verify archive does NOT contain .env or logs
       # ============================================================
-      - name: 32. Remove Sensitive And Transient Files
+      - name: 32. Verify Backup Contents
         run: |
           set -euo pipefail
 
-          TARGET="$GITHUB_WORKSPACE/$OMNIROUTE_REPO_PATH"
+          BACKUP="$OMNIROUTE_BACKUP_PATH"
 
-          if [ -d "$TARGET" ]; then
+          test -f "$BACKUP"
 
-            find "$TARGET" \
-              -type f \
-              -name '.env' \
-              -delete
+          echo "===== BACKUP CONTENTS ====="
 
-            find "$TARGET" \
-              -type f \
-              -name '*.log' \
-              -delete
+          tar -tzf "$BACKUP" | sort
 
-            find "$TARGET" \
-              -type f \
-              \( \
-                -name 'storage.sqlite-wal' \
-                -o \
-                -name 'storage.sqlite-shm' \
-              \) \
-              -delete
+          echo
+          echo "===== VERIFY .env IS EXCLUDED ====="
 
-            find "$TARGET" \
-              -type d \
-              -name 'logs' \
-              -prune \
-              -exec rm -rf {} +
+          if tar -tzf "$BACKUP" \
+            | grep -E '(^|/)\.env$'; then
 
+            echo "ERROR: .env exists inside backup archive."
+            exit 1
           fi
 
-          echo "Sensitive and transient files removed."
+          echo ".env is not present in backup archive."
+
+          echo
+          echo "===== VERIFY logs/ IS EXCLUDED ====="
+
+          if tar -tzf "$BACKUP" \
+            | grep -E '(^|/)logs(/|$)'; then
+
+            echo "ERROR: logs directory exists inside backup archive."
+            exit 1
+          fi
+
+          echo "logs directory is not present in backup archive."
+
+          echo
+          echo "Backup contents security check passed."
 
       # ============================================================
-      # 33. Security check before staging
+      # 33. Verify no .env/log files are being committed
       # ============================================================
       - name: 33. Security Check Before Commit
         run: |
@@ -1084,85 +1133,55 @@ jobs:
 
           echo "Checking repository for forbidden files."
 
-          if [ -d "$OMNIROUTE_REPO_PATH" ]; then
-
-            if find "$OMNIROUTE_REPO_PATH" \
-              -type f \
-              \( \
-                -name '.env' \
-                -o \
-                -name '*.log' \
-                -o \
-                -name 'storage.sqlite-wal' \
-                -o \
-                -name 'storage.sqlite-shm' \
-              \) \
-              -print \
-              -quit \
-              | grep -q .; then
-
-              echo "ERROR: Forbidden file found in persisted repository directory."
-
-              exit 1
-            fi
-
-          fi
-
           if git ls-files \
-            | grep -E '(^|/)\.env$|(^|/)logs/|\.log$|storage\.sqlite-(wal|shm)$'; then
+            | grep -E '(^|/)\.env$|(^|/)logs/|\.log$'; then
 
             echo "ERROR: Forbidden files are already tracked by Git."
 
             exit 1
           fi
 
+          echo "No .env or log files are tracked."
+
+          echo
+          echo "Checking backup archive."
+
+          if tar -tzf "$OMNIROUTE_BACKUP_PATH" \
+            | grep -E '(^|/)\.env$|(^|/)logs(/|$)'; then
+
+            echo "ERROR: Backup contains forbidden files."
+
+            exit 1
+          fi
+
+          echo "Backup archive contains no .env or logs."
+
+          echo
           echo "Security check passed."
 
       # ============================================================
-      # 34. Check file sizes
+      # 34. Check GitHub file size limit
       # ============================================================
-      - name: 34. Check GitHub File Size Limits
+      - name: 34. Check GitHub File Size Limit
         run: |
           set -euo pipefail
 
-          if [ -d "$OMNIROUTE_REPO_PATH" ]; then
+          BACKUP_SIZE="$(
+            stat \
+              -c '%s' \
+              "$OMNIROUTE_BACKUP_PATH"
+          )"
 
-            LARGE_FILES="$(
-              find "$OMNIROUTE_REPO_PATH" \
-                -type f \
-                -size +95M \
-                -print \
-                || true
-            )"
+          echo "Backup size: $BACKUP_SIZE bytes"
 
-            if [ -n "$LARGE_FILES" ]; then
+          if [ "$BACKUP_SIZE" -gt 99614720 ]; then
 
-              echo "ERROR: Files larger than 95 MB were found:"
-              echo "$LARGE_FILES"
+            echo "ERROR: Backup exceeds 95 MB."
 
-              exit 1
-            fi
-
+            exit 1
           fi
 
-          if [ -f "$OMNIROUTE_BACKUP_PATH" ]; then
-
-            BACKUP_SIZE="$(
-              stat \
-                -c '%s' \
-                "$OMNIROUTE_BACKUP_PATH"
-            )"
-
-            if [ "$BACKUP_SIZE" -gt 99614720 ]; then
-
-              echo "ERROR: Backup exceeds 95 MB."
-
-              exit 1
-            fi
-
-          fi
-
-          echo "File size check passed."
+          echo "Backup size is within the 95 MB safety limit."
 
       # ============================================================
       # 35. Git status
@@ -1176,20 +1195,20 @@ jobs:
           git status --short
 
           echo
-          echo "===== EXISTING FILE COUNT ====="
+          echo "===== BACKUP FILE ====="
 
-          git ls-files | wc -l
+          ls -lh "$OMNIROUTE_BACKUP_PATH"
 
       # ============================================================
       # 36. Git add
       # ============================================================
-      - name: 36. Git Add Everything
+      - name: 36. Git Add Backup
         run: |
           set -euo pipefail
 
           git add -A
 
-          echo "All repository changes staged."
+          echo "Repository changes staged."
 
           echo
           echo "===== STAGED FILES ====="
@@ -1197,9 +1216,9 @@ jobs:
           git diff --cached --name-status
 
       # ============================================================
-      # 37. Verify staged backup/state and .env exclusion
+      # 37. Verify ONLY backup archive is staged
       # ============================================================
-      - name: 37. Verify Backup And State Are Staged
+      - name: 37. Verify Backup Is Staged
         run: |
           set -euo pipefail
 
@@ -1211,16 +1230,10 @@ jobs:
               exit 1
             }
 
-          if git diff --cached --name-only \
-            | grep -q "^$OMNIROUTE_REPO_PATH/"; then
+          echo "Final backup archive is staged."
 
-            echo "OmniRoute state files are staged."
-
-          else
-
-            echo "WARNING: No OmniRoute state files are staged."
-
-          fi
+          echo
+          echo "===== VERIFY .env IS NOT STAGED ====="
 
           if git diff --cached --name-only \
             | grep -E '(^|/)\.env$'; then
@@ -1232,10 +1245,23 @@ jobs:
 
           echo ".env is not staged."
 
+          echo
+          echo "===== VERIFY LOGS ARE NOT STAGED ====="
+
+          if git diff --cached --name-only \
+            | grep -E '(^|/)logs/|\.log$'; then
+
+            echo "ERROR: log files are staged."
+
+            exit 1
+          fi
+
+          echo "Log files are not staged."
+
       # ============================================================
       # 38. Commit
       # ============================================================
-      - name: 38. Commit Backup And OmniRoute State
+      - name: 38. Commit Backup
         run: |
           set -euo pipefail
 
@@ -1247,7 +1273,7 @@ jobs:
           fi
 
           git commit \
-            -m "chore: persist OmniRoute state and backup"
+            -m "chore: persist OmniRoute backup"
 
           echo "Commit created:"
 
@@ -1267,7 +1293,7 @@ jobs:
           echo "Git push completed successfully."
 
       # ============================================================
-      # 40. Verify remote commit and final state
+      # 40. Verify remote commit and final backup
       # ============================================================
       - name: 40. Final Repository Validation
         run: |
@@ -1287,16 +1313,6 @@ jobs:
           echo "Remote commit: $REMOTE_COMMIT"
 
           test "$LOCAL_COMMIT" = "$REMOTE_COMMIT"
-
-          echo
-          echo "===== PERSISTED OMNIROUTE FILES ====="
-
-          git ls-tree \
-            -r \
-            --name-only \
-            HEAD \
-            "$OMNIROUTE_REPO_PATH" \
-            | sort
 
           echo
           echo "===== FINAL BACKUP ====="
@@ -1324,6 +1340,33 @@ jobs:
           echo ".env is not stored in Git."
 
           echo
+          echo "===== VERIFY LOGS ARE NOT IN GIT ====="
+
+          if git ls-tree \
+            -r \
+            --name-only \
+            HEAD \
+            | grep -E '(^|/)logs/|\.log$'; then
+
+            echo "ERROR: log files exist in the Git commit."
+
+            exit 1
+          fi
+
+          echo "Logs are not stored in Git."
+
+          echo
+          echo "===== VERIFY BACKUP ARCHIVE ====="
+
+          test -f "$OMNIROUTE_BACKUP_PATH"
+
+          gzip -t "$OMNIROUTE_BACKUP_PATH"
+
+          tar -tzf "$OMNIROUTE_BACKUP_PATH" >/dev/null
+
+          echo "Backup archive is valid."
+
+          echo
           echo "===== FINAL SERVICE STATE ====="
 
           if sudo systemctl is-active --quiet omniroute; then
@@ -1334,10 +1377,6 @@ jobs:
           fi
 
           echo "OmniRoute is STOPPED."
-
-          sudo systemctl is-active \
-            omniroute \
-            || true
 
           echo
           echo "=============================================="
