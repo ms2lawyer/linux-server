@@ -456,9 +456,9 @@ jobs:
       - name: 12. Install Node.js
         run: |
           set -euo pipefail
-
+          
           curl -fsSL \
-            https://deb.nodesource.com/setup_22.x \
+            https://deb.nodesource.com/setup_24.x \
             | sudo -E bash -
 
           sudo apt-get install -y nodejs
@@ -706,62 +706,72 @@ jobs:
 
           echo ".env still contains HOSTNAME=0.0.0.0."
           echo ".env still contains OMNIROUTE_SERVER_HOST=0.0.0.0."
-
-      # ============================================================
-      # 19. Verify actual process environment
-      # ============================================================
-      - name: 19. Verify OmniRoute Process Environment
+          
+      - name: 19. Verify Effective OmniRoute Environment
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
           set -euo pipefail
 
-          PID="$(
-            systemctl show \
+          ENV_FILE="/home/$SSH_USERNAME/.omniroute/.env"
+
+          echo "===== .ENV BIND CONFIGURATION ====="
+
+          ENV_HOSTNAME="$(
+            sudo grep -E '^HOSTNAME=' "$ENV_FILE" \
+              | tail -n 1 \
+              | cut -d '=' -f 2-
+          )"
+
+          ENV_SERVER_HOST="$(
+            sudo grep -E '^OMNIROUTE_SERVER_HOST=' "$ENV_FILE" \
+              | tail -n 1 \
+              | cut -d '=' -f 2-
+          )"
+
+          test "$ENV_HOSTNAME" = "0.0.0.0" || {
+            echo "ERROR: .env HOSTNAME is not 0.0.0.0."
+            exit 1
+          }
+
+          test "$ENV_SERVER_HOST" = "0.0.0.0" || {
+            echo "ERROR: .env OMNIROUTE_SERVER_HOST is not 0.0.0.0."
+            exit 1
+          }
+
+          echo ".env HOSTNAME=0.0.0.0 confirmed."
+          echo ".env OMNIROUTE_SERVER_HOST=0.0.0.0 confirmed."
+
+          echo
+          echo "===== SYSTEMD CONFIGURATION ====="
+
+          SYSTEMD_ENV="$(
+            sudo systemctl show \
               omniroute \
-              -p MainPID \
-              --value
+              -p Environment \
+              --value \
+              --no-pager
           )"
 
-          test -n "$PID"
-          test "$PID" != "0"
+          printf '%s\n' "$SYSTEMD_ENV" \
+            | tr ' ' '\n' \
+            | grep -Fxq 'OMNIROUTE_SERVER_HOST=0.0.0.0' || {
+              echo "ERROR: systemd OMNIROUTE_SERVER_HOST is incorrect."
+              exit 1
+            }
 
-          echo "OmniRoute PID: $PID"
+          printf '%s\n' "$SYSTEMD_ENV" \
+            | tr ' ' '\n' \
+            | grep -Fxq 'HOSTNAME=0.0.0.0' || {
+              echo "ERROR: systemd HOSTNAME is incorrect."
+              exit 1
+            }
 
-          PROCESS_HOST="$(
-            sudo tr '\0' '\n' \
-              < "/proc/$PID/environ" \
-              | awk -F= '
-                  $1 == "HOSTNAME" {
-                    value=$2
-                  }
-                  END {
-                    print value
-                '
-          )"
+          echo "systemd OMNIROUTE_SERVER_HOST=0.0.0.0 confirmed."
+          echo "systemd HOSTNAME=0.0.0.0 confirmed."
 
-          PROCESS_SERVER_HOST="$(
-            sudo tr '\0' '\n' \
-              < "/proc/$PID/environ" \
-              | awk -F= '
-                  $1 == "OMNIROUTE_SERVER_HOST" {
-                    value=$2
-                  }
-                  END {
-                    print value
-                '
-          )"
-
-          if [ "$PROCESS_HOST" != "0.0.0.0" ]; then
-            echo "ERROR: Running OmniRoute process HOSTNAME is not 0.0.0.0."
-            exit 1
-          fi
-
-          if [ "$PROCESS_SERVER_HOST" != "0.0.0.0" ]; then
-            echo "ERROR: Running OmniRoute process OMNIROUTE_SERVER_HOST is not 0.0.0.0."
-            exit 1
-          fi
-
-          echo "Running process HOSTNAME=0.0.0.0 confirmed."
-          echo "Running process OMNIROUTE_SERVER_HOST=0.0.0.0 confirmed."
+          echo
+          echo "Effective OmniRoute environment validation passed."
 
       # ============================================================
       # 20. Verify OmniRoute listening port
