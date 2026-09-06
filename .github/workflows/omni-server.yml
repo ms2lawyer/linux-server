@@ -1,3 +1,4 @@
+
 name: Linux OmniRoute Server
 
 on:
@@ -218,8 +219,6 @@ jobs:
       # Excluded from archive:
       #   .env
       #   logs/
-      #
-      # Everything else is restored.
       # ============================================================
       - name: 08. Restore OmniRoute Archive
         env:
@@ -334,9 +333,99 @@ jobs:
           echo "Secret contents were not displayed."
 
       # ============================================================
-      # 10. Verify .env
+      # 10. FORCE OmniRoute bind configuration
+      #
+      # This is intentional.
+      #
+      # The GitHub secret remains the source of the .env file, but
+      # the network binding is enforced here so a stale/default
+      # HOSTNAME value cannot make the service bind to localhost.
+      #
+      # No secret values are printed.
       # ============================================================
-      - name: 10. Verify OmniRoute Environment
+      - name: 10. Enforce OmniRoute Bind Configuration
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          OMNIROUTE_HOME="/home/$SSH_USERNAME/.omniroute"
+          ENV_FILE="$OMNIROUTE_HOME/.env"
+          TEMP_ENV="$RUNNER_TEMP/omniroute.env.normalized"
+
+          sudo test -f "$ENV_FILE"
+          sudo test -s "$ENV_FILE"
+
+          sudo cp "$ENV_FILE" "$TEMP_ENV"
+
+          # Remove existing HOSTNAME assignment(s).
+          sudo sed -i \
+            -E '/^[[:space:]]*(export[[:space:]]+)?HOSTNAME[[:space:]]*=/d' \
+            "$TEMP_ENV"
+
+          # Remove existing OMNIROUTE_SERVER_HOST assignment(s).
+          sudo sed -i \
+            -E '/^[[:space:]]*(export[[:space:]]+)?OMNIROUTE_SERVER_HOST[[:space:]]*=/d' \
+            "$TEMP_ENV"
+
+          # Add the authoritative values.
+          printf '\nHOSTNAME=0.0.0.0\n' \
+            | sudo tee -a "$TEMP_ENV" >/dev/null
+
+          printf 'OMNIROUTE_SERVER_HOST=0.0.0.0\n' \
+            | sudo tee -a "$TEMP_ENV" >/dev/null
+
+          sudo install \
+            -o "$SSH_USERNAME" \
+            -g "$SSH_USERNAME" \
+            -m 600 \
+            "$TEMP_ENV" \
+            "$ENV_FILE"
+
+          sudo rm -f "$TEMP_ENV"
+
+          echo "OmniRoute bind configuration enforced."
+
+          # Verify exact values without printing the complete .env.
+          HOSTNAME_VALUE="$(
+            sudo awk -F= '
+              $1 == "HOSTNAME" {
+                value=$2
+              }
+              END {
+                print value
+              }
+            ' "$ENV_FILE"
+          )"
+
+          SERVER_HOST_VALUE="$(
+            sudo awk -F= '
+              $1 == "OMNIROUTE_SERVER_HOST" {
+                value=$2
+              }
+              END {
+                print value
+              }
+            ' "$ENV_FILE"
+          )"
+
+          if [ "$HOSTNAME_VALUE" != "0.0.0.0" ]; then
+            echo "ERROR: .env HOSTNAME is not 0.0.0.0."
+            exit 1
+          fi
+
+          if [ "$SERVER_HOST_VALUE" != "0.0.0.0" ]; then
+            echo "ERROR: .env OMNIROUTE_SERVER_HOST is not 0.0.0.0."
+            exit 1
+          fi
+
+          echo ".env HOSTNAME=0.0.0.0 confirmed."
+          echo ".env OMNIROUTE_SERVER_HOST=0.0.0.0 confirmed."
+
+      # ============================================================
+      # 11. Verify .env
+      # ============================================================
+      - name: 11. Verify OmniRoute Environment
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -362,9 +451,9 @@ jobs:
           echo "Contents are intentionally not displayed."
 
       # ============================================================
-      # 11. Install Node.js
+      # 12. Install Node.js
       # ============================================================
-      - name: 11. Install Node.js
+      - name: 12. Install Node.js
         run: |
           set -euo pipefail
 
@@ -378,9 +467,9 @@ jobs:
           npm --version
 
       # ============================================================
-      # 12. Install OmniRoute
+      # 13. Install OmniRoute
       # ============================================================
-      - name: 12. Install OmniRoute
+      - name: 13. Install OmniRoute
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -405,9 +494,9 @@ jobs:
           USER_SCRIPT
 
       # ============================================================
-      # 13. Verify OmniRoute installation
+      # 14. Verify OmniRoute installation
       # ============================================================
-      - name: 13. Verify OmniRoute Installation
+      - name: 14. Verify OmniRoute Installation
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -427,16 +516,23 @@ jobs:
           echo "OmniRoute executable and .env are both available."
 
       # ============================================================
-      # 14. Create systemd service
+      # 15. Create systemd service
       #
       # IMPORTANT:
-      # OmniRoute >= v3.8.39 uses OMNIROUTE_SERVER_HOST for
-      # omniroute serve.
       #
-      # Do NOT use HOSTNAME because POSIX shells/systemd environments
-      # already use HOSTNAME for the machine hostname.
+      # OmniRoute >= v3.8.39 uses:
+      #
+      #   OMNIROUTE_SERVER_HOST
+      #
+      # for the server bind address.
+      #
+      # HOSTNAME is NOT used as the primary bind configuration.
+      #
+      # The explicit Environment= value is intentionally placed
+      # AFTER EnvironmentFile so the service-level value is
+      # authoritative.
       # ============================================================
-      - name: 14. Create OmniRoute systemd Service
+      - name: 15. Create OmniRoute systemd Service
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -470,9 +566,10 @@ jobs:
 
           EnvironmentFile=$OMNIROUTE_HOME/.env
 
-          # OmniRoute's actual bind-address variable.
-          # Do NOT use HOSTNAME here.
+          # AUTHORITATIVE OmniRoute bind address.
           Environment=OMNIROUTE_SERVER_HOST=0.0.0.0
+
+          # Keep the process environment consistent as well.
           Environment=HOSTNAME=0.0.0.0
 
           ExecStart=$OMNIROUTE_BIN
@@ -497,9 +594,41 @@ jobs:
           sudo systemctl cat omniroute
 
       # ============================================================
-      # 15. Start OmniRoute
+      # 16. Verify systemd configuration BEFORE starting
       # ============================================================
-      - name: 15. Start OmniRoute
+      - name: 16. Verify Systemd OmniRoute Configuration
+        run: |
+          set -euo pipefail
+
+          echo "===== SYSTEMD ENVIRONMENT ====="
+
+          SYSTEMD_ENV="$(
+            sudo systemctl show \
+              omniroute \
+              -p Environment \
+              --no-pager
+          )"
+
+          echo "$SYSTEMD_ENV" \
+            | grep -F 'OMNIROUTE_SERVER_HOST=0.0.0.0' >/dev/null || {
+              echo "ERROR: OMNIROUTE_SERVER_HOST=0.0.0.0 is missing."
+              exit 1
+            }
+
+          echo "OMNIROUTE_SERVER_HOST=0.0.0.0 confirmed."
+
+          echo "$SYSTEMD_ENV" \
+            | grep -F 'HOSTNAME=0.0.0.0' >/dev/null || {
+              echo "ERROR: HOSTNAME=0.0.0.0 is missing."
+              exit 1
+            }
+
+          echo "HOSTNAME=0.0.0.0 confirmed."
+
+      # ============================================================
+      # 17. Start OmniRoute
+      # ============================================================
+      - name: 17. Start OmniRoute
         run: |
           set -euo pipefail
 
@@ -512,6 +641,7 @@ jobs:
           if ! sudo systemctl is-active --quiet omniroute; then
             echo "ERROR: OmniRoute failed to start."
 
+            echo
             echo "===== JOURNAL ====="
 
             sudo journalctl \
@@ -525,9 +655,118 @@ jobs:
           echo "OmniRoute is running."
 
       # ============================================================
-      # 16. Verify OmniRoute listening port
+      # 18. Verify .env AFTER startup
+      #
+      # This is important because the original problem was that
+      # .env appeared to contain HOSTNAME=127.0.0.1 after startup.
+      #
+      # If OmniRoute changes the file, this step will catch it.
       # ============================================================
-      - name: 16. Verify OmniRoute Port
+      - name: 18. Verify Environment After OmniRoute Startup
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          ENV_FILE="/home/$SSH_USERNAME/.omniroute/.env"
+
+          HOSTNAME_VALUE="$(
+            sudo awk -F= '
+              $1 == "HOSTNAME" {
+                value=$2
+              }
+              END {
+                print value
+              }
+            ' "$ENV_FILE"
+          )"
+
+          SERVER_HOST_VALUE="$(
+            sudo awk -F= '
+              $1 == "OMNIROUTE_SERVER_HOST" {
+                value=$2
+              }
+              END {
+                print value
+              }
+            ' "$ENV_FILE"
+          )"
+
+          if [ "$HOSTNAME_VALUE" != "0.0.0.0" ]; then
+            echo "ERROR: OmniRoute changed .env HOSTNAME."
+            echo "Expected: HOSTNAME=0.0.0.0"
+            echo "Actual value is not the expected bind address."
+            exit 1
+          fi
+
+          if [ "$SERVER_HOST_VALUE" != "0.0.0.0" ]; then
+            echo "ERROR: .env OMNIROUTE_SERVER_HOST is not 0.0.0.0."
+            exit 1
+          fi
+
+          echo ".env still contains HOSTNAME=0.0.0.0."
+          echo ".env still contains OMNIROUTE_SERVER_HOST=0.0.0.0."
+
+      # ============================================================
+      # 19. Verify actual process environment
+      # ============================================================
+      - name: 19. Verify OmniRoute Process Environment
+        run: |
+          set -euo pipefail
+
+          PID="$(
+            systemctl show \
+              omniroute \
+              -p MainPID \
+              --value
+          )"
+
+          test -n "$PID"
+          test "$PID" != "0"
+
+          echo "OmniRoute PID: $PID"
+
+          PROCESS_HOST="$(
+            sudo tr '\0' '\n' \
+              < "/proc/$PID/environ" \
+              | awk -F= '
+                  $1 == "HOSTNAME" {
+                    value=$2
+                  }
+                  END {
+                    print value
+                '
+          )"
+
+          PROCESS_SERVER_HOST="$(
+            sudo tr '\0' '\n' \
+              < "/proc/$PID/environ" \
+              | awk -F= '
+                  $1 == "OMNIROUTE_SERVER_HOST" {
+                    value=$2
+                  }
+                  END {
+                    print value
+                '
+          )"
+
+          if [ "$PROCESS_HOST" != "0.0.0.0" ]; then
+            echo "ERROR: Running OmniRoute process HOSTNAME is not 0.0.0.0."
+            exit 1
+          fi
+
+          if [ "$PROCESS_SERVER_HOST" != "0.0.0.0" ]; then
+            echo "ERROR: Running OmniRoute process OMNIROUTE_SERVER_HOST is not 0.0.0.0."
+            exit 1
+          fi
+
+          echo "Running process HOSTNAME=0.0.0.0 confirmed."
+          echo "Running process OMNIROUTE_SERVER_HOST=0.0.0.0 confirmed."
+
+      # ============================================================
+      # 20. Verify OmniRoute listening port
+      # ============================================================
+      - name: 20. Verify OmniRoute Port
         run: |
           set -euo pipefail
 
@@ -557,38 +796,14 @@ jobs:
           exit 1
 
       # ============================================================
-      # 16A. Verify OmniRoute bind address is 0.0.0.0
+      # 21. Verify OmniRoute bind address
       #
-      # IMPORTANT:
-      # This verifies the REAL socket.
-      # It does not assume an environment variable is sufficient.
+      # This verifies the REAL TCP socket.
       # ============================================================
-      - name: 16A. Verify OmniRoute Bind Address
+      - name: 21. Verify OmniRoute Bind Address
         run: |
           set -euo pipefail
 
-          echo "===== SYSTEMD OMNIROUTE_SERVER_HOST ====="
-
-          sudo systemctl show \
-            omniroute \
-            -p Environment \
-            --no-pager \
-            | grep -F 'OMNIROUTE_SERVER_HOST=0.0.0.0' || {
-
-              echo "ERROR: systemd omniroute service does not contain:"
-              echo "OMNIROUTE_SERVER_HOST=0.0.0.0"
-
-              echo
-              echo "===== SERVICE FILE ====="
-
-              sudo systemctl cat omniroute
-
-              exit 1
-            }
-
-          echo "OMNIROUTE_SERVER_HOST=0.0.0.0 confirmed."
-
-          echo
           echo "===== LISTENING SOCKET ====="
 
           LISTENING_SOCKET="$(
@@ -609,7 +824,10 @@ jobs:
           else
 
             echo
-            echo "ERROR: OmniRoute is NOT listening on 0.0.0.0:$OMNIROUTE_PORT or [::]:$OMNIROUTE_PORT."
+            echo "ERROR: OmniRoute is NOT listening on:"
+            echo "0.0.0.0:$OMNIROUTE_PORT"
+            echo "or"
+            echo "[::]:$OMNIROUTE_PORT"
 
             echo
             echo "===== FULL SOCKET INFORMATION ====="
@@ -628,9 +846,9 @@ jobs:
           fi
 
       # ============================================================
-      # 17. Verify SQLite database
+      # 22. Verify SQLite database
       # ============================================================
-      - name: 17. Verify OmniRoute Database
+      - name: 22. Verify OmniRoute Database
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -655,9 +873,9 @@ jobs:
           echo "SQLite integrity check passed."
 
       # ============================================================
-      # 18. OmniRoute health check
+      # 23. OmniRoute health check
       # ============================================================
-      - name: 18. OmniRoute Health Check
+      - name: 23. OmniRoute Health Check
         run: |
           set -euo pipefail
 
@@ -679,9 +897,9 @@ jobs:
           fi
 
       # ============================================================
-      # 19. Setup Tailscale
+      # 24. Setup Tailscale
       # ============================================================
-      - name: 19. Setup Tailscale
+      - name: 24. Setup Tailscale
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
@@ -703,9 +921,9 @@ jobs:
           echo "Tailscale is connected."
 
       # ============================================================
-      # 20. Final startup validation
+      # 25. Final startup validation
       # ============================================================
-      - name: 20. Final Startup Validation
+      - name: 25. Final Startup Validation
         run: |
           set -euo pipefail
 
@@ -743,9 +961,9 @@ jobs:
           echo "OmniRoute startup validation completed."
 
       # ============================================================
-      # 21. Send Tailscale connection information to Telegram
+      # 26. Send Tailscale connection information to Telegram
       # ============================================================
-      - name: 21. Send Tailscale Connection Information To Telegram
+      - name: 26. Send Tailscale Connection Information To Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -813,6 +1031,9 @@ jobs:
           Port:
           $OMNIROUTE_PORT
 
+          Bind:
+          0.0.0.0
+
           ━━━━━━━━━━━━━━━━━━━━
           Status
           ━━━━━━━━━━━━━━━━━━━━
@@ -844,9 +1065,9 @@ jobs:
           echo "Telegram notification sent successfully."
 
       # ============================================================
-      # 22. Keep runner alive for 6 hours
+      # 27. Keep runner alive for 6 hours
       # ============================================================
-      - name: 22. Keep Runner Alive For 6 Hours
+      - name: 27. Keep Runner Alive For 6 Hours
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -898,9 +1119,9 @@ jobs:
           echo "6-hour runtime period completed."
 
       # ============================================================
-      # 23. Stop OmniRoute before persistence
+      # 28. Stop OmniRoute before persistence
       # ============================================================
-      - name: 23. Stop OmniRoute Before Persistence
+      - name: 28. Stop OmniRoute Before Persistence
         run: |
           set -euo pipefail
 
@@ -923,9 +1144,9 @@ jobs:
           echo "OmniRoute is stopped."
 
       # ============================================================
-      # 24. SQLite checkpoint
+      # 29. SQLite checkpoint
       # ============================================================
-      - name: 24. Checkpoint SQLite Database
+      - name: 29. Checkpoint SQLite Database
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -946,9 +1167,9 @@ jobs:
           echo "SQLite checkpoint completed."
 
       # ============================================================
-      # 25. Validate final SQLite database
+      # 30. Validate final SQLite database
       # ============================================================
-      - name: 25. Validate Final SQLite Database
+      - name: 30. Validate Final SQLite Database
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -969,17 +1190,15 @@ jobs:
           echo "Final SQLite integrity check passed."
 
       # ============================================================
-      # 26. Create final OmniRoute backup archive
+      # 31. Create final OmniRoute backup archive
       #
-      # Archive contains the CONTENTS of .omniroute.
-      #
-      # Excluded ONLY:
+      # Excluded:
       #   .env
       #   logs/
       #
       # Everything else is included.
       # ============================================================
-      - name: 26. Create Final OmniRoute Backup
+      - name: 31. Create Final OmniRoute Backup
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -1008,9 +1227,9 @@ jobs:
           ls -lh "$FINAL_BACKUP"
 
       # ============================================================
-      # 27. Authenticate GitHub CLI using GIT_TOKEN over HTTPS
+      # 32. Authenticate GitHub CLI using GIT_TOKEN over HTTPS
       # ============================================================
-      - name: 27. Authenticate GitHub CLI
+      - name: 32. Authenticate GitHub CLI
         env:
           GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
         run: |
@@ -1032,9 +1251,9 @@ jobs:
           echo "GitHub CLI HTTPS authentication configured."
 
       # ============================================================
-      # 28. Verify GitHub repository
+      # 33. Verify GitHub repository
       # ============================================================
-      - name: 28. Verify GitHub Repository
+      - name: 33. Verify GitHub Repository
         run: |
           set -euo pipefail
 
@@ -1045,9 +1264,9 @@ jobs:
           echo "GitHub repository verified."
 
       # ============================================================
-      # 29. Synchronize repository before modifying backup
+      # 34. Synchronize repository before modifying backup
       # ============================================================
-      - name: 29. Synchronize Git Repository
+      - name: 34. Synchronize Git Repository
         run: |
           set -euo pipefail
 
@@ -1077,11 +1296,9 @@ jobs:
           echo "Repository synchronized with origin/$BRANCH."
 
       # ============================================================
-      # 30. Remove legacy individual OmniRoute state
-      #
-      # New architecture stores ONLY one backup archive.
+      # 35. Remove legacy individual OmniRoute state
       # ============================================================
-      - name: 30. Remove Legacy OmniRoute State
+      - name: 35. Remove Legacy OmniRoute State
         run: |
           set -euo pipefail
 
@@ -1097,9 +1314,9 @@ jobs:
           echo "Legacy OmniRoute state removed."
 
       # ============================================================
-      # 31. Persist ONLY final backup archive
+      # 36. Persist ONLY final backup archive
       # ============================================================
-      - name: 31. Persist Final Backup Archive
+      - name: 36. Persist Final Backup Archive
         run: |
           set -euo pipefail
 
@@ -1126,9 +1343,9 @@ jobs:
           ls -lh "$OMNIROUTE_BACKUP_PATH"
 
       # ============================================================
-      # 32. Verify archive does NOT contain .env or logs
+      # 37. Verify archive does NOT contain .env or logs
       # ============================================================
-      - name: 32. Verify Backup Contents
+      - name: 37. Verify Backup Contents
         run: |
           set -euo pipefail
 
@@ -1170,9 +1387,9 @@ jobs:
           echo "Backup contents security check passed."
 
       # ============================================================
-      # 33. Verify no .env/log files are being committed
+      # 38. Verify no .env/log files are being committed
       # ============================================================
-      - name: 33. Security Check Before Commit
+      - name: 38. Security Check Before Commit
         run: |
           set -euo pipefail
 
@@ -1205,9 +1422,9 @@ jobs:
           echo "Security check passed."
 
       # ============================================================
-      # 34. Check GitHub file size limit
+      # 39. Check GitHub file size limit
       # ============================================================
-      - name: 34. Check GitHub File Size Limit
+      - name: 39. Check GitHub File Size Limit
         run: |
           set -euo pipefail
 
@@ -1229,9 +1446,9 @@ jobs:
           echo "Backup size is within the 95 MB safety limit."
 
       # ============================================================
-      # 35. Git status
+      # 40. Git status
       # ============================================================
-      - name: 35. Git Status Before Commit
+      - name: 40. Git Status Before Commit
         run: |
           set -euo pipefail
 
@@ -1245,9 +1462,9 @@ jobs:
           ls -lh "$OMNIROUTE_BACKUP_PATH"
 
       # ============================================================
-      # 36. Git add
+      # 41. Git add
       # ============================================================
-      - name: 36. Git Add Backup
+      - name: 41. Git Add Backup
         run: |
           set -euo pipefail
 
@@ -1261,9 +1478,9 @@ jobs:
           git diff --cached --name-status
 
       # ============================================================
-      # 37. Verify backup is staged
+      # 42. Verify backup is staged
       # ============================================================
-      - name: 37. Verify Backup Is Staged
+      - name: 42. Verify Backup Is Staged
         run: |
           set -euo pipefail
 
@@ -1304,9 +1521,9 @@ jobs:
           echo "Log files are not staged."
 
       # ============================================================
-      # 38. Commit
+      # 43. Commit
       # ============================================================
-      - name: 38. Commit Backup
+      - name: 43. Commit Backup
         run: |
           set -euo pipefail
 
@@ -1325,9 +1542,9 @@ jobs:
           git log -1 --oneline
 
       # ============================================================
-      # 39. Push using GitHub CLI HTTPS credentials
+      # 44. Push using GitHub CLI HTTPS credentials
       # ============================================================
-      - name: 39. Push Using GitHub CLI Authentication
+      - name: 44. Push Using GitHub CLI Authentication
         run: |
           set -euo pipefail
 
@@ -1338,9 +1555,9 @@ jobs:
           echo "Git push completed successfully."
 
       # ============================================================
-      # 40. Verify remote commit and final backup
+      # 45. Verify remote commit and final backup
       # ============================================================
-      - name: 40. Final Repository Validation
+      - name: 45. Final Repository Validation
         run: |
           set -euo pipefail
 
