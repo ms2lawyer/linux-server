@@ -486,7 +486,7 @@ jobs:
 
           npm config set prefix "$NPM_PREFIX"
 
-          npm install -g "omniroute@3.8.49"
+          npm install -g omniroute
 
           test -x "$NPM_PREFIX/bin/omniroute"
 
