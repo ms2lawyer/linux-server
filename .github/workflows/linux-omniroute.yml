@@ -1,4 +1,3 @@
-```yaml
 name: Linux OmniRoute Server
 
 on:
@@ -1800,4 +1799,3 @@ jobs:
             echo "OmniRoute persistence was NOT authorized."
             echo "The previous known-good repository database was preserved."
           fi
-```
