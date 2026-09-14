@@ -1,0 +1,11 @@
+# Secrets
+.env
+
+# SQLite live journal files
+*.sqlite-wal
+*.sqlite-shm
+
+# Explicitly keep SQLite database snapshots
+!*.sqlite
+!db_backups/
+!db_backups/*.sqlite
