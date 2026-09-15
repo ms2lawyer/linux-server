@@ -211,7 +211,9 @@ jobs:
             "$REPO_DB" \
             "$DB"
 
-          sudo -u "$SSH_USERNAME" sqlite3 "$DB" "PRAGMA integrity_check;" |
+          sudo -u "$SSH_USERNAME" \
+            sqlite3 "$DB" \
+            "PRAGMA integrity_check;" |
             grep -Fxq "ok"
 
           echo "SQLite database restored successfully."
@@ -234,7 +236,10 @@ jobs:
           printf '%s' "$OMNIROUTE_ENV" > "$TEMP_ENV"
 
           test -s "$TEMP_ENV"
-          grep -Eq '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' "$TEMP_ENV"
+
+          grep -Eq \
+            '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' \
+            "$TEMP_ENV"
 
           sudo install \
             -o "$SSH_USERNAME" \
@@ -260,6 +265,11 @@ jobs:
           ENV_FILE="$OMNIROUTE_HOME/.env"
           TEMP_ENV="$RUNNER_TEMP/omniroute.env.normalized"
 
+          echo "Normalizing OmniRoute environment..."
+
+          # .env is mode 600 and belongs to SSH_USERNAME.
+          # Therefore all reads/writes requiring access use sudo.
+
           sudo cp "$ENV_FILE" "$TEMP_ENV"
 
           sudo sed -i -E \
@@ -270,8 +280,11 @@ jobs:
             '/^[[:space:]]*(export[[:space:]]+)?OMNIROUTE_SERVER_HOST[[:space:]]*=/d' \
             "$TEMP_ENV"
 
-          printf '\nHOSTNAME=0.0.0.0\n' | sudo tee -a "$TEMP_ENV" >/dev/null
-          printf 'OMNIROUTE_SERVER_HOST=0.0.0.0\n' | sudo tee -a "$TEMP_ENV" >/dev/null
+          printf '\nHOSTNAME=0.0.0.0\n' |
+            sudo tee -a "$TEMP_ENV" >/dev/null
+
+          printf 'OMNIROUTE_SERVER_HOST=0.0.0.0\n' |
+            sudo tee -a "$TEMP_ENV" >/dev/null
 
           sudo install \
             -o "$SSH_USERNAME" \
@@ -282,10 +295,18 @@ jobs:
 
           sudo rm -f "$TEMP_ENV"
 
-          grep -Eq '^HOSTNAME=0\.0\.0\.0$' "$ENV_FILE"
-          grep -Eq '^OMNIROUTE_SERVER_HOST=0\.0\.0\.0$' "$ENV_FILE"
+          # IMPORTANT:
+          # ENV_FILE is 600 and owned by SSH_USERNAME.
+          # The GitHub runner cannot read it directly.
+          sudo grep -Eq \
+            '^HOSTNAME=0\.0\.0\.0$' \
+            "$ENV_FILE"
 
-          grep -Eq \
+          sudo grep -Eq \
+            '^OMNIROUTE_SERVER_HOST=0\.0\.0\.0$' \
+            "$ENV_FILE"
+
+          sudo grep -Eq \
             '^[[:space:]]*(export[[:space:]]+)?STORAGE_ENCRYPTION_KEY[[:space:]]*=[[:space:]]*[^[:space:]]' \
             "$ENV_FILE" || {
               echo "ERROR: STORAGE_ENCRYPTION_KEY is missing or empty."
@@ -299,6 +320,8 @@ jobs:
           test "$PERMISSIONS" = "600"
 
           echo "Environment validation passed."
+          echo "Owner: $OWNER"
+          echo "Permissions: $PERMISSIONS"
 
       # ==========================================================
       # 11. INSTALL NODE.JS
@@ -307,7 +330,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+          curl -fsSL https://deb.nodesource.com/setup_24.x |
+            sudo -E bash -
+
           sudo apt-get install -y nodejs
 
           echo "Node: $(node --version)"
@@ -333,11 +358,13 @@ jobs:
           export PATH="$NPM_PREFIX/bin:$PATH"
 
           mkdir -p "$NPM_PREFIX"
+
           npm config set prefix "$NPM_PREFIX"
 
           npm install -g "omniroute@$OMNIROUTE_VERSION"
 
           test -x "$NPM_PREFIX/bin/omniroute"
+
           "$NPM_PREFIX/bin/omniroute" --version
 
           USER_SCRIPT
@@ -355,14 +382,19 @@ jobs:
 
           test -x "$OMNIROUTE_BIN"
 
-          INSTALLED_VERSION="$(sudo -u "$SSH_USERNAME" "$OMNIROUTE_BIN" --version)"
+          INSTALLED_VERSION="$(
+            sudo -u "$SSH_USERNAME" \
+              "$OMNIROUTE_BIN" \
+              --version
+          )"
 
           echo "Installed version: $INSTALLED_VERSION"
 
-          echo "$INSTALLED_VERSION" | grep -F "$OMNIROUTE_VERSION" >/dev/null || {
-            echo "ERROR: Installed OmniRoute version does not match $OMNIROUTE_VERSION."
-            exit 1
-          }
+          echo "$INSTALLED_VERSION" |
+            grep -F "$OMNIROUTE_VERSION" >/dev/null || {
+              echo "ERROR: Installed OmniRoute version does not match $OMNIROUTE_VERSION."
+              exit 1
+            }
 
       # ==========================================================
       # 14. CREATE SYSTEMD SERVICE
@@ -424,8 +456,11 @@ jobs:
 
           for i in {1..30}; do
             if sudo systemctl is-active --quiet omniroute &&
-               curl -fsS --max-time 5 \
+               curl \
+                 -fsS \
+                 --max-time 5 \
                  "$OMNIROUTE_BASE_URL/v1/models" >/dev/null 2>&1; then
+
               echo "OmniRoute is healthy."
               exit 0
             fi
@@ -434,8 +469,17 @@ jobs:
           done
 
           echo "ERROR: OmniRoute failed startup/health validation."
-          sudo systemctl --no-pager --full status omniroute || true
-          sudo journalctl -u omniroute --no-pager -n 150 || true
+
+          sudo systemctl \
+            --no-pager \
+            --full \
+            status omniroute || true
+
+          sudo journalctl \
+            -u omniroute \
+            --no-pager \
+            -n 150 || true
+
           exit 1
 
       # ==========================================================
@@ -487,10 +531,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          OMNIROUTE_TEST_DIR="$GITHUB_WORKSPACE/omniroute-tests"
+          # IMPORTANT:
+          # Do NOT place this under GITHUB_WORKSPACE.
+          # The workspace belongs to the GitHub runner, while this
+          # script runs as SSH_USERNAME.
+          OMNIROUTE_TEST_DIR="/home/$SSH_USERNAME/omniroute-tests"
 
-          sudo -u "$SSH_USERNAME" mkdir -p "$OMNIROUTE_TEST_DIR"
-          sudo -u "$SSH_USERNAME" mkdir -p "$OMNIROUTE_TEST_DIR/history"
+          sudo mkdir -p "$OMNIROUTE_TEST_DIR"
+          sudo mkdir -p "$OMNIROUTE_TEST_DIR/history"
+
+          sudo chown -R \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$OMNIROUTE_TEST_DIR"
 
           sudo tee "$OMNIROUTE_TEST_DIR/check-and-sync.sh" >/dev/null <<'SCRIPT'
           #!/usr/bin/env bash
@@ -516,6 +568,7 @@ jobs:
           COMBO_REPORT="$HISTORY_DIR/combos-$STAMP.txt"
 
           CURL_AUTH=()
+
           if [[ -n "$API_KEY" ]]; then
             CURL_AUTH=(-H "Authorization: Bearer $API_KEY")
           fi
@@ -554,7 +607,10 @@ jobs:
           fi
 
           echo "Testing ${#MODELS[@]} concrete models..."
-          printf 'timestamp\tstatus\tlatency_ms\tmodel\n' > "$REPORT"
+
+          printf \
+            'timestamp\tstatus\tlatency_ms\tmodel\n' \
+            > "$REPORT"
 
           test_model() {
             local model="$1"
@@ -564,13 +620,20 @@ jobs:
             local end
             local elapsed
             local http_code
+            local status
 
-            key="$(printf '%s' "$model" | sha256sum | cut -d' ' -f1)"
+            key="$(
+              printf '%s' "$model" |
+              sha256sum |
+              cut -d' ' -f1
+            )"
+
             tmp="$TEST_DIR/.model-$key"
 
             start="$(date +%s%3N)"
 
             set +e
+
             http_code="$(
               curl \
                 --silent \
@@ -585,7 +648,10 @@ jobs:
                   '{
                     model: $model,
                     messages: [
-                      {role: "user", content: "Reply with exactly OK"}
+                      {
+                        role: "user",
+                        content: "Reply with exactly OK"
+                      }
                     ],
                     max_tokens: 16,
                     stream: false
@@ -593,19 +659,33 @@ jobs:
                 "$BASE_URL/v1/chat/completions" \
                 2>"$tmp.error"
             )"
-            local status=$?
+
+            status=$?
+
             set -e
 
             end="$(date +%s%3N)"
             elapsed=$((end - start))
 
             if [[ "$status" -eq 0 && "$http_code" =~ ^2 ]]; then
-              printf '%s\tPASS\t%s\t%s\n' \
-                "$NOW_UTC" "$elapsed" "$model" >> "$REPORT"
-              rm -f "$tmp.response" "$tmp.error"
+              printf \
+                '%s\tPASS\t%s\t%s\n' \
+                "$NOW_UTC" \
+                "$elapsed" \
+                "$model" \
+                >> "$REPORT"
+
+              rm -f \
+                "$tmp.response" \
+                "$tmp.error"
+
             else
-              printf '%s\tFAIL\t%s\t%s\n' \
-                "$NOW_UTC" "$elapsed" "$model" >> "$REPORT"
+              printf \
+                '%s\tFAIL\t%s\t%s\n' \
+                "$NOW_UTC" \
+                "$elapsed" \
+                "$model" \
+                >> "$REPORT"
 
               {
                 echo "MODEL=$model"
@@ -618,11 +698,14 @@ jobs:
                 echo
               } >> "$TEST_DIR/last-failures.log"
 
-              rm -f "$tmp.response" "$tmp.error"
+              rm -f \
+                "$tmp.response" \
+                "$tmp.error"
             fi
           }
 
           active=0
+
           for model in "${MODELS[@]}"; do
             test_model "$model" &
             active=$((active + 1))
@@ -643,6 +726,7 @@ jobs:
           echo
           echo "PASS count: $PASS_COUNT"
           echo "PASS models:"
+
           cat "$PASS_LIST" || true
 
           if [[ "$PASS_COUNT" -eq 0 ]]; then
@@ -652,33 +736,33 @@ jobs:
 
           # --------------------------------------------------------
           # Model ordering/classification.
-          #
-          # This is intentionally based only on health-test results.
-          # A PASS means the basic OpenAI-compatible smoke test works;
-          # it does NOT prove tool calling, reasoning quality, context
-          # length, or production suitability.
           # --------------------------------------------------------
 
           sort -t$'\t' -k3,3n "$REPORT" |
             awk -F'\t' '$2=="PASS"{print $3 "\t" $4}' |
-            awk -F'\t' '!seen[$2]++' > "$TEST_DIR/passed-by-latency.tsv"
+            awk -F'\t' '!seen[$2]++' \
+            > "$TEST_DIR/passed-by-latency.tsv"
 
           awk -F'\t' '
             {
               m=tolower($2)
+
               if (
                 m ~ /code/ ||
                 m ~ /coder/ ||
                 m ~ /codestral/ ||
                 m ~ /codex/ ||
                 m ~ /deepseek/
-              ) print $1 "\t" $2
+              )
+                print $1 "\t" $2
             }
-          ' "$TEST_DIR/passed-by-latency.tsv" > "$TEST_DIR/passed-coding.tsv"
+          ' "$TEST_DIR/passed-by-latency.tsv" \
+            > "$TEST_DIR/passed-coding.tsv"
 
           awk -F'\t' '
             {
               m=tolower($2)
+
               if (
                 m ~ /reason/ ||
                 m ~ /think/ ||
@@ -686,38 +770,49 @@ jobs:
                 m ~ /(^|[^0-9])o1([^0-9]|$)/ ||
                 m ~ /(^|[^0-9])o3([^0-9]|$)/ ||
                 m ~ /(^|[^0-9])o4([^0-9]|$)/
-              ) print $1 "\t" $2
+              )
+                print $1 "\t" $2
             }
-          ' "$TEST_DIR/passed-by-latency.tsv" > "$TEST_DIR/passed-reasoning.tsv"
+          ' "$TEST_DIR/passed-by-latency.tsv" \
+            > "$TEST_DIR/passed-reasoning.tsv"
 
           head -n 8 \
-            "$TEST_DIR/passed-by-latency.tsv" > "$TEST_DIR/passed-fast.tsv"
+            "$TEST_DIR/passed-by-latency.tsv" \
+            > "$TEST_DIR/passed-fast.tsv"
 
           head -n 8 \
-            "$TEST_DIR/passed-coding.tsv" > "$TEST_DIR/passed-coding-fast.tsv"
+            "$TEST_DIR/passed-coding.tsv" \
+            > "$TEST_DIR/passed-coding-fast.tsv"
 
-          # If classification produces an empty pool, fall back to all
-          # currently healthy models rather than deleting the combo.
           [[ -s "$TEST_DIR/passed-coding.tsv" ]] ||
-            cp "$TEST_DIR/passed-by-latency.tsv" "$TEST_DIR/passed-coding.tsv"
+            cp \
+              "$TEST_DIR/passed-by-latency.tsv" \
+              "$TEST_DIR/passed-coding.tsv"
 
           [[ -s "$TEST_DIR/passed-coding-fast.tsv" ]] ||
-            cp "$TEST_DIR/passed-coding.tsv" "$TEST_DIR/passed-coding-fast.tsv"
+            cp \
+              "$TEST_DIR/passed-coding.tsv" \
+              "$TEST_DIR/passed-coding-fast.tsv"
 
           [[ -s "$TEST_DIR/passed-reasoning.tsv" ]] ||
-            cp "$TEST_DIR/passed-by-latency.tsv" "$TEST_DIR/passed-reasoning.tsv"
+            cp \
+              "$TEST_DIR/passed-by-latency.tsv" \
+              "$TEST_DIR/passed-reasoning.tsv"
 
           [[ -s "$TEST_DIR/passed-fast.tsv" ]] ||
-            cp "$TEST_DIR/passed-by-latency.tsv" "$TEST_DIR/passed-fast.tsv"
+            cp \
+              "$TEST_DIR/passed-by-latency.tsv" \
+              "$TEST_DIR/passed-fast.tsv"
 
           # --------------------------------------------------------
           # Combo management.
-          #
-          # OmniRoute 3.8.49 supports creating combos via POST and
-          # editing them via PUT. Do not use PATCH here.
+          # OmniRoute 3.8.49:
+          #   POST = create
+          #   PUT  = update
           # --------------------------------------------------------
 
           combo_auth=()
+
           if [[ -n "$API_KEY" ]]; then
             combo_auth=(-H "Authorization: Bearer $API_KEY")
           fi
@@ -730,7 +825,8 @@ jobs:
             --fail \
             --max-time 15 \
             "${combo_auth[@]}" \
-            "$BASE_URL/api/combos" > "$COMBOS_JSON"
+            "$BASE_URL/api/combos" \
+            > "$COMBOS_JSON"
 
           get_combo_id() {
             local name="$1"
@@ -752,7 +848,8 @@ jobs:
                | (.models // [])
                | .[]
                | (.model // .id // empty)' \
-              "$COMBOS_JSON" 2>/dev/null || true
+              "$COMBOS_JSON" \
+              2>/dev/null || true
           }
 
           model_object() {
@@ -779,13 +876,14 @@ jobs:
 
             get_existing_models "$combo_name" |
               while IFS= read -r model; do
-                [[ -n "$model" ]] && printf '%s\n' "$model"
+                [[ -n "$model" ]] &&
+                  printf '%s\n' "$model"
               done > "$tmp_existing"
 
             : > "$tmp_all"
 
-            # Keep existing combo members first, but only when they passed
-            # the current health cycle.
+            # Keep existing combo members first,
+            # but only if they passed this health cycle.
             while IFS= read -r model; do
               [[ -z "$model" ]] && continue
 
@@ -794,7 +892,7 @@ jobs:
               fi
             done < "$tmp_existing"
 
-            # Then append the newly healthy profile candidates.
+            # Append newly healthy candidates.
             while IFS=$'\t' read -r latency model; do
               [[ -z "$model" ]] && continue
               printf '%s\n' "$model" >> "$tmp_all"
@@ -806,14 +904,13 @@ jobs:
             )
 
             if [[ "${#candidates[@]}" -eq 0 ]]; then
-              # Never replace a healthy combo with an empty model list.
               echo '[]'
               return
             fi
 
             json='['
-
             local first=1
+
             for model in "${candidates[@]}"; do
               if [[ "$first" -eq 0 ]]; then
                 json+=','
@@ -838,27 +935,31 @@ jobs:
             local response
 
             combo_id="$(get_combo_id "$name")"
-            models_json="$(build_models_json "$candidate_file" "$name")"
+
+            models_json="$(
+              build_models_json \
+                "$candidate_file" \
+                "$name"
+            )"
 
             if [[ "$models_json" == "[]" ]]; then
               echo "WARN: $name has no candidate models; preserving existing combo."
               return 0
             fi
 
-            if [[ -n "$combo_id" ]]; then
-              # Preserve only server-owned fields that PUT expects.
-              body="$(
-                jq -nc \
-                  --arg name "$name" \
-                  --arg strategy "$strategy" \
-                  --argjson models "$models_json" \
-                  '{
-                    name: $name,
-                    strategy: $strategy,
-                    models: $models
-                  }'
-              )"
+            body="$(
+              jq -nc \
+                --arg name "$name" \
+                --arg strategy "$strategy" \
+                --argjson models "$models_json" \
+                '{
+                  name: $name,
+                  strategy: $strategy,
+                  models: $models
+                }'
+            )"
 
+            if [[ -n "$combo_id" ]]; then
               response="$(
                 curl \
                   --silent \
@@ -872,22 +973,12 @@ jobs:
                   "$BASE_URL/api/combos/$combo_id"
               )"
 
-              printf '%s\n' "$response" > "$TEST_DIR/combo-response-$name.json"
+              printf '%s\n' "$response" |
+                tee "$TEST_DIR/combo-response-$name.json" >/dev/null
 
               echo "UPDATED combo: $name ($combo_id)"
-            else
-              body="$(
-                jq -nc \
-                  --arg name "$name" \
-                  --arg strategy "$strategy" \
-                  --argjson models "$models_json" \
-                  '{
-                    name: $name,
-                    strategy: $strategy,
-                    models: $models
-                  }'
-              )"
 
+            else
               response="$(
                 curl \
                   --silent \
@@ -901,14 +992,16 @@ jobs:
                   "$BASE_URL/api/combos"
               )"
 
-              printf '%s\n' "$response" > "$TEST_DIR/combo-response-$name.json"
+              printf '%s\n' "$response" |
+                tee "$TEST_DIR/combo-response-$name.json" >/dev/null
 
               echo "CREATED combo: $name"
             fi
 
             {
               echo "[$name]"
-              echo "$models_json" | jq -r '.[].model'
+              echo "$models_json" |
+                jq -r '.[].model'
               echo
             } >> "$COMBO_REPORT"
           }
@@ -942,13 +1035,22 @@ jobs:
 
           cat "$COMBO_REPORT"
 
-          # Keep a stable latest report for SSH/manual inspection.
-          cp "$REPORT" "$TEST_DIR/latest-models.tsv"
-          cp "$PASS_LIST" "$TEST_DIR/pass-models.txt"
-          cp "$COMBO_REPORT" "$TEST_DIR/latest-combos.txt"
+          cp \
+            "$REPORT" \
+            "$TEST_DIR/latest-models.tsv"
 
-          # Retain only the latest 48 cycles (~24 hours at 30-min cadence).
-          find "$HISTORY_DIR" -type f -printf '%T@ %p\n' |
+          cp \
+            "$PASS_LIST" \
+            "$TEST_DIR/pass-models.txt"
+
+          cp \
+            "$COMBO_REPORT" \
+            "$TEST_DIR/latest-combos.txt"
+
+          # Keep approximately the latest 48 cycles.
+          find "$HISTORY_DIR" \
+            -type f \
+            -printf '%T@ %p\n' |
             sort -nr |
             awk 'NR>96{print $2}' |
             xargs -r rm -f
@@ -956,8 +1058,12 @@ jobs:
           echo "Model health/combo synchronization completed."
           SCRIPT
 
-          sudo chmod 750 "$OMNIROUTE_TEST_DIR/check-and-sync.sh"
-          sudo chown "$SSH_USERNAME:$SSH_USERNAME" "$OMNIROUTE_TEST_DIR/check-and-sync.sh"
+          sudo chmod 750 \
+            "$OMNIROUTE_TEST_DIR/check-and-sync.sh"
+
+          sudo chown \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$OMNIROUTE_TEST_DIR/check-and-sync.sh"
 
           echo "Health-check script installed."
 
@@ -982,7 +1088,7 @@ jobs:
               OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS="$OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS" \
               OMNIROUTE_MODEL_TEST_PARALLELISM="$OMNIROUTE_MODEL_TEST_PARALLELISM" \
               OMNIROUTE_MAX_MODELS_PER_CYCLE="$OMNIROUTE_MAX_MODELS_PER_CYCLE" \
-            /home/"$SSH_USERNAME"/omniroute-tests/check-and-sync.sh
+            "/home/$SSH_USERNAME/omniroute-tests/check-and-sync.sh"
 
       # ==========================================================
       # 20. TELEGRAM ONLINE NOTIFICATION
@@ -995,7 +1101,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+          TAILSCALE_IP="$(
+            sudo tailscale ip -4 |
+            head -n 1
+          )"
+
           TAILSCALE_DNS="$(
             sudo tailscale dns status 2>/dev/null |
             grep -Eo '[A-Za-z0-9._-]+\.ts\.net' |
@@ -1057,8 +1167,10 @@ jobs:
           set -euo pipefail
 
           TEST_SCRIPT="/home/$SSH_USERNAME/omniroute-tests/check-and-sync.sh"
+
           TOTAL_SECONDS=$((OMNIROUTE_RUNTIME_MINUTES * 60))
           INTERVAL_SECONDS=$((OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES * 60))
+
           STARTED_AT="$(date +%s)"
           CYCLE=1
 
@@ -1082,8 +1194,17 @@ jobs:
 
             if ! sudo systemctl is-active --quiet omniroute; then
               echo "ERROR: OmniRoute stopped unexpectedly."
-              sudo systemctl --no-pager --full status omniroute || true
-              sudo journalctl -u omniroute --no-pager -n 100 || true
+
+              sudo systemctl \
+                --no-pager \
+                --full \
+                status omniroute || true
+
+              sudo journalctl \
+                -u omniroute \
+                --no-pager \
+                -n 100 || true
+
               exit 1
             fi
 
@@ -1093,11 +1214,13 @@ jobs:
               --fail \
               --max-time 15 \
               "$OMNIROUTE_BASE_URL/v1/models" >/dev/null; then
+
               echo "ERROR: OmniRoute health endpoint failed."
               exit 1
             fi
 
             set +e
+
             sudo -u "$SSH_USERNAME" \
               env \
                 OMNIROUTE_BASE_URL="$OMNIROUTE_BASE_URL" \
@@ -1106,17 +1229,21 @@ jobs:
                 OMNIROUTE_MODEL_TEST_PARALLELISM="$OMNIROUTE_MODEL_TEST_PARALLELISM" \
                 OMNIROUTE_MAX_MODELS_PER_CYCLE="$OMNIROUTE_MAX_MODELS_PER_CYCLE" \
               "$TEST_SCRIPT"
+
             CHECK_STATUS=$?
+
             set -e
 
             case "$CHECK_STATUS" in
               0)
                 echo "Model health and combo synchronization PASSED."
                 ;;
+
               2)
                 echo "WARNING: No healthy models were found."
                 echo "Existing combos were preserved."
                 ;;
+
               *)
                 echo "ERROR: Model health/combo synchronization failed."
                 exit "$CHECK_STATUS"
@@ -1125,18 +1252,25 @@ jobs:
 
             CYCLE=$((CYCLE + 1))
 
-            REMAINING=$((TOTAL_SECONDS - ( $(date +%s) - STARTED_AT ) ))
+            REMAINING=$(
+              (
+                TOTAL_SECONDS -
+                ($(date +%s) - STARTED_AT)
+              )
+            )
 
             if (( REMAINING <= 0 )); then
               break
             fi
 
             SLEEP_SECONDS="$INTERVAL_SECONDS"
+
             if (( SLEEP_SECONDS > REMAINING )); then
               SLEEP_SECONDS="$REMAINING"
             fi
 
             echo "Sleeping $SLEEP_SECONDS seconds until next health cycle..."
+
             sleep "$SLEEP_SECONDS"
           done
 
@@ -1161,35 +1295,61 @@ jobs:
             if ! sudo systemctl is-active --quiet omniroute; then
               break
             fi
+
             sleep 1
           done
 
           if sudo systemctl is-active --quiet omniroute; then
             echo "ERROR: OmniRoute is still active."
-            sudo systemctl --no-pager --full status omniroute || true
+
+            sudo systemctl \
+              --no-pager \
+              --full \
+              status omniroute || true
+
             exit 1
           fi
 
           for i in {1..30}; do
-            HOLDERS="$(sudo fuser "$DB" 2>/dev/null || true)"
+            HOLDERS="$(
+              sudo fuser "$DB" 2>/dev/null ||
+              true
+            )"
 
             if [[ -z "$HOLDERS" ]]; then
               break
             fi
 
             echo "SQLite holders: $HOLDERS"
-            sudo fuser -TERM "$DB" 2>/dev/null || true
+
+            sudo fuser \
+              -TERM \
+              "$DB" \
+              2>/dev/null ||
+              true
+
             sleep 2
           done
 
-          HOLDERS="$(sudo fuser "$DB" 2>/dev/null || true)"
+          HOLDERS="$(
+            sudo fuser "$DB" 2>/dev/null ||
+            true
+          )"
 
           if [[ -n "$HOLDERS" ]]; then
-            sudo fuser -KILL "$DB" 2>/dev/null || true
+            sudo fuser \
+              -KILL \
+              "$DB" \
+              2>/dev/null ||
+              true
+
             sleep 3
           fi
 
-          HOLDERS="$(sudo fuser "$DB" 2>/dev/null || true)"
+          HOLDERS="$(
+            sudo fuser "$DB" 2>/dev/null ||
+            true
+          )"
 
           if [[ -n "$HOLDERS" ]]; then
             sudo fuser -v "$DB" || true
@@ -1226,7 +1386,9 @@ jobs:
             "PRAGMA integrity_check;" |
             grep -Fxq "ok"
 
-          sudo rm -f "$DB-wal" "$DB-shm"
+          sudo rm -f \
+            "$DB-wal" \
+            "$DB-shm"
 
           echo "SQLite finalization passed."
 
@@ -1263,7 +1425,8 @@ jobs:
 
           git fetch origin --prune
 
-          # Pull remote changes first. Never force-push over remote state.
+          # Pull remote changes first.
+          # Never force-push over remote state.
           git checkout -B "$BRANCH" "origin/$BRANCH"
 
           echo "Repository synchronized with origin/$BRANCH."
@@ -1278,6 +1441,7 @@ jobs:
 
           if git ls-files |
             grep -E '(^|/)\.env$|(^|/)logs/|\.log$'; then
+
             echo "ERROR: Forbidden .env/log file is tracked."
             exit 1
           fi
@@ -1288,6 +1452,7 @@ jobs:
             -not -path "$GITHUB_WORKSPACE/.git/*" \
             -print -quit |
             grep -q .; then
+
             echo "ERROR: .env or .log exists in workspace."
             exit 1
           fi
@@ -1302,8 +1467,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          rm -rf "$GITHUB_WORKSPACE/backup/omniroute/data"
-          rm -f "$GITHUB_WORKSPACE/backup/omniroute/omniroute-full-backup.tar.gz"
+          rm -rf \
+            "$GITHUB_WORKSPACE/backup/omniroute/data"
+
+          rm -f \
+            "$GITHUB_WORKSPACE/backup/omniroute/omniroute-full-backup.tar.gz"
 
       # ==========================================================
       # 28. COPY SQLITE TO REPOSITORY
@@ -1319,21 +1487,29 @@ jobs:
           REPO_DB="$GITHUB_WORKSPACE/$OMNIROUTE_DB_PATH"
 
           test -s "$DB"
-          test -z "$(sudo fuser "$DB" 2>/dev/null || true)"
+
+          test -z "$(
+            sudo fuser "$DB" 2>/dev/null ||
+            true
+          )"
 
           mkdir -p "$(dirname "$REPO_DB")"
 
-          sudo -u "$SSH_USERNAME" \
-            sqlite3 "$DB" \
+          # Use sudo for the SQLite operation because the database
+          # belongs to SSH_USERNAME and is mode 600.
+          sudo sqlite3 "$DB" \
             ".backup '$REPO_DB'"
 
-          if [[ ! -s "$REPO_DB" ]]; then
+          test -s "$REPO_DB" || {
             echo "ERROR: SQLite backup produced an empty file."
             exit 1
-          fi
+          }
 
-          chown "$(id -u):$(id -g)" "$REPO_DB"
-          chmod 600 "$REPO_DB"
+          sudo chown \
+            "$(id -u):$(id -g)" \
+            "$REPO_DB"
+
+          sudo chmod 600 "$REPO_DB"
 
           sqlite3 \
             -cmd ".timeout 60000" \
@@ -1341,7 +1517,9 @@ jobs:
             "PRAGMA integrity_check;" |
             grep -Fxq "ok"
 
-          rm -f "$REPO_DB-wal" "$REPO_DB-shm"
+          rm -f \
+            "$REPO_DB-wal" \
+            "$REPO_DB-shm"
 
           echo "Repository SQLite backup is valid."
 
@@ -1354,7 +1532,10 @@ jobs:
           set -euo pipefail
 
           REPO_DB="$GITHUB_WORKSPACE/$OMNIROUTE_DB_PATH"
-          DB_SIZE="$(stat -c '%s' "$REPO_DB")"
+
+          DB_SIZE="$(
+            stat -c '%s' "$REPO_DB"
+          )"
 
           echo "SQLite database size: $DB_SIZE bytes"
 
@@ -1376,10 +1557,12 @@ jobs:
           git add -u \
             -- backup/omniroute/data \
                backup/omniroute/omniroute-full-backup.tar.gz \
-            2>/dev/null || true
+            2>/dev/null ||
+            true
 
           if git diff --cached --name-only |
             grep -E '(^|/)\.env$|(^|/)logs/|\.log$|storage\.sqlite-(wal|shm)$'; then
+
             echo "ERROR: Secret/log/SQLite sidecar is staged."
             exit 1
           fi
@@ -1399,7 +1582,8 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: persist OmniRoute state and healthy model combos"
+          git commit \
+            -m "chore: persist OmniRoute state and healthy model combos"
 
       # ==========================================================
       # 32. PUSH
@@ -1453,8 +1637,13 @@ jobs:
 
           git fetch origin "$BRANCH"
 
-          LOCAL_COMMIT="$(git rev-parse HEAD)"
-          REMOTE_COMMIT="$(git rev-parse "origin/$BRANCH")"
+          LOCAL_COMMIT="$(
+            git rev-parse HEAD
+          )"
+
+          REMOTE_COMMIT="$(
+            git rev-parse "origin/$BRANCH"
+          )"
 
           echo "Local commit : $LOCAL_COMMIT"
           echo "Remote commit: $REMOTE_COMMIT"
@@ -1473,6 +1662,7 @@ jobs:
             --name-only \
             HEAD |
             grep -E '(^|/)\.env$|(^|/)logs/|\.log$|storage\.sqlite-(wal|shm)$'; then
+
             echo "ERROR: Forbidden file exists in Git."
             exit 1
           fi
