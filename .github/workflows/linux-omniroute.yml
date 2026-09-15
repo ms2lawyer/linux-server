@@ -109,11 +109,13 @@ jobs:
           set -euo pipefail
 
           if ! command -v gh >/dev/null 2>&1; then
-            type -p curl >/dev/null
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg |
-              sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            curl -fsSL \
+              https://cli.github.com/packages/githubcli-archive-keyring.gpg |
+              sudo dd \
+                of=/usr/share/keyrings/githubcli-archive-keyring.gpg
 
-            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r \
+              /usr/share/keyrings/githubcli-archive-keyring.gpg
 
             echo \
               "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" |
@@ -159,9 +161,6 @@ jobs:
 
           echo "$SSH_USERNAME:$SSH_PASSWORD" | sudo chpasswd
 
-          sudo systemctl enable ssh
-          sudo systemctl restart ssh
-
           sudo sed -i \
             -E 's/^#?PasswordAuthentication .*/PasswordAuthentication yes/' \
             /etc/ssh/sshd_config
@@ -170,6 +169,7 @@ jobs:
             -E 's/^#?PubkeyAuthentication .*/PubkeyAuthentication yes/' \
             /etc/ssh/sshd_config
 
+          sudo systemctl enable ssh
           sudo systemctl restart ssh
 
           echo "SSH server configured for user: $SSH_USERNAME"
@@ -187,7 +187,9 @@ jobs:
           OMNIROUTE_HOME="/home/$SSH_USERNAME/.omniroute"
 
           sudo mkdir -p "$OMNIROUTE_HOME"
-          sudo chown -R "$SSH_USERNAME:$SSH_USERNAME" "$OMNIROUTE_HOME"
+          sudo chown -R \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$OMNIROUTE_HOME"
           sudo chmod 700 "$OMNIROUTE_HOME"
 
           echo "Prepared: $OMNIROUTE_HOME"
@@ -237,7 +239,10 @@ jobs:
           printf '%s\n' "$OMNIROUTE_ENV" |
             sudo tee "$ENV_FILE" >/dev/null
 
-          sudo chown "$SSH_USERNAME:$SSH_USERNAME" "$ENV_FILE"
+          sudo chown \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$ENV_FILE"
+
           sudo chmod 600 "$ENV_FILE"
 
           echo "OmniRoute environment restored."
@@ -258,7 +263,7 @@ jobs:
           sudo test -f "$ENV_FILE"
 
           if ! sudo grep -Eq '^HOSTNAME=' "$ENV_FILE"; then
-            printf '\nHOSTNAME=0.0.0.0\n' |
+            printf '%s\n' 'HOSTNAME=0.0.0.0' |
               sudo tee -a "$ENV_FILE" >/dev/null
           else
             sudo sed -i \
@@ -267,7 +272,7 @@ jobs:
           fi
 
           if ! sudo grep -Eq '^OMNIROUTE_SERVER_HOST=' "$ENV_FILE"; then
-            printf 'OMNIROUTE_SERVER_HOST=0.0.0.0\n' |
+            printf '%s\n' 'OMNIROUTE_SERVER_HOST=0.0.0.0' |
               sudo tee -a "$ENV_FILE" >/dev/null
           else
             sudo sed -i \
@@ -276,7 +281,8 @@ jobs:
           fi
 
           if ! sudo grep -Eq '^STORAGE_ENCRYPTION_KEY=' "$ENV_FILE"; then
-            printf 'STORAGE_ENCRYPTION_KEY=%s\n' "$STORAGE_ENCRYPTION_KEY" |
+            printf 'STORAGE_ENCRYPTION_KEY=%s\n' \
+              "$STORAGE_ENCRYPTION_KEY" |
               sudo tee -a "$ENV_FILE" >/dev/null
           fi
 
@@ -285,20 +291,32 @@ jobs:
             exit 1
           fi
 
-          sudo chown "$SSH_USERNAME:$SSH_USERNAME" "$ENV_FILE"
+          sudo chown \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$ENV_FILE"
+
           sudo chmod 600 "$ENV_FILE"
 
           echo "OmniRoute environment validated."
 
       # ==========================================================
       # 11. Install Node.js 24
+      #
+      # IMPORTANT:
+      # No "cache: npm" here.
+      #
+      # This repository does not contain:
+      #   package-lock.json
+      #   npm-shrinkwrap.json
+      #   yarn.lock
+      #
+      # Therefore npm cache mode in setup-node fails.
       # ==========================================================
 
       - name: 11. Install Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: npm
 
       # ==========================================================
       # 12. Install exact OmniRoute
@@ -310,18 +328,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          sudo -u "$SSH_USERNAME" mkdir -p \
-            "/home/$SSH_USERNAME/.npm-global"
+          sudo -u "$SSH_USERNAME" \
+            mkdir -p "/home/$SSH_USERNAME/.npm-global"
 
           sudo chown -R \
             "$SSH_USERNAME:$SSH_USERNAME" \
             "/home/$SSH_USERNAME/.npm-global"
 
           sudo -u "$SSH_USERNAME" \
-            npm config set prefix "/home/$SSH_USERNAME/.npm-global"
+            npm config set prefix \
+              "/home/$SSH_USERNAME/.npm-global"
 
           sudo -u "$SSH_USERNAME" \
-            npm install -g "omniroute@$OMNIROUTE_VERSION"
+            npm install -g \
+              "omniroute@$OMNIROUTE_VERSION"
 
       # ==========================================================
       # 13. Verify installation
@@ -334,7 +354,8 @@ jobs:
           set -euo pipefail
 
           sudo -u "$SSH_USERNAME" \
-            "/home/$SSH_USERNAME/.npm-global/bin/omniroute" --version
+            "/home/$SSH_USERNAME/.npm-global/bin/omniroute" \
+            --version
 
       # ==========================================================
       # 14. Create systemd service
@@ -356,6 +377,7 @@ jobs:
           Type=simple
           User=$SSH_USERNAME
           Group=$SSH_USERNAME
+
           WorkingDirectory=/home/$SSH_USERNAME/.omniroute
 
           Environment=HOME=/home/$SSH_USERNAME
@@ -395,7 +417,11 @@ jobs:
 
           sleep 5
 
-          sudo systemctl --no-pager --full status omniroute.service || true
+          sudo systemctl \
+            --no-pager \
+            --full \
+            status \
+            omniroute.service || true
 
       # ==========================================================
       # 16. Verify TCP bind
@@ -406,7 +432,9 @@ jobs:
           set -euo pipefail
 
           for i in {1..30}; do
-            if sudo ss -lntp | grep -q ":$OMNIROUTE_PORT"; then
+            if sudo ss -lntp |
+              grep -q ":$OMNIROUTE_PORT"; then
+
               echo "OmniRoute is listening on port $OMNIROUTE_PORT."
               exit 0
             fi
@@ -415,7 +443,12 @@ jobs:
           done
 
           echo "ERROR: OmniRoute did not bind to port $OMNIROUTE_PORT."
-          sudo journalctl -u omniroute.service --no-pager -n 100 || true
+
+          sudo journalctl \
+            -u omniroute.service \
+            --no-pager \
+            -n 100 || true
+
           exit 1
 
       # ==========================================================
@@ -428,7 +461,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          curl -fsSL https://tailscale.com/install.sh | sh
+          curl -fsSL \
+            https://tailscale.com/install.sh |
+            sh
 
           sudo systemctl enable --now tailscaled
 
@@ -468,6 +503,7 @@ jobs:
 
           BASE_URL="${OMNIROUTE_BASE_URL:-http://127.0.0.1:20128}"
           API_KEY="${OMNIROUTE_API_KEY:-}"
+
           TEST_DIR="${HOME}/omniroute-tests"
 
           TIMEOUT="${OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS:-45}"
@@ -485,6 +521,7 @@ jobs:
           LATEST_REPORT="$TEST_DIR/latest-models.tsv"
           LATEST_PASS_LIST="$TEST_DIR/pass-models.txt"
           LATEST_COMBOS="$TEST_DIR/latest-combos.txt"
+
           FAILURE_LOG="$TEST_DIR/last-failures.log"
 
           echo "=============================================="
@@ -495,6 +532,10 @@ jobs:
           AUTH_HEADER="Authorization: Bearer $API_KEY"
 
           MODELS_JSON="$TEST_DIR/models-${TIMESTAMP}.json"
+
+          # ------------------------------------------------------
+          # Get model catalog
+          # ------------------------------------------------------
 
           if ! curl \
               --fail \
@@ -509,15 +550,27 @@ jobs:
             echo "WARNING: Unable to read OmniRoute /v1/models."
             echo "WARNING: Existing combos will be preserved."
             echo "WARNING: Runner will continue normally."
+
             exit 0
           fi
+
+          # ------------------------------------------------------
+          # Select concrete provider/model IDs.
+          #
+          # Combo aliases such as:
+          #   coding
+          #   coding-fast
+          #   reasoning
+          #   fast
+          # are excluded.
+          # ------------------------------------------------------
 
           mapfile -t MODELS < <(
             jq -r '
               .data[]?.id
               | select(type == "string")
-              | select(contains("/") and
-                       startswith("auto/") | not)
+              | select(contains("/"))
+              | select(startswith("auto/") | not)
             ' "$MODELS_JSON" 2>/dev/null |
             grep -Ev '^(coding|coding-fast|reasoning|fast)$' |
             sort -u |
@@ -529,14 +582,20 @@ jobs:
             echo "WARNING: No concrete provider/model IDs were found."
             echo "WARNING: Existing combos will be preserved."
             echo "WARNING: Runner will continue normally."
+
             exit 0
           fi
 
           echo "Testing ${#MODELS[@]} concrete models..."
 
           printf 'model\tstatus\tlatency_ms\terror\n' > "$REPORT"
+
           : > "$PASS_LIST"
           : > "$FAILURE_LOG"
+
+          # ------------------------------------------------------
+          # Test one model
+          # ------------------------------------------------------
 
           test_model() {
             local model="$1"
@@ -546,6 +605,7 @@ jobs:
             local response_file
             local http_code
             local error_text
+            local curl_exit
 
             response_file="$(mktemp)"
 
@@ -579,19 +639,25 @@ jobs:
                 )"
             )"
 
-            local curl_exit=$?
+            curl_exit=$?
 
             set -e
 
             end="$(date +%s%3N)"
             latency=$((end - start))
 
-            if [[ "$curl_exit" -eq 0 && "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+            if [[ \
+              "$curl_exit" -eq 0 &&
+              "$http_code" =~ ^2[0-9][0-9]$
+            ]]; then
+
               printf '%s\tPASS\t%s\t\n' \
                 "$model" \
                 "$latency" >> "$REPORT"
 
-              printf '%s\n' "$model" >> "$PASS_LIST"
+              printf '%s\n' \
+                "$model" >> "$PASS_LIST"
+
             else
               error_text="$(
                 jq -r '
@@ -621,6 +687,10 @@ jobs:
             rm -f "$response_file"
           }
 
+          # ------------------------------------------------------
+          # Parallel model testing
+          # ------------------------------------------------------
+
           running=0
 
           for model in "${MODELS[@]}"; do
@@ -641,7 +711,10 @@ jobs:
           sort -o "$PASS_LIST" "$PASS_LIST"
 
           PASS_COUNT="$(wc -l < "$PASS_LIST" | tr -d ' ')"
-          FAIL_COUNT="$(grep -c $'\tFAIL\t' "$REPORT" || true)"
+
+          FAIL_COUNT="$(
+            grep -c $'\tFAIL\t' "$REPORT" || true
+          )"
 
           echo
           echo "PASS count: $PASS_COUNT"
@@ -665,10 +738,11 @@ jobs:
             "$TEST_DIR/history/pass-models-${TIMESTAMP}.txt"
 
           # ------------------------------------------------------
-          # CRITICAL SAFETY RULE:
+          # CRITICAL:
           #
-          # Zero healthy models MUST NOT modify existing combos.
-          # Zero healthy models MUST NOT terminate the runner.
+          # Zero healthy models is NOT a workflow failure.
+          #
+          # Most importantly, DO NOT mutate existing combos.
           # ------------------------------------------------------
 
           if [[ "$PASS_COUNT" -eq 0 ]]; then
@@ -735,7 +809,7 @@ jobs:
             > "$LATEST_COMBOS" 2>/dev/null || true
 
           # ------------------------------------------------------
-          # Helper: determine whether a model passed
+          # Determine whether model passed
           # ------------------------------------------------------
 
           is_passed_model() {
@@ -745,13 +819,7 @@ jobs:
           }
 
           # ------------------------------------------------------
-          # Build a model array for a combo.
-          #
-          # Existing models are retained only when they passed
-          # the current health cycle.
-          #
-          # Then healthy models are appended until the desired
-          # size is reached.
+          # Build combo model list
           # ------------------------------------------------------
 
           build_models_json() {
@@ -771,6 +839,7 @@ jobs:
                     <<< "$result"
                 )"
               fi
+
             done < <(
               jq -r '
                 .[]
@@ -786,7 +855,10 @@ jobs:
             while IFS= read -r candidate; do
               [[ -z "$candidate" ]] && continue
 
-              if [[ "$(jq 'length' <<< "$result")" -ge "$desired_count" ]]; then
+              if [[ \
+                "$(jq 'length' <<< "$result")" \
+                -ge "$desired_count"
+              ]]; then
                 break
               fi
 
@@ -796,13 +868,14 @@ jobs:
                   '. + [$model] | unique' \
                   <<< "$result"
               )"
+
             done < "$PASS_LIST"
 
             printf '%s\n' "$result"
           }
 
           # ------------------------------------------------------
-          # Combo definitions
+          # Combo sizes
           # ------------------------------------------------------
 
           declare -A COMBO_SIZES=(
@@ -813,7 +886,7 @@ jobs:
           )
 
           # ------------------------------------------------------
-          # Find combo by name
+          # Get combo ID
           # ------------------------------------------------------
 
           get_combo_id() {
@@ -912,9 +985,11 @@ jobs:
 
                 echo "WARNING: Failed to update combo: $name"
                 echo "WARNING: Existing combo remains unchanged."
+
                 rm -f "$response_file"
                 return 0
               fi
+
             else
               echo "Creating combo: $name"
 
@@ -931,6 +1006,7 @@ jobs:
                   > "$response_file"; then
 
                 echo "WARNING: Failed to create combo: $name"
+
                 rm -f "$response_file"
                 return 0
               fi
@@ -946,14 +1022,19 @@ jobs:
           # Synchronize configured combos
           # ------------------------------------------------------
 
-          for combo_name in coding coding-fast reasoning fast; do
+          for combo_name in \
+            coding \
+            coding-fast \
+            reasoning \
+            fast
+          do
             sync_combo \
               "$combo_name" \
               "${COMBO_SIZES[$combo_name]}"
           done
 
           # ------------------------------------------------------
-          # Keep only recent history
+          # Retain seven days of history
           # ------------------------------------------------------
 
           find "$TEST_DIR/history" \
@@ -964,11 +1045,15 @@ jobs:
 
           echo
           echo "Model health/combo synchronization completed."
+
           exit 0
           SCRIPT
 
           sudo chmod 700 "$SCRIPT"
-          sudo chown "$SSH_USERNAME:$SSH_USERNAME" "$SCRIPT"
+
+          sudo chown \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$SCRIPT"
 
           sudo test -x "$SCRIPT"
 
@@ -976,7 +1061,7 @@ jobs:
           echo "$SCRIPT"
 
       # ==========================================================
-      # 19. Initial model health check
+      # 19. Initial model check
       # ==========================================================
 
       - name: 19. Initial Model Check And Combo Sync
@@ -1008,7 +1093,7 @@ jobs:
 
           echo
           echo "Initial model health check completed."
-          echo "Zero passing models is considered a non-fatal condition."
+          echo "Zero passing models is non-fatal."
           echo "The runner will continue."
 
       # ==========================================================
@@ -1085,8 +1170,8 @@ jobs:
                 OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS="$OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS" \
                 OMNIROUTE_MODEL_TEST_PARALLELISM="$OMNIROUTE_MODEL_TEST_PARALLELISM" \
                 OMNIROUTE_MAX_MODELS_PER_CYCLE="$OMNIROUTE_MAX_MODELS_PER_CYCLE" \
-              "$SCRIPT"; then
-
+              "$SCRIPT"
+            then
               echo "ERROR: Model health/combo synchronization failed."
               echo "The failure was not caused merely by zero passing models."
               exit 1
@@ -1101,7 +1186,9 @@ jobs:
             echo
             echo "Next model health cycle in ${OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES} minutes."
 
-            sleep_seconds=$((OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES * 60))
+            sleep_seconds=$(
+              ((OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES * 60))
+            )
 
             remaining=$((END_TIME - NOW))
 
@@ -1124,7 +1211,6 @@ jobs:
           set -euo pipefail
 
           sudo systemctl stop omniroute.service || true
-
           sudo systemctl is-active omniroute.service || true
 
       # ==========================================================
@@ -1141,7 +1227,7 @@ jobs:
           DB="/home/$SSH_USERNAME/.omniroute/storage.sqlite"
 
           if sudo test -f "$DB"; then
-            echo "Running SQLite integrity check..."
+            echo "Running SQLite WAL checkpoint..."
 
             sudo -u "$SSH_USERNAME" \
               sqlite3 "$DB" \
@@ -1151,11 +1237,16 @@ jobs:
               sqlite3 "$DB" \
               'PRAGMA optimize;' || true
 
+            echo "Running SQLite integrity check..."
+
             sudo -u "$SSH_USERNAME" \
               sqlite3 "$DB" \
               'PRAGMA integrity_check;' || true
 
-            sudo chown "$SSH_USERNAME:$SSH_USERNAME" "$DB"
+            sudo chown \
+              "$SSH_USERNAME:$SSH_USERNAME" \
+              "$DB"
+
             sudo chmod 600 "$DB"
           else
             echo "No SQLite database found."
@@ -1184,6 +1275,7 @@ jobs:
           set -euo pipefail
 
           git status --short
+
           git fetch origin
 
           CURRENT_BRANCH="$(git branch --show-current)"
@@ -1194,8 +1286,11 @@ jobs:
 
           echo "Current branch: $CURRENT_BRANCH"
 
-          if git show-ref --verify --quiet "refs/remotes/origin/$CURRENT_BRANCH"; then
-            git merge --no-edit "origin/$CURRENT_BRANCH"
+          if git show-ref --verify --quiet \
+            "refs/remotes/origin/$CURRENT_BRANCH"
+          then
+            git merge --no-edit \
+              "origin/$CURRENT_BRANCH"
           fi
 
       # ==========================================================
@@ -1215,14 +1310,19 @@ jobs:
           )
 
           for file in "${forbidden_files[@]}"; do
-            if git ls-files --error-unmatch "$file" >/dev/null 2>&1; then
+            if git ls-files --error-unmatch "$file" \
+              >/dev/null 2>&1
+            then
               echo "ERROR: Forbidden file is tracked: $file"
               exit 1
             fi
           done
 
           if git ls-files |
-             grep -E '(^|/)\.env$|storage\.sqlite-(wal|shm)$' >/dev/null 2>&1; then
+            grep -E \
+              '(^|/)\.env$|storage\.sqlite-(wal|shm)$' \
+              >/dev/null 2>&1
+          then
             echo "ERROR: Sensitive OmniRoute files are tracked."
             exit 1
           fi
@@ -1238,13 +1338,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          mkdir -p backup/omniroute
+
           find backup/omniroute \
             -type f \
             ! -name 'storage.sqlite' \
             -delete \
             2>/dev/null || true
-
-          mkdir -p backup/omniroute
 
       # ==========================================================
       # 28. Backup SQLite
@@ -1261,7 +1361,9 @@ jobs:
           TARGET_DB="$GITHUB_WORKSPACE/$OMNIROUTE_DB_PATH"
 
           if sudo test -f "$SOURCE_DB"; then
-            sudo cp "$SOURCE_DB" "$TARGET_DB"
+            sudo cp \
+              "$SOURCE_DB" \
+              "$TARGET_DB"
 
             sudo chown \
               "$(id -u):$(id -g)" \
@@ -1311,7 +1413,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          git add backup/omniroute/storage.sqlite
+          git add \
+            backup/omniroute/storage.sqlite
 
           git status --short
 
@@ -1356,7 +1459,10 @@ jobs:
           git log -1 --oneline
 
           if git ls-files |
-             grep -E '(^|/)\.env$|storage\.sqlite-(wal|shm)$' >/dev/null 2>&1; then
+            grep -E \
+              '(^|/)\.env$|storage\.sqlite-(wal|shm)$' \
+              >/dev/null 2>&1
+          then
             echo "ERROR: Sensitive files are tracked."
             exit 1
           fi
