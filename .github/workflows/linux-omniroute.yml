@@ -469,7 +469,7 @@ jobs:
 
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTHKEY" \
-            --hostname="omniroute-ci-gateway"
+            --hostname="omniroute"
 
           sudo tailscale status
 
