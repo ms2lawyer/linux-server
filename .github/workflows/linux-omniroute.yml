@@ -2,6 +2,7 @@ name: Linux OmniRoute Server
 
 on:
   schedule:
+    # Rebuild/restart the persistent OmniRoute runner every 6 hours.
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
@@ -15,13 +16,20 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    # 350 min runtime + setup + persistence margin.
     timeout-minutes: 380
 
     env:
       OMNIROUTE_PORT: '20128'
       OMNIROUTE_VERSION: '3.8.49'
-      OMNIROUTE_RUNTIME_MINUTES: '360'
+      OMNIROUTE_RUNTIME_MINUTES: '350'
+      OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES: '30'
+      OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS: '45'
+      OMNIROUTE_MODEL_TEST_PARALLELISM: '6'
+      OMNIROUTE_MAX_MODELS_PER_CYCLE: '100'
       OMNIROUTE_DB_PATH: 'backup/omniroute/storage.sqlite'
+      OMNIROUTE_BASE_URL: 'http://127.0.0.1:20128'
 
     steps:
 
@@ -46,43 +54,27 @@ jobs:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
         run: |
           set -euo pipefail
 
-          test -n "${SSH_USERNAME:-}" || {
-            echo "ERROR: SSH_USERNAME is empty."
-            exit 1
-          }
+          required=(
+            SSH_USERNAME
+            SSH_PASSWORD
+            OMNIROUTE_ENV
+            GIT_TOKEN
+            TAILSCALE_AUTHKEY
+            TELEGRAM_BOT_TOKEN
+            TELEGRAM_CHAT_ID
+            OMNIROUTE_API_KEY
+          )
 
-          test -n "${SSH_PASSWORD:-}" || {
-            echo "ERROR: SSH_PASSWORD is empty."
-            exit 1
-          }
-
-          test -n "${OMNIROUTE_ENV:-}" || {
-            echo "ERROR: OMNIROUTE_ENV is empty."
-            exit 1
-          }
-
-          test -n "${GIT_TOKEN:-}" || {
-            echo "ERROR: GIT_TOKEN is empty."
-            exit 1
-          }
-
-          test -n "${TAILSCALE_AUTHKEY:-}" || {
-            echo "ERROR: TAILSCALE_AUTHKEY is empty."
-            exit 1
-          }
-
-          test -n "${TELEGRAM_BOT_TOKEN:-}" || {
-            echo "ERROR: TELEGRAM_BOT_TOKEN is empty."
-            exit 1
-          }
-
-          test -n "${TELEGRAM_CHAT_ID:-}" || {
-            echo "ERROR: TELEGRAM_CHAT_ID is empty."
-            exit 1
-          }
+          for name in "${required[@]}"; do
+            test -n "${!name:-}" || {
+              echo "ERROR: $name is empty."
+              exit 1
+            }
+          done
 
           echo "Required GitHub configuration is present."
           echo "Secret values were not displayed."
@@ -101,6 +93,7 @@ jobs:
             wget \
             git \
             sqlite3 \
+            jq \
             openssh-server \
             ca-certificates \
             gnupg \
@@ -119,16 +112,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          if command -v gh >/dev/null 2>&1; then
-            echo "GitHub CLI already installed."
-          else
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-              | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          if ! command -v gh >/dev/null 2>&1; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg |
+              sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
 
             sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
 
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-              | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" |
+              sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
 
             sudo apt-get update
             sudo apt-get install -y gh
@@ -146,8 +137,6 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global init.defaultBranch main
-
-          echo "Git configured."
 
       # ==========================================================
       # 06. SETUP SSH SERVER
@@ -176,8 +165,7 @@ jobs:
             's/^#?PermitRootLogin .*/PermitRootLogin no/' \
             /etc/ssh/sshd_config
 
-          sudo systemctl restart ssh
-          sudo systemctl enable ssh
+          sudo systemctl enable --now ssh
 
           echo "SSH server is running."
 
@@ -196,8 +184,6 @@ jobs:
           sudo chown "$SSH_USERNAME:$SSH_USERNAME" "$OMNIROUTE_HOME"
           sudo chmod 700 "$OMNIROUTE_HOME"
 
-          echo "OmniRoute home prepared: $OMNIROUTE_HOME"
-
       # ==========================================================
       # 08. RESTORE SQLITE DATABASE
       # ==========================================================
@@ -211,25 +197,12 @@ jobs:
           REPO_DB="$GITHUB_WORKSPACE/$OMNIROUTE_DB_PATH"
           DB="$OMNIROUTE_HOME/storage.sqlite"
 
-          if [ ! -f "$REPO_DB" ]; then
-            echo "ERROR: Persistent SQLite database does not exist:"
-            echo "$REPO_DB"
-            exit 1
-          fi
-
           test -s "$REPO_DB" || {
-            echo "ERROR: Persistent SQLite database is empty."
+            echo "ERROR: Persistent SQLite database missing or empty: $REPO_DB"
             exit 1
           }
 
-          echo "Removing stale runtime database files."
-
-          sudo rm -f \
-            "$DB" \
-            "$DB-wal" \
-            "$DB-shm"
-
-          echo "Restoring SQLite database."
+          sudo rm -f "$DB" "$DB-wal" "$DB-shm"
 
           sudo install \
             -o "$SSH_USERNAME" \
@@ -238,15 +211,10 @@ jobs:
             "$REPO_DB" \
             "$DB"
 
-          echo "Running SQLite integrity check."
-
-          sudo -u "$SSH_USERNAME" \
-            sqlite3 "$DB" \
-            "PRAGMA integrity_check;" \
-            | grep -Fxq "ok"
+          sudo -u "$SSH_USERNAME" sqlite3 "$DB" "PRAGMA integrity_check;" |
+            grep -Fxq "ok"
 
           echo "SQLite database restored successfully."
-
           sudo ls -lh "$DB"
 
       # ==========================================================
@@ -265,19 +233,8 @@ jobs:
 
           printf '%s' "$OMNIROUTE_ENV" > "$TEMP_ENV"
 
-          test -s "$TEMP_ENV" || {
-            echo "ERROR: Temporary .env is empty."
-            rm -f "$TEMP_ENV"
-            exit 1
-          }
-
-          grep -Eq \
-            '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' \
-            "$TEMP_ENV" || {
-              echo "ERROR: OMNIROUTE_ENV is not a valid .env file."
-              rm -f "$TEMP_ENV"
-              exit 1
-            }
+          test -s "$TEMP_ENV"
+          grep -Eq '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' "$TEMP_ENV"
 
           sudo install \
             -o "$SSH_USERNAME" \
@@ -288,41 +245,12 @@ jobs:
 
           rm -f "$TEMP_ENV"
 
-          sudo test -f "$ENV_FILE"
-          sudo test -s "$ENV_FILE"
-
           echo "OmniRoute .env restored."
-          echo "Secret contents were not displayed."
 
       # ==========================================================
-      # 10. VERIFY ENCRYPTION KEY
+      # 10. NORMALIZE + VALIDATE NETWORK/ENCRYPTION ENVIRONMENT
       # ==========================================================
-      - name: 10. Verify OmniRoute Encryption Configuration
-        env:
-          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
-        run: |
-          set -euo pipefail
-
-          ENV_FILE="/home/$SSH_USERNAME/.omniroute/.env"
-
-          if ! sudo grep -Eq \
-            '^[[:space:]]*(export[[:space:]]+)?STORAGE_ENCRYPTION_KEY=' \
-            "$ENV_FILE"; then
-
-            echo "ERROR: STORAGE_ENCRYPTION_KEY is not present in .env."
-            echo "The database contains encrypted credential material."
-            echo "The database cannot safely be restored without the correct key."
-
-            exit 1
-          fi
-
-          echo "STORAGE_ENCRYPTION_KEY is present."
-          echo "The key value was not displayed."
-
-      # ==========================================================
-      # 11. NORMALIZE + VALIDATE ENVIRONMENT
-      # ==========================================================
-      - name: 11. Normalize And Validate OmniRoute Environment
+      - name: 10. Normalize And Validate OmniRoute Environment
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -331,18 +259,6 @@ jobs:
           OMNIROUTE_HOME="/home/$SSH_USERNAME/.omniroute"
           ENV_FILE="$OMNIROUTE_HOME/.env"
           TEMP_ENV="$RUNNER_TEMP/omniroute.env.normalized"
-
-          sudo test -f "$ENV_FILE" || {
-            echo "ERROR: OmniRoute .env does not exist."
-            exit 1
-          }
-
-          sudo test -s "$ENV_FILE" || {
-            echo "ERROR: OmniRoute .env is empty."
-            exit 1
-          }
-
-          echo "Normalizing OmniRoute network configuration."
 
           sudo cp "$ENV_FILE" "$TEMP_ENV"
 
@@ -354,11 +270,8 @@ jobs:
             '/^[[:space:]]*(export[[:space:]]+)?OMNIROUTE_SERVER_HOST[[:space:]]*=/d' \
             "$TEMP_ENV"
 
-          printf '\nHOSTNAME=0.0.0.0\n' \
-            | sudo tee -a "$TEMP_ENV" >/dev/null
-
-          printf 'OMNIROUTE_SERVER_HOST=0.0.0.0\n' \
-            | sudo tee -a "$TEMP_ENV" >/dev/null
+          printf '\nHOSTNAME=0.0.0.0\n' | sudo tee -a "$TEMP_ENV" >/dev/null
+          printf 'OMNIROUTE_SERVER_HOST=0.0.0.0\n' | sudo tee -a "$TEMP_ENV" >/dev/null
 
           sudo install \
             -o "$SSH_USERNAME" \
@@ -369,105 +282,28 @@ jobs:
 
           sudo rm -f "$TEMP_ENV"
 
-          echo "Validating STORAGE_ENCRYPTION_KEY."
+          grep -Eq '^HOSTNAME=0\.0\.0\.0$' "$ENV_FILE"
+          grep -Eq '^OMNIROUTE_SERVER_HOST=0\.0\.0\.0$' "$ENV_FILE"
 
-          STORAGE_KEY_LINE="$(
-            sudo awk '
-              /^[[:space:]]*(export[[:space:]]+)?STORAGE_ENCRYPTION_KEY[[:space:]]*=/ {
-                line=$0
-              }
-              END {
-                print line
-              }
-            ' "$ENV_FILE"
-          )"
-
-          if [ -z "$STORAGE_KEY_LINE" ]; then
-            echo "ERROR: STORAGE_ENCRYPTION_KEY is not present."
-            exit 1
-          fi
-
-          STORAGE_KEY_VALUE="$(
-            printf '%s\n' "$STORAGE_KEY_LINE" |
-            sed -E \
-              's/^[[:space:]]*(export[[:space:]]+)?STORAGE_ENCRYPTION_KEY[[:space:]]*=[[:space:]]*//'
-          )"
-
-          case "$STORAGE_KEY_VALUE" in
-            \"*\")
-              STORAGE_KEY_VALUE="${STORAGE_KEY_VALUE#\"}"
-              STORAGE_KEY_VALUE="${STORAGE_KEY_VALUE%\"}"
-              ;;
-            \'*\')
-              STORAGE_KEY_VALUE="${STORAGE_KEY_VALUE#\'}"
-              STORAGE_KEY_VALUE="${STORAGE_KEY_VALUE%\'}"
-              ;;
-          esac
-
-          if [ -z "$STORAGE_KEY_VALUE" ]; then
-            echo "ERROR: STORAGE_ENCRYPTION_KEY exists but is empty."
-            exit 1
-          fi
-
-          echo "STORAGE_ENCRYPTION_KEY is present and non-empty."
-
-          HOSTNAME_VALUE="$(
-            sudo awk -F= '
-              /^[[:space:]]*(export[[:space:]]+)?HOSTNAME[[:space:]]*=/ {
-                value=$2
-              }
-              END {
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-                print value
-              }
-            ' "$ENV_FILE"
-          )"
-
-          SERVER_HOST_VALUE="$(
-            sudo awk -F= '
-              /^[[:space:]]*(export[[:space:]]+)?OMNIROUTE_SERVER_HOST[[:space:]]*=/ {
-                value=$2
-              }
-              END {
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-                print value
-              }
-            ' "$ENV_FILE"
-          )"
-
-          [ "$HOSTNAME_VALUE" = "0.0.0.0" ] || {
-            echo "ERROR: .env HOSTNAME is not 0.0.0.0."
-            exit 1
-          }
-
-          [ "$SERVER_HOST_VALUE" = "0.0.0.0" ] || {
-            echo "ERROR: .env OMNIROUTE_SERVER_HOST is not 0.0.0.0."
-            exit 1
-          }
-
-          echo ".env HOSTNAME=0.0.0.0 confirmed."
-          echo ".env OMNIROUTE_SERVER_HOST=0.0.0.0 confirmed."
+          grep -Eq \
+            '^[[:space:]]*(export[[:space:]]+)?STORAGE_ENCRYPTION_KEY[[:space:]]*=[[:space:]]*[^[:space:]]' \
+            "$ENV_FILE" || {
+              echo "ERROR: STORAGE_ENCRYPTION_KEY is missing or empty."
+              exit 1
+            }
 
           OWNER="$(sudo stat -c '%U' "$ENV_FILE")"
           PERMISSIONS="$(sudo stat -c '%a' "$ENV_FILE")"
 
-          [ "$OWNER" = "$SSH_USERNAME" ] || {
-            echo "ERROR: .env owner is '$OWNER', expected '$SSH_USERNAME'."
-            exit 1
-          }
+          test "$OWNER" = "$SSH_USERNAME"
+          test "$PERMISSIONS" = "600"
 
-          [ "$PERMISSIONS" = "600" ] || {
-            echo "ERROR: .env permissions are '$PERMISSIONS', expected '600'."
-            exit 1
-          }
-
-          echo ".env ownership and permissions are correct."
-          echo "OmniRoute environment validation passed."
+          echo "Environment validation passed."
 
       # ==========================================================
-      # 12. INSTALL NODE.JS
+      # 11. INSTALL NODE.JS
       # ==========================================================
-      - name: 12. Install Node.js
+      - name: 11. Install Node.js
         run: |
           set -euo pipefail
 
@@ -478,9 +314,9 @@ jobs:
           echo "npm:  $(npm --version)"
 
       # ==========================================================
-      # 13. INSTALL EXACT OMNIROUTE VERSION
+      # 12. INSTALL EXACT OMNIROUTE VERSION
       # ==========================================================
-      - name: 13. Install OmniRoute
+      - name: 12. Install OmniRoute
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -497,24 +333,19 @@ jobs:
           export PATH="$NPM_PREFIX/bin:$PATH"
 
           mkdir -p "$NPM_PREFIX"
-
           npm config set prefix "$NPM_PREFIX"
-
-          echo "Installing OmniRoute version: $OMNIROUTE_VERSION"
 
           npm install -g "omniroute@$OMNIROUTE_VERSION"
 
           test -x "$NPM_PREFIX/bin/omniroute"
-
-          echo "Installed OmniRoute version:"
           "$NPM_PREFIX/bin/omniroute" --version
 
           USER_SCRIPT
 
       # ==========================================================
-      # 14. VERIFY OMNIROUTE INSTALLATION
+      # 13. VERIFY OMNIROUTE INSTALLATION
       # ==========================================================
-      - name: 14. Verify OmniRoute Installation
+      - name: 13. Verify OmniRoute Installation
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -524,22 +355,19 @@ jobs:
 
           test -x "$OMNIROUTE_BIN"
 
-          INSTALLED_VERSION="$(
-            sudo -u "$SSH_USERNAME" "$OMNIROUTE_BIN" --version
-          )"
+          INSTALLED_VERSION="$(sudo -u "$SSH_USERNAME" "$OMNIROUTE_BIN" --version)"
 
           echo "Installed version: $INSTALLED_VERSION"
 
-          echo "$INSTALLED_VERSION" |
-            grep -F "$OMNIROUTE_VERSION" >/dev/null || {
-              echo "ERROR: Installed OmniRoute version does not match $OMNIROUTE_VERSION"
-              exit 1
-            }
+          echo "$INSTALLED_VERSION" | grep -F "$OMNIROUTE_VERSION" >/dev/null || {
+            echo "ERROR: Installed OmniRoute version does not match $OMNIROUTE_VERSION."
+            exit 1
+          }
 
       # ==========================================================
-      # 15. CREATE SYSTEMD SERVICE
+      # 14. CREATE SYSTEMD SERVICE
       # ==========================================================
-      - name: 15. Create OmniRoute systemd Service
+      - name: 14. Create OmniRoute systemd Service
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -565,7 +393,6 @@ jobs:
           Environment=PORT=$OMNIROUTE_PORT
           Environment=DATA_DIR=$OMNIROUTE_HOME
           Environment=PATH=/home/$SSH_USERNAME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
           EnvironmentFile=$OMNIROUTE_HOME/.env
 
           Environment=OMNIROUTE_SERVER_HOST=0.0.0.0
@@ -575,7 +402,6 @@ jobs:
 
           Restart=on-failure
           RestartSec=5
-
           NoNewPrivileges=true
 
           [Install]
@@ -585,190 +411,59 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl enable omniroute
 
-          echo "Systemd service created."
-
           sudo systemctl cat omniroute
 
       # ==========================================================
-      # 16. VERIFY SYSTEMD CONFIGURATION
+      # 15. START OMNIROUTE
       # ==========================================================
-      - name: 16. Verify systemd Configuration
-        run: |
-          set -euo pipefail
-
-          SYSTEMD_ENV="$(
-            sudo systemctl show omniroute \
-              -p Environment \
-              --value \
-              --no-pager
-          )"
-
-          printf '%s\n' "$SYSTEMD_ENV" |
-            tr ' ' '\n' |
-            grep -Fxq "OMNIROUTE_SERVER_HOST=0.0.0.0" || {
-              echo "ERROR: OMNIROUTE_SERVER_HOST is incorrect."
-              exit 1
-            }
-
-          printf '%s\n' "$SYSTEMD_ENV" |
-            tr ' ' '\n' |
-            grep -Fxq "HOSTNAME=0.0.0.0" || {
-              echo "ERROR: HOSTNAME is incorrect."
-              exit 1
-            }
-
-          echo "Systemd bind configuration verified."
-
-      # ==========================================================
-      # 17. START OMNIROUTE
-      # ==========================================================
-      - name: 17. Start OmniRoute
+      - name: 15. Start OmniRoute
         run: |
           set -euo pipefail
 
           sudo systemctl restart omniroute
 
-          sleep 5
-
-          if ! sudo systemctl is-active --quiet omniroute; then
-            echo "ERROR: OmniRoute failed to start."
-
-            echo "===== SYSTEMD STATUS ====="
-            sudo systemctl --no-pager --full status omniroute || true
-
-            echo "===== JOURNAL ====="
-            sudo journalctl -u omniroute --no-pager -n 150 || true
-
-            exit 1
-          fi
-
-          echo "OmniRoute is running."
-
-      # ==========================================================
-      # 18. RESERVED
-      # ==========================================================
-      - name: 18. Startup Stabilization
-        run: |
-          set -euo pipefail
-          sleep 2
-          echo "Startup stabilization completed."
-
-      # ==========================================================
-      # 19. VERIFY PORT
-      # ==========================================================
-      - name: 19. Verify OmniRoute Port
-        run: |
-          set -euo pipefail
-
           for i in {1..30}; do
-            if sudo ss -lntp |
-              grep -q ":$OMNIROUTE_PORT "; then
-
-              echo "OmniRoute is listening on port $OMNIROUTE_PORT."
-
-              sudo ss -lntp |
-                grep ":$OMNIROUTE_PORT " || true
-
+            if sudo systemctl is-active --quiet omniroute &&
+               curl -fsS --max-time 5 \
+                 "$OMNIROUTE_BASE_URL/v1/models" >/dev/null 2>&1; then
+              echo "OmniRoute is healthy."
               exit 0
             fi
 
-            echo "Waiting for OmniRoute... ($i/30)"
             sleep 2
           done
 
-          echo "ERROR: OmniRoute did not listen on port $OMNIROUTE_PORT."
-
-          sudo journalctl -u omniroute --no-pager -n 100 || true
-
+          echo "ERROR: OmniRoute failed startup/health validation."
+          sudo systemctl --no-pager --full status omniroute || true
+          sudo journalctl -u omniroute --no-pager -n 150 || true
           exit 1
 
       # ==========================================================
-      # 20. VERIFY REAL TCP BIND ADDRESS
+      # 16. VERIFY REAL TCP BIND
       # ==========================================================
-      - name: 20. Verify OmniRoute Bind Address
+      - name: 16. Verify OmniRoute Bind
         run: |
           set -euo pipefail
 
-          LISTENING_SOCKET="$(
+          SOCKET="$(
             sudo ss -lntp |
             grep -E ":$OMNIROUTE_PORT[[:space:]]" ||
             true
           )"
 
-          echo "$LISTENING_SOCKET"
+          echo "$SOCKET"
 
-          echo "$LISTENING_SOCKET" |
+          echo "$SOCKET" |
             grep -Eq \
               "0\.0\.0\.0:$OMNIROUTE_PORT[[:space:]]|\[::\]:$OMNIROUTE_PORT[[:space:]]" || {
-
-              echo "ERROR: OmniRoute is not externally bound."
-
-              sudo ss -lntp || true
-
-              echo "===== JOURNAL ====="
-              sudo journalctl -u omniroute --no-pager -n 100 || true
-
-              exit 1
+                echo "ERROR: OmniRoute is not externally bound."
+                exit 1
             }
 
-          echo "OmniRoute is listening on an externally reachable interface."
-
       # ==========================================================
-      # 21. HEALTH CHECK
+      # 17. SETUP TAILSCALE
       # ==========================================================
-      - name: 21. OmniRoute Health Check
-        run: |
-          set -euo pipefail
-
-          curl \
-            --silent \
-            --show-error \
-            --fail \
-            --max-time 15 \
-            "http://127.0.0.1:$OMNIROUTE_PORT/v1/models" \
-            >/dev/null
-
-          echo "OmniRoute /v1/models health check passed."
-
-      # ==========================================================
-      # 22. VERIFY ENVIRONMENT AFTER STARTUP
-      # ==========================================================
-      - name: 22. Verify Environment After Startup
-        env:
-          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
-        run: |
-          set -euo pipefail
-
-          ENV_FILE="/home/$SSH_USERNAME/.omniroute/.env"
-
-          HOSTNAME_VALUE="$(
-            sudo grep -E '^HOSTNAME=' "$ENV_FILE" |
-            tail -n 1 |
-            cut -d '=' -f 2-
-          )"
-
-          SERVER_HOST_VALUE="$(
-            sudo grep -E '^OMNIROUTE_SERVER_HOST=' "$ENV_FILE" |
-            tail -n 1 |
-            cut -d '=' -f 2-
-          )"
-
-          [ "$HOSTNAME_VALUE" = "0.0.0.0" ] || {
-            echo "ERROR: HOSTNAME changed after startup."
-            exit 1
-          }
-
-          [ "$SERVER_HOST_VALUE" = "0.0.0.0" ] || {
-            echo "ERROR: OMNIROUTE_SERVER_HOST changed after startup."
-            exit 1
-          }
-
-          echo "Environment remained correct after startup."
-
-      # ==========================================================
-      # 23. SETUP TAILSCALE
-      # ==========================================================
-      - name: 23. Setup Tailscale
+      - name: 17. Setup Tailscale
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
@@ -780,63 +475,519 @@ jobs:
             --authkey="$TAILSCALE_AUTHKEY" \
             --hostname="omniroute"
 
-          echo "Tailscale connected."
+          sudo tailscale ip -4
 
       # ==========================================================
-      # 24. FINAL STARTUP VALIDATION
+      # 18. INSTALL MODEL HEALTH-CHECK SCRIPT
       # ==========================================================
-      - name: 24. Final Startup Validation
+      - name: 18. Install Model Health And Combo Sync Script
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
         run: |
           set -euo pipefail
 
-          echo "===== SYSTEMD ====="
-          sudo systemctl is-active omniroute
+          OMNIROUTE_TEST_DIR="/home/$SSH_USERNAME/omniroute-tests"
 
-          echo "===== PORT ====="
-          sudo ss -lntp |
-            grep ":$OMNIROUTE_PORT "
+          sudo -u "$SSH_USERNAME" mkdir -p "$OMNIROUTE_TEST_DIR"
+          sudo -u "$SSH_USERNAME" mkdir -p "$OMNIROUTE_TEST_DIR/history"
 
-          echo "===== BIND ====="
-          sudo ss -lntp |
-            grep -E \
-              "0\.0\.0\.0:$OMNIROUTE_PORT[[:space:]]|\[::\]:$OMNIROUTE_PORT[[:space:]]"
+          sudo tee "$OMNIROUTE_TEST_DIR/check-and-sync.sh" >/dev/null <<'SCRIPT'
+          #!/usr/bin/env bash
 
-          echo "===== API ====="
+          set -euo pipefail
+
+          BASE_URL="${OMNIROUTE_BASE_URL:-http://127.0.0.1:20128}"
+          API_KEY="${OMNIROUTE_API_KEY:-}"
+          TEST_TIMEOUT="${OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS:-45}"
+          PARALLELISM="${OMNIROUTE_MODEL_TEST_PARALLELISM:-6}"
+          MAX_MODELS="${OMNIROUTE_MAX_MODELS_PER_CYCLE:-100}"
+
+          TEST_DIR="${HOME}/omniroute-tests"
+          HISTORY_DIR="${TEST_DIR}/history"
+
+          mkdir -p "$HISTORY_DIR"
+
+          NOW_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          STAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
+
+          REPORT="$HISTORY_DIR/models-$STAMP.tsv"
+          PASS_LIST="$HISTORY_DIR/pass-models-$STAMP.txt"
+          COMBO_REPORT="$HISTORY_DIR/combos-$STAMP.txt"
+
+          CURL_AUTH=()
+          if [[ -n "$API_KEY" ]]; then
+            CURL_AUTH=(-H "Authorization: Bearer $API_KEY")
+          fi
+
+          echo "============================================================"
+          echo "OmniRoute model health cycle"
+          echo "UTC: $NOW_UTC"
+          echo "============================================================"
+
           curl \
             --silent \
             --show-error \
             --fail \
             --max-time 15 \
-            "http://127.0.0.1:$OMNIROUTE_PORT/v1/models" \
-            >/dev/null
+            "${CURL_AUTH[@]}" \
+            "$BASE_URL/v1/models" > "$TEST_DIR/models.json"
 
-          echo "===== TAILSCALE ====="
+          mapfile -t MODELS < <(
+            jq -r '
+              .data[]?.id
+              | select(type == "string")
+              | select(contains("/"))
+              | select(startswith("auto/") | not)
+              | select(. != "coding")
+              | select(. != "coding-fast")
+              | select(. != "reasoning")
+              | select(. != "fast")
+            ' "$TEST_DIR/models.json" |
+            sort -u |
+            head -n "$MAX_MODELS"
+          )
 
-          TAILSCALE_IP="$(
-            sudo tailscale ip -4 |
-            head -n 1
-          )"
+          if [[ "${#MODELS[@]}" -eq 0 ]]; then
+            echo "ERROR: No concrete provider/model IDs were found."
+            exit 1
+          fi
 
-          test -n "$TAILSCALE_IP"
+          echo "Testing ${#MODELS[@]} concrete models..."
+          printf 'timestamp\tstatus\tlatency_ms\tmodel\n' > "$REPORT"
 
-          echo "Tailscale IPv4: $TAILSCALE_IP"
-          echo "Final OmniRoute startup validation PASSED."
+          test_model() {
+            local model="$1"
+            local key
+            local tmp
+            local start
+            local end
+            local elapsed
+            local http_code
+
+            key="$(printf '%s' "$model" | sha256sum | cut -d' ' -f1)"
+            tmp="$TEST_DIR/.model-$key"
+
+            start="$(date +%s%3N)"
+
+            set +e
+            http_code="$(
+              curl \
+                --silent \
+                --show-error \
+                --output "$tmp.response" \
+                --write-out '%{http_code}' \
+                --max-time "$TEST_TIMEOUT" \
+                "${CURL_AUTH[@]}" \
+                -H 'Content-Type: application/json' \
+                -d "$(jq -nc \
+                  --arg model "$model" \
+                  '{
+                    model: $model,
+                    messages: [
+                      {role: "user", content: "Reply with exactly OK"}
+                    ],
+                    max_tokens: 16,
+                    stream: false
+                  }')" \
+                "$BASE_URL/v1/chat/completions" \
+                2>"$tmp.error"
+            )"
+            local status=$?
+            set -e
+
+            end="$(date +%s%3N)"
+            elapsed=$((end - start))
+
+            if [[ "$status" -eq 0 && "$http_code" =~ ^2 ]]; then
+              printf '%s\tPASS\t%s\t%s\n' \
+                "$NOW_UTC" "$elapsed" "$model" >> "$REPORT"
+              rm -f "$tmp.response" "$tmp.error"
+            else
+              printf '%s\tFAIL\t%s\t%s\n' \
+                "$NOW_UTC" "$elapsed" "$model" >> "$REPORT"
+
+              {
+                echo "MODEL=$model"
+                echo "HTTP=$http_code"
+                echo "CURL_EXIT=$status"
+                echo "ERROR:"
+                sed -n '1,12p' "$tmp.error" 2>/dev/null || true
+                echo "RESPONSE:"
+                sed -n '1,12p' "$tmp.response" 2>/dev/null || true
+                echo
+              } >> "$TEST_DIR/last-failures.log"
+
+              rm -f "$tmp.response" "$tmp.error"
+            fi
+          }
+
+          active=0
+          for model in "${MODELS[@]}"; do
+            test_model "$model" &
+            active=$((active + 1))
+
+            if (( active >= PARALLELISM )); then
+              wait
+              active=0
+            fi
+          done
+
+          wait
+
+          awk -F'\t' '$2=="PASS"{print $4}' "$REPORT" |
+            sort -u > "$PASS_LIST"
+
+          PASS_COUNT="$(wc -l < "$PASS_LIST" | tr -d ' ')"
+
+          echo
+          echo "PASS count: $PASS_COUNT"
+          echo "PASS models:"
+          cat "$PASS_LIST" || true
+
+          if [[ "$PASS_COUNT" -eq 0 ]]; then
+            echo "ERROR: Zero models passed. Existing combos will be preserved."
+            exit 2
+          fi
+
+          # --------------------------------------------------------
+          # Model ordering/classification.
+          #
+          # This is intentionally based only on health-test results.
+          # A PASS means the basic OpenAI-compatible smoke test works;
+          # it does NOT prove tool calling, reasoning quality, context
+          # length, or production suitability.
+          # --------------------------------------------------------
+
+          sort -t$'\t' -k3,3n "$REPORT" |
+            awk -F'\t' '$2=="PASS"{print $3 "\t" $4}' |
+            awk -F'\t' '!seen[$2]++' > "$TEST_DIR/passed-by-latency.tsv"
+
+          awk -F'\t' '
+            {
+              m=tolower($2)
+              if (
+                m ~ /code/ ||
+                m ~ /coder/ ||
+                m ~ /codestral/ ||
+                m ~ /codex/ ||
+                m ~ /deepseek/
+              ) print $1 "\t" $2
+            }
+          ' "$TEST_DIR/passed-by-latency.tsv" > "$TEST_DIR/passed-coding.tsv"
+
+          awk -F'\t' '
+            {
+              m=tolower($2)
+              if (
+                m ~ /reason/ ||
+                m ~ /think/ ||
+                m ~ /(^|[^0-9])r1([^0-9]|$)/ ||
+                m ~ /(^|[^0-9])o1([^0-9]|$)/ ||
+                m ~ /(^|[^0-9])o3([^0-9]|$)/ ||
+                m ~ /(^|[^0-9])o4([^0-9]|$)/
+              ) print $1 "\t" $2
+            }
+          ' "$TEST_DIR/passed-by-latency.tsv" > "$TEST_DIR/passed-reasoning.tsv"
+
+          head -n 8 \
+            "$TEST_DIR/passed-by-latency.tsv" > "$TEST_DIR/passed-fast.tsv"
+
+          head -n 8 \
+            "$TEST_DIR/passed-coding.tsv" > "$TEST_DIR/passed-coding-fast.tsv"
+
+          # If classification produces an empty pool, fall back to all
+          # currently healthy models rather than deleting the combo.
+          [[ -s "$TEST_DIR/passed-coding.tsv" ]] ||
+            cp "$TEST_DIR/passed-by-latency.tsv" "$TEST_DIR/passed-coding.tsv"
+
+          [[ -s "$TEST_DIR/passed-coding-fast.tsv" ]] ||
+            cp "$TEST_DIR/passed-coding.tsv" "$TEST_DIR/passed-coding-fast.tsv"
+
+          [[ -s "$TEST_DIR/passed-reasoning.tsv" ]] ||
+            cp "$TEST_DIR/passed-by-latency.tsv" "$TEST_DIR/passed-reasoning.tsv"
+
+          [[ -s "$TEST_DIR/passed-fast.tsv" ]] ||
+            cp "$TEST_DIR/passed-by-latency.tsv" "$TEST_DIR/passed-fast.tsv"
+
+          # --------------------------------------------------------
+          # Combo management.
+          #
+          # OmniRoute 3.8.49 supports creating combos via POST and
+          # editing them via PUT. Do not use PATCH here.
+          # --------------------------------------------------------
+
+          combo_auth=()
+          if [[ -n "$API_KEY" ]]; then
+            combo_auth=(-H "Authorization: Bearer $API_KEY")
+          fi
+
+          COMBOS_JSON="$TEST_DIR/combos.json"
+
+          curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 15 \
+            "${combo_auth[@]}" \
+            "$BASE_URL/api/combos" > "$COMBOS_JSON"
+
+          get_combo_id() {
+            local name="$1"
+
+            jq -r \
+              --arg name "$name" \
+              '.[]? | select(.name == $name) | .id' \
+              "$COMBOS_JSON" |
+              head -n 1
+          }
+
+          get_existing_models() {
+            local name="$1"
+
+            jq -r \
+              --arg name "$name" \
+              '.[]?
+               | select(.name == $name)
+               | (.models // [])
+               | .[]
+               | (.model // .id // empty)' \
+              "$COMBOS_JSON" 2>/dev/null || true
+          }
+
+          model_object() {
+            local model="$1"
+            local provider="${model%%/*}"
+
+            jq -nc \
+              --arg model "$model" \
+              --arg provider "$provider" \
+              '{
+                id: $model,
+                kind: "model",
+                model: $model,
+                providerId: $provider,
+                weight: 0
+              }'
+          }
+
+          build_models_json() {
+            local file="$1"
+            local combo_name="$2"
+            local tmp_existing="$TEST_DIR/existing-$combo_name.txt"
+            local tmp_all="$TEST_DIR/all-$combo_name.txt"
+
+            get_existing_models "$combo_name" |
+              while IFS= read -r model; do
+                [[ -n "$model" ]] && printf '%s\n' "$model"
+              done > "$tmp_existing"
+
+            : > "$tmp_all"
+
+            # Keep existing combo members first, but only when they passed
+            # the current health cycle.
+            while IFS= read -r model; do
+              [[ -z "$model" ]] && continue
+
+              if grep -Fxq "$model" "$PASS_LIST"; then
+                printf '%s\n' "$model" >> "$tmp_all"
+              fi
+            done < "$tmp_existing"
+
+            # Then append the newly healthy profile candidates.
+            while IFS=$'\t' read -r latency model; do
+              [[ -z "$model" ]] && continue
+              printf '%s\n' "$model" >> "$tmp_all"
+            done < "$file"
+
+            mapfile -t candidates < <(
+              cat "$tmp_all" |
+              awk 'NF && !seen[$0]++'
+            )
+
+            if [[ "${#candidates[@]}" -eq 0 ]]; then
+              # Never replace a healthy combo with an empty model list.
+              echo '[]'
+              return
+            fi
+
+            json='['
+
+            local first=1
+            for model in "${candidates[@]}"; do
+              if [[ "$first" -eq 0 ]]; then
+                json+=','
+              fi
+
+              first=0
+              json+="$(model_object "$model")"
+            done
+
+            json+=']'
+
+            printf '%s\n' "$json"
+          }
+
+          update_or_create_combo() {
+            local name="$1"
+            local candidate_file="$2"
+            local strategy="${3:-priority}"
+            local combo_id
+            local models_json
+            local body
+            local response
+
+            combo_id="$(get_combo_id "$name")"
+            models_json="$(build_models_json "$candidate_file" "$name")"
+
+            if [[ "$models_json" == "[]" ]]; then
+              echo "WARN: $name has no candidate models; preserving existing combo."
+              return 0
+            fi
+
+            if [[ -n "$combo_id" ]]; then
+              # Preserve only server-owned fields that PUT expects.
+              body="$(
+                jq -nc \
+                  --arg name "$name" \
+                  --arg strategy "$strategy" \
+                  --argjson models "$models_json" \
+                  '{
+                    name: $name,
+                    strategy: $strategy,
+                    models: $models
+                  }'
+              )"
+
+              response="$(
+                curl \
+                  --silent \
+                  --show-error \
+                  --fail \
+                  --max-time 20 \
+                  --request PUT \
+                  "${combo_auth[@]}" \
+                  -H 'Content-Type: application/json' \
+                  -d "$body" \
+                  "$BASE_URL/api/combos/$combo_id"
+              )"
+
+              printf '%s\n' "$response" > "$TEST_DIR/combo-response-$name.json"
+
+              echo "UPDATED combo: $name ($combo_id)"
+            else
+              body="$(
+                jq -nc \
+                  --arg name "$name" \
+                  --arg strategy "$strategy" \
+                  --argjson models "$models_json" \
+                  '{
+                    name: $name,
+                    strategy: $strategy,
+                    models: $models
+                  }'
+              )"
+
+              response="$(
+                curl \
+                  --silent \
+                  --show-error \
+                  --fail \
+                  --max-time 20 \
+                  --request POST \
+                  "${combo_auth[@]}" \
+                  -H 'Content-Type: application/json' \
+                  -d "$body" \
+                  "$BASE_URL/api/combos"
+              )"
+
+              printf '%s\n' "$response" > "$TEST_DIR/combo-response-$name.json"
+
+              echo "CREATED combo: $name"
+            fi
+
+            {
+              echo "[$name]"
+              echo "$models_json" | jq -r '.[].model'
+              echo
+            } >> "$COMBO_REPORT"
+          }
+
+          : > "$COMBO_REPORT"
+
+          update_or_create_combo \
+            "coding" \
+            "$TEST_DIR/passed-coding.tsv" \
+            "priority"
+
+          update_or_create_combo \
+            "coding-fast" \
+            "$TEST_DIR/passed-coding-fast.tsv" \
+            "priority"
+
+          update_or_create_combo \
+            "reasoning" \
+            "$TEST_DIR/passed-reasoning.tsv" \
+            "priority"
+
+          update_or_create_combo \
+            "fast" \
+            "$TEST_DIR/passed-fast.tsv" \
+            "priority"
+
+          echo
+          echo "============================================================"
+          echo "UPDATED COMBOS"
+          echo "============================================================"
+
+          cat "$COMBO_REPORT"
+
+          # Keep a stable latest report for SSH/manual inspection.
+          cp "$REPORT" "$TEST_DIR/latest-models.tsv"
+          cp "$PASS_LIST" "$TEST_DIR/pass-models.txt"
+          cp "$COMBO_REPORT" "$TEST_DIR/latest-combos.txt"
+
+          # Retain only the latest 48 cycles (~24 hours at 30-min cadence).
+          find "$HISTORY_DIR" -type f -printf '%T@ %p\n' |
+            sort -nr |
+            awk 'NR>96{print $2}' |
+            xargs -r rm -f
+
+          echo "Model health/combo synchronization completed."
+          SCRIPT
+
+          sudo chmod 750 "$OMNIROUTE_TEST_DIR/check-and-sync.sh"
+          sudo chown "$SSH_USERNAME:$SSH_USERNAME" "$OMNIROUTE_TEST_DIR/check-and-sync.sh"
+
+          echo "Health-check script installed."
 
       # ==========================================================
-      # 25. CREATE SUCCESSFUL-START MARKER
+      # 19. INITIAL MODEL CHECK + COMBO SYNC
       # ==========================================================
-      - name: 25. Mark Successful OmniRoute Startup
+      - name: 19. Initial Model Check And Combo Sync
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
+          OMNIROUTE_BASE_URL: ${{ env.OMNIROUTE_BASE_URL }}
+          OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS: ${{ env.OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS }}
+          OMNIROUTE_MODEL_TEST_PARALLELISM: ${{ env.OMNIROUTE_MODEL_TEST_PARALLELISM }}
+          OMNIROUTE_MAX_MODELS_PER_CYCLE: ${{ env.OMNIROUTE_MAX_MODELS_PER_CYCLE }}
         run: |
           set -euo pipefail
 
-          touch "$RUNNER_TEMP/omniroute-started"
-
-          echo "Successful-start marker created."
+          sudo -u "$SSH_USERNAME" \
+            env \
+              OMNIROUTE_BASE_URL="$OMNIROUTE_BASE_URL" \
+              OMNIROUTE_API_KEY="$OMNIROUTE_API_KEY" \
+              OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS="$OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS" \
+              OMNIROUTE_MODEL_TEST_PARALLELISM="$OMNIROUTE_MODEL_TEST_PARALLELISM" \
+              OMNIROUTE_MAX_MODELS_PER_CYCLE="$OMNIROUTE_MAX_MODELS_PER_CYCLE" \
+            /home/"$SSH_USERNAME"/omniroute-tests/check-and-sync.sh
 
       # ==========================================================
-      # 26. SEND TELEGRAM NOTIFICATION
+      # 20. TELEGRAM ONLINE NOTIFICATION
       # ==========================================================
-      - name: 26. Send Tailscale Connection Information To Telegram
+      - name: 20. Send Tailscale Connection Information To Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -844,13 +995,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          TAILSCALE_IP="$(
-            sudo tailscale ip -4 |
-            head -n 1
-          )"
-
-          test -n "$TAILSCALE_IP"
-
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
           TAILSCALE_DNS="$(
             sudo tailscale dns status 2>/dev/null |
             grep -Eo '[A-Za-z0-9._-]+\.ts\.net' |
@@ -858,132 +1003,149 @@ jobs:
             true
           )"
 
-          [ -z "$TAILSCALE_DNS" ] &&
-            TAILSCALE_DNS="Not detected"
+          TAILSCALE_DNS="${TAILSCALE_DNS:-Not detected}"
 
           MESSAGE="$(cat <<EOF
           🚀 OmniRoute Linux Server is ONLINE
           ━━━━━━━━━━━━━━━━━━━━
-          Tailscale
-          ━━━━━━━━━━━━━━━━━━━━
-
           Hostname:
           $TAILSCALE_DNS
 
           IP:
           $TAILSCALE_IP
 
-          ━━━━━━━━━━━━━━━━━━━━
-          SSH
-          ━━━━━━━━━━━━━━━━━━━━
-
+          SSH:
           ssh $SSH_USERNAME@$TAILSCALE_IP
 
-          Port:
-          22
-
-          ━━━━━━━━━━━━━━━━━━━━
-          OmniRoute
-          ━━━━━━━━━━━━━━━━━━━━
-
-          URL:
-          http://$TAILSCALE_IP:$OMNIROUTE_PORT
-
-          API:
+          OmniRoute:
           http://$TAILSCALE_IP:$OMNIROUTE_PORT/v1
-
-          Port:
-          $OMNIROUTE_PORT
-
-          Bind:
-          0.0.0.0
 
           Version:
           $OMNIROUTE_VERSION
 
-          ━━━━━━━━━━━━━━━━━━━━
-          Status
-          ━━━━━━━━━━━━━━━━━━━━
+          Model health:
+          every $OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES minutes
 
-          Service: RUNNING
-          Runtime: approximately 6 hours
-
-          The GitHub Actions runner is active.
+          Combo policy:
+          PASS-only models
           EOF
           )"
 
-          RESPONSE="$(
-            curl \
-              --silent \
-              --show-error \
-              --fail \
-              --max-time 20 \
-              --request POST \
-              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=${MESSAGE}"
-          )"
-
-          echo "$RESPONSE" |
-            grep -q '"ok":true' || {
-              echo "ERROR: Telegram API did not report success."
-              exit 1
-            }
-
-          echo "Telegram notification sent."
+          curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 20 \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" \
+            >/dev/null
 
       # ==========================================================
-      # 27. KEEP RUNNER ALIVE (~6 HOURS)
+      # 21. KEEP RUNNER ALIVE + CHECK EVERY 30 MINUTES
       # ==========================================================
-      - name: 27. Keep Runner Alive
+      - name: 21. Keep Runner Alive And Maintain Combos
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
+          OMNIROUTE_BASE_URL: ${{ env.OMNIROUTE_BASE_URL }}
+          OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS: ${{ env.OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS }}
+          OMNIROUTE_MODEL_TEST_PARALLELISM: ${{ env.OMNIROUTE_MODEL_TEST_PARALLELISM }}
+          OMNIROUTE_MAX_MODELS_PER_CYCLE: ${{ env.OMNIROUTE_MAX_MODELS_PER_CYCLE }}
         run: |
           set -euo pipefail
 
-          echo "============================================================"
-          echo "PRODUCTION MODE – Keeping OmniRoute runner alive"
-          echo "Runtime minutes: $OMNIROUTE_RUNTIME_MINUTES"
-          echo "============================================================"
+          TEST_SCRIPT="/home/$SSH_USERNAME/omniroute-tests/check-and-sync.sh"
+          TOTAL_SECONDS=$((OMNIROUTE_RUNTIME_MINUTES * 60))
+          INTERVAL_SECONDS=$((OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES * 60))
+          STARTED_AT="$(date +%s)"
+          CYCLE=1
 
-          for ((i=1; i<=OMNIROUTE_RUNTIME_MINUTES; i++)); do
+          echo "Production runtime: $OMNIROUTE_RUNTIME_MINUTES minutes"
+          echo "Model health interval: $OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES minutes"
 
-            echo
-            echo "===== RUNTIME MINUTE $i / $OMNIROUTE_RUNTIME_MINUTES ====="
+          while true; do
+            NOW="$(date +%s)"
+            ELAPSED=$((NOW - STARTED_AT))
 
-            echo "OmniRoute service:"
-            sudo systemctl is-active omniroute || true
-
-            echo "Listening port:"
-            sudo ss -lntp |
-              grep ":$OMNIROUTE_PORT " ||
-              true
-
-            echo "Tailscale:"
-            sudo tailscale ip -4 || true
-
-            echo "SQLite:"
-
-            DB="/home/$SSH_USERNAME/.omniroute/storage.sqlite"
-
-            if [ -f "$DB" ]; then
-              stat \
-                -c 'size=%s bytes modified=%y' \
-                "$DB" ||
-                true
-            else
-              echo "storage.sqlite not present."
+            if (( ELAPSED >= TOTAL_SECONDS )); then
+              break
             fi
 
-            sleep 60
+            echo
+            echo "============================================================"
+            echo "MAINTENANCE CYCLE $CYCLE"
+            echo "Elapsed: $((ELAPSED / 60)) / $OMNIROUTE_RUNTIME_MINUTES minutes"
+            echo "UTC: $(date -u)"
+            echo "============================================================"
+
+            if ! sudo systemctl is-active --quiet omniroute; then
+              echo "ERROR: OmniRoute stopped unexpectedly."
+              sudo systemctl --no-pager --full status omniroute || true
+              sudo journalctl -u omniroute --no-pager -n 100 || true
+              exit 1
+            fi
+
+            if ! curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 15 \
+              "$OMNIROUTE_BASE_URL/v1/models" >/dev/null; then
+              echo "ERROR: OmniRoute health endpoint failed."
+              exit 1
+            fi
+
+            set +e
+            sudo -u "$SSH_USERNAME" \
+              env \
+                OMNIROUTE_BASE_URL="$OMNIROUTE_BASE_URL" \
+                OMNIROUTE_API_KEY="$OMNIROUTE_API_KEY" \
+                OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS="$OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS" \
+                OMNIROUTE_MODEL_TEST_PARALLELISM="$OMNIROUTE_MODEL_TEST_PARALLELISM" \
+                OMNIROUTE_MAX_MODELS_PER_CYCLE="$OMNIROUTE_MAX_MODELS_PER_CYCLE" \
+              "$TEST_SCRIPT"
+            CHECK_STATUS=$?
+            set -e
+
+            case "$CHECK_STATUS" in
+              0)
+                echo "Model health and combo synchronization PASSED."
+                ;;
+              2)
+                echo "WARNING: No healthy models were found."
+                echo "Existing combos were preserved."
+                ;;
+              *)
+                echo "ERROR: Model health/combo synchronization failed."
+                exit "$CHECK_STATUS"
+                ;;
+            esac
+
+            CYCLE=$((CYCLE + 1))
+
+            REMAINING=$((TOTAL_SECONDS - ( $(date +%s) - STARTED_AT ) ))
+
+            if (( REMAINING <= 0 )); then
+              break
+            fi
+
+            SLEEP_SECONDS="$INTERVAL_SECONDS"
+            if (( SLEEP_SECONDS > REMAINING )); then
+              SLEEP_SECONDS="$REMAINING"
+            fi
+
+            echo "Sleeping $SLEEP_SECONDS seconds until next health cycle..."
+            sleep "$SLEEP_SECONDS"
           done
 
           echo "Runtime period completed."
 
       # ==========================================================
-      # 28. STOP OMNIROUTE AND RELEASE SQLITE
+      # 22. STOP OMNIROUTE BEFORE SQLITE PERSISTENCE
       # ==========================================================
-      - name: 28. Stop OmniRoute Before Persistence
+      - name: 22. Stop OmniRoute Before Persistence
         if: ${{ !cancelled() }}
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
@@ -993,320 +1155,86 @@ jobs:
           OMNIROUTE_HOME="/home/$SSH_USERNAME/.omniroute"
           DB="$OMNIROUTE_HOME/storage.sqlite"
 
-          echo "============================================================"
-          echo "STOPPING OMNIROUTE"
-          echo "============================================================"
-
           sudo systemctl stop omniroute || true
 
           for i in {1..30}; do
             if ! sudo systemctl is-active --quiet omniroute; then
-              echo "OmniRoute systemd service is inactive."
               break
             fi
-
-            echo "Waiting for OmniRoute service to stop... ($i/30)"
             sleep 1
           done
 
           if sudo systemctl is-active --quiet omniroute; then
-            echo "ERROR: OmniRoute service is still active."
-
-            sudo systemctl \
-              --no-pager \
-              --full \
-              status omniroute ||
-              true
-
+            echo "ERROR: OmniRoute is still active."
+            sudo systemctl --no-pager --full status omniroute || true
             exit 1
           fi
-
-          echo "Sending SIGTERM to all OmniRoute service processes..."
-
-          sudo systemctl kill \
-            --kill-who=all \
-            --signal=TERM \
-            omniroute ||
-            true
-
-          sleep 5
-
-          echo "Sending SIGKILL to remaining OmniRoute service processes..."
-
-          sudo systemctl kill \
-            --kill-who=all \
-            --signal=KILL \
-            omniroute ||
-            true
-
-          sleep 3
-
-          if sudo systemctl is-active --quiet omniroute; then
-            echo "ERROR: OmniRoute is still active after forced termination."
-
-            sudo systemctl \
-              --no-pager \
-              --full \
-              status omniroute ||
-              true
-
-            exit 1
-          fi
-
-          echo "Checking for processes holding SQLite database..."
 
           for i in {1..30}; do
+            HOLDERS="$(sudo fuser "$DB" 2>/dev/null || true)"
 
-            HOLDERS="$(
-              sudo fuser "$DB" 2>/dev/null ||
-              true
-            )"
-
-            if [ -z "$HOLDERS" ]; then
-              echo "No process is holding $DB."
+            if [[ -z "$HOLDERS" ]]; then
               break
             fi
 
-            echo "Database is still open by:"
-            echo "$HOLDERS"
-
+            echo "SQLite holders: $HOLDERS"
             sudo fuser -TERM "$DB" 2>/dev/null || true
-
             sleep 2
           done
 
-          HOLDERS="$(
-            sudo fuser "$DB" 2>/dev/null ||
-            true
-          )"
+          HOLDERS="$(sudo fuser "$DB" 2>/dev/null || true)"
 
-          if [ -n "$HOLDERS" ]; then
-
-            echo "WARNING: Database still has open handles."
-            echo "Sending SIGKILL to database holders..."
-
+          if [[ -n "$HOLDERS" ]]; then
             sudo fuser -KILL "$DB" 2>/dev/null || true
-
             sleep 3
           fi
 
-          HOLDERS="$(
-            sudo fuser "$DB" 2>/dev/null ||
-            true
-          )"
+          HOLDERS="$(sudo fuser "$DB" 2>/dev/null || true)"
 
-          if [ -n "$HOLDERS" ]; then
-
-            echo "ERROR: Database is still held by:"
-            echo "$HOLDERS"
-
-            echo "===== WHO OWNS THE DATABASE ====="
+          if [[ -n "$HOLDERS" ]]; then
             sudo fuser -v "$DB" || true
-
-            echo "===== OPEN FILE HANDLES ====="
             sudo lsof "$DB" 2>/dev/null || true
-
             exit 1
           fi
 
-          echo "SQLite database has no open handles."
-          echo "Waiting 5 seconds before finalization..."
-
-          sleep 5
-
-          echo "OmniRoute shutdown completed successfully."
+          echo "OmniRoute stopped and SQLite is free."
 
       # ==========================================================
-      # 29. PERSISTENCE GATE
+      # 23. FINALIZE SQLITE
       # ==========================================================
-      - name: 29. Determine Persistence Eligibility
-        id: persistence_gate
+      - name: 23. Finalize SQLite Database
         if: ${{ !cancelled() }}
-        run: |
-          set -euo pipefail
-
-          MARKER="$RUNNER_TEMP/omniroute-started"
-
-          if [ ! -f "$MARKER" ]; then
-            echo "Successful startup marker does not exist."
-            echo "The persistent repository database will NOT be replaced."
-
-            echo "persist=false" >> "$GITHUB_OUTPUT"
-
-            exit 0
-          fi
-
-          if sudo systemctl is-active --quiet omniroute; then
-            echo "ERROR: OmniRoute is still running."
-
-            echo "persist=false" >> "$GITHUB_OUTPUT"
-
-            exit 1
-          fi
-
-          echo "Startup marker exists."
-          echo "OmniRoute is stopped."
-
-          echo "persist=true" >> "$GITHUB_OUTPUT"
-
-      # ==========================================================
-      # 30. FINALIZE SQLITE DATABASE
-      # ==========================================================
-      - name: 30. Finalize SQLite Database
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
           set -euo pipefail
 
-          DB="/home/${SSH_USERNAME}/.omniroute/storage.sqlite"
+          DB="/home/$SSH_USERNAME/.omniroute/storage.sqlite"
 
-          echo "============================================================"
-          echo "FINAL SQLITE FINALIZATION"
-          echo "DB path: $DB"
-          echo "============================================================"
+          test -s "$DB"
 
-          if [ ! -f "$DB" ]; then
-            echo "ERROR: Database does not exist: $DB"
-            ls -la "/home/${SSH_USERNAME}/.omniroute/" || true
-            exit 1
-          fi
+          sudo -u "$SSH_USERNAME" \
+            sqlite3 \
+            -cmd ".timeout 60000" \
+            "$DB" \
+            "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null
 
-          if [ ! -s "$DB" ]; then
-            echo "ERROR: Database is empty (0 bytes)."
-            exit 1
-          fi
+          sudo -u "$SSH_USERNAME" \
+            sqlite3 \
+            -cmd ".timeout 60000" \
+            "$DB" \
+            "PRAGMA integrity_check;" |
+            grep -Fxq "ok"
 
-          echo "Database size: $(stat -c '%s' "$DB") bytes"
+          sudo rm -f "$DB-wal" "$DB-shm"
 
-          echo "Checking for processes holding the database..."
-
-          for attempt in {1..8}; do
-
-            HOLDERS="$(
-              sudo fuser "$DB" 2>/dev/null ||
-              true
-            )"
-
-            if [ -z "$HOLDERS" ]; then
-              echo "No process is holding the database."
-              break
-            fi
-
-            echo "Attempt $attempt: holders = $HOLDERS"
-
-            sudo fuser -v "$DB" 2>/dev/null || true
-
-            sudo fuser -KILL "$DB" 2>/dev/null || true
-
-            sleep 2
-          done
-
-          HOLDERS="$(
-            sudo fuser "$DB" 2>/dev/null ||
-            true
-          )"
-
-          if [ -n "$HOLDERS" ]; then
-            echo "ERROR: Still cannot release database."
-
-            sudo fuser -v "$DB" || true
-            sudo lsof "$DB" 2>/dev/null || true
-
-            exit 1
-          fi
-
-          echo "Running WAL checkpoint (TRUNCATE)..."
-
-          CHECKPOINT_OK=0
-
-          for i in {1..12}; do
-
-            echo "--- Checkpoint attempt $i/12 ---"
-
-            set +e
-
-            OUTPUT="$(
-              sudo -u "$SSH_USERNAME" \
-                sqlite3 \
-                -cmd ".timeout 60000" \
-                "$DB" \
-                "PRAGMA wal_checkpoint(TRUNCATE);" \
-                2>&1
-            )"
-
-            STATUS=$?
-
-            set -e
-
-            echo "sqlite3 exit code: $STATUS"
-            echo "sqlite3 output: [$OUTPUT]"
-
-            if [ "$STATUS" -eq 0 ]; then
-              CHECKPOINT_OK=1
-              break
-            fi
-
-            sleep 3
-          done
-
-          if [ "$CHECKPOINT_OK" -ne 1 ]; then
-            echo "ERROR: WAL checkpoint failed after retries."
-
-            sudo ls -la "$DB"* 2>/dev/null || true
-            sudo fuser -v "$DB" 2>/dev/null || true
-
-            exit 1
-          fi
-
-          echo "WAL checkpoint succeeded."
-
-          echo "Running final integrity check..."
-
-          set +e
-
-          RESULT="$(
-            sudo -u "$SSH_USERNAME" \
-              sqlite3 \
-              -cmd ".timeout 60000" \
-              "$DB" \
-              "PRAGMA integrity_check;" \
-              2>&1
-          )"
-
-          STATUS=$?
-
-          set -e
-
-          echo "integrity_check exit code: $STATUS"
-          echo "integrity_check output: [$RESULT]"
-
-          if [ "$STATUS" -ne 0 ]; then
-            echo "ERROR: integrity_check command failed."
-            exit 1
-          fi
-
-          if ! echo "$RESULT" |
-            tr -d '[:space:]' |
-            grep -qx "ok"; then
-
-            echo "ERROR: integrity_check did not return 'ok'."
-            exit 1
-          fi
-
-          echo "SQLite integrity check PASSED."
-
-          sudo rm -f \
-            "${DB}-wal" \
-            "${DB}-shm"
-
-          echo "Final SQLite database is ready for repository copy."
+          echo "SQLite finalization passed."
 
       # ==========================================================
-      # 31. AUTHENTICATE GITHUB CLI
+      # 24. AUTHENTICATE GITHUB CLI
       # ==========================================================
-      - name: 31. Authenticate GitHub CLI
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
+      - name: 24. Authenticate GitHub CLI
+        if: ${{ !cancelled() }}
         env:
           GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
         run: |
@@ -1320,26 +1248,11 @@ jobs:
 
           gh auth setup-git
 
-          echo "GitHub CLI authentication configured."
-
       # ==========================================================
-      # 32. VERIFY REPOSITORY
+      # 25. SYNCHRONIZE REPOSITORY SAFELY
       # ==========================================================
-      - name: 32. Verify GitHub Repository
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
-        run: |
-          set -euo pipefail
-
-          gh repo view "$GITHUB_REPOSITORY" \
-            --json nameWithOwner,url
-
-          echo "GitHub repository verified."
-
-      # ==========================================================
-      # 33. SYNCHRONIZE REPOSITORY
-      # ==========================================================
-      - name: 33. Synchronize Git Repository
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
+      - name: 25. Synchronize Git Repository
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
 
@@ -1350,26 +1263,24 @@ jobs:
 
           git fetch origin --prune
 
+          # Pull remote changes first. Never force-push over remote state.
           git checkout -B "$BRANCH" "origin/$BRANCH"
 
           echo "Repository synchronized with origin/$BRANCH."
 
       # ==========================================================
-      # 34. SECURITY CHECK
+      # 26. SECURITY CHECK
       # ==========================================================
-      - name: 34. Security Check Before Persistence
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
+      - name: 26. Security Check Before Persistence
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
 
           if git ls-files |
             grep -E '(^|/)\.env$|(^|/)logs/|\.log$'; then
-
-            echo "ERROR: Forbidden .env or log file is tracked."
+            echo "ERROR: Forbidden .env/log file is tracked."
             exit 1
           fi
-
-          echo "No forbidden .env/log file is tracked."
 
           if find "$GITHUB_WORKSPACE" \
             -type f \
@@ -1377,111 +1288,38 @@ jobs:
             -not -path "$GITHUB_WORKSPACE/.git/*" \
             -print -quit |
             grep -q .; then
-
             echo "ERROR: .env or .log exists in workspace."
             exit 1
           fi
 
-          echo "Workspace security check passed."
+          echo "Security check passed."
 
       # ==========================================================
-      # 35. REMOVE LEGACY BACKUPS
+      # 27. REMOVE LEGACY BACKUPS
       # ==========================================================
-      - name: 35. Remove Legacy Backup Artifacts
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
+      - name: 27. Remove Legacy Backup Artifacts
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
 
-          rm -rf \
-            "$GITHUB_WORKSPACE/backup/omniroute/data"
-
-          rm -f \
-            "$GITHUB_WORKSPACE/backup/omniroute/omniroute-full-backup.tar.gz"
-
-          echo "Legacy backup artifacts removed."
+          rm -rf "$GITHUB_WORKSPACE/backup/omniroute/data"
+          rm -f "$GITHUB_WORKSPACE/backup/omniroute/omniroute-full-backup.tar.gz"
 
       # ==========================================================
-      # 36. BACKUP SQLITE DATABASE TO REPOSITORY
+      # 28. COPY SQLITE TO REPOSITORY
       # ==========================================================
-      - name: 36. Backup SQLite Database To Repository
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
+      - name: 28. Backup SQLite Database To Repository
+        if: ${{ !cancelled() }}
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
           set -euo pipefail
 
-          DB="/home/${SSH_USERNAME}/.omniroute/storage.sqlite"
-          REPO_DB="${GITHUB_WORKSPACE}/${OMNIROUTE_DB_PATH}"
+          DB="/home/$SSH_USERNAME/.omniroute/storage.sqlite"
+          REPO_DB="$GITHUB_WORKSPACE/$OMNIROUTE_DB_PATH"
 
-          echo "============================================================"
-          echo "COPYING FINALIZED SQLITE DATABASE"
-          echo "Source : $DB"
-          echo "Target : $REPO_DB"
-          echo "============================================================"
-
-          if sudo systemctl is-active --quiet omniroute; then
-            echo "ERROR: OmniRoute is still running!"
-            sudo systemctl status omniroute --no-pager || true
-            exit 1
-          fi
-
-          HOLDERS="$(
-            sudo fuser "$DB" 2>/dev/null ||
-            true
-          )"
-
-          if [ -n "$HOLDERS" ]; then
-
-            echo "WARNING: holders still present -> killing..."
-
-            sudo fuser -KILL "$DB" 2>/dev/null || true
-
-            sleep 3
-
-            HOLDERS="$(
-              sudo fuser "$DB" 2>/dev/null ||
-              true
-            )"
-
-            if [ -n "$HOLDERS" ]; then
-              echo "ERROR: Could not release database."
-
-              sudo fuser -v "$DB" || true
-
-              exit 1
-            fi
-          fi
-
-          if [ ! -f "$DB" ] || [ ! -s "$DB" ]; then
-            echo "ERROR: Source database missing or empty."
-            exit 1
-          fi
-
-          set +e
-
-          RESULT="$(
-            sudo -u "$SSH_USERNAME" \
-              sqlite3 \
-              -cmd ".timeout 60000" \
-              "$DB" \
-              "PRAGMA integrity_check;" \
-              2>&1
-          )"
-
-          STATUS=$?
-
-          set -e
-
-          echo "Pre-copy integrity: exit=$STATUS output=[$RESULT]"
-
-          if [ "$STATUS" -ne 0 ] ||
-             ! echo "$RESULT" |
-             tr -d '[:space:]' |
-             grep -qx "ok"; then
-
-            echo "ERROR: Source database failed integrity check."
-            exit 1
-          fi
+          test -s "$DB"
+          test -z "$(sudo fuser "$DB" 2>/dev/null || true)"
 
           mkdir -p "$(dirname "$REPO_DB")"
 
@@ -1489,129 +1327,47 @@ jobs:
             sqlite3 "$DB" \
             ".backup '$REPO_DB'"
 
-          if [ ! -s "$REPO_DB" ]; then
-            echo "sqlite3 .backup failed or produced empty file."
-            echo "Falling back to cp."
-
-            sudo cp -f "$DB" "$REPO_DB"
-          fi
-
-          sudo chown \
-            "$(id -u):$(id -g)" \
-            "$REPO_DB"
-
-          chmod 600 "$REPO_DB"
-
-          echo "Copied database:"
-          ls -lh "$REPO_DB"
-
-          set +e
-
-          RESULT="$(
-            sqlite3 \
-              -cmd ".timeout 60000" \
-              "$REPO_DB" \
-              "PRAGMA integrity_check;" \
-              2>&1
-          )"
-
-          STATUS=$?
-
-          set -e
-
-          echo "Repo integrity: exit=$STATUS output=[$RESULT]"
-
-          if [ "$STATUS" -ne 0 ] ||
-             ! echo "$RESULT" |
-             tr -d '[:space:]' |
-             grep -qx "ok"; then
-
-            echo "ERROR: Repository copy failed integrity check."
+          if [[ ! -s "$REPO_DB" ]]; then
+            echo "ERROR: SQLite backup produced an empty file."
             exit 1
           fi
 
-          rm -f \
-            "${REPO_DB}-wal" \
-            "${REPO_DB}-shm"
-
-          echo "SQLite database copied successfully."
-
-      # ==========================================================
-      # 37. VALIDATE REPOSITORY SQLITE DATABASE
-      # ==========================================================
-      - name: 37. Validate Repository SQLite Database
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
-        run: |
-          set -euo pipefail
-
-          REPO_DB="$GITHUB_WORKSPACE/$OMNIROUTE_DB_PATH"
-
-          echo "===== REPOSITORY SQLITE VALIDATION ====="
-
-          test -f "$REPO_DB" || {
-            echo "ERROR: Repository database does not exist."
-            exit 1
-          }
-
-          test -s "$REPO_DB" || {
-            echo "ERROR: Repository database is empty."
-            exit 1
-          }
-
+          chown "$(id -u):$(id -g)" "$REPO_DB"
           chmod 600 "$REPO_DB"
-
-          echo "Running repository database integrity check..."
 
           sqlite3 \
-            -cmd ".timeout 30000" \
+            -cmd ".timeout 60000" \
             "$REPO_DB" \
             "PRAGMA integrity_check;" |
             grep -Fxq "ok"
 
-          echo "Repository SQLite integrity check PASSED."
+          rm -f "$REPO_DB-wal" "$REPO_DB-shm"
 
-          if [ -f "$REPO_DB-wal" ]; then
-            echo "ERROR: repository WAL file exists."
-            exit 1
-          fi
-
-          if [ -f "$REPO_DB-shm" ]; then
-            echo "ERROR: repository SHM file exists."
-            exit 1
-          fi
-
-          echo "No SQLite WAL/SHM sidecars exist."
-
-          ls -lh "$REPO_DB"
-
-          echo "Repository SQLite database is valid."
+          echo "Repository SQLite backup is valid."
 
       # ==========================================================
-      # 38. CHECK DATABASE SIZE
+      # 29. CHECK DATABASE SIZE
       # ==========================================================
-      - name: 38. Check SQLite File Size
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
+      - name: 29. Check SQLite File Size
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
 
           REPO_DB="$GITHUB_WORKSPACE/$OMNIROUTE_DB_PATH"
-
           DB_SIZE="$(stat -c '%s' "$REPO_DB")"
 
           echo "SQLite database size: $DB_SIZE bytes"
 
-          if [ "$DB_SIZE" -gt 99614720 ]; then
+          if (( DB_SIZE > 99614720 )); then
             echo "ERROR: SQLite database exceeds 95 MB."
             exit 1
           fi
 
-          echo "SQLite size is within the safety limit."
-
       # ==========================================================
-      # 39. STAGE SQLITE
+      # 30. STAGE ONLY PERSISTENT STATE
       # ==========================================================
-      - name: 39. Stage SQLite Database
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
+      - name: 30. Stage SQLite Database
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
 
@@ -1620,48 +1376,21 @@ jobs:
           git add -u \
             -- backup/omniroute/data \
                backup/omniroute/omniroute-full-backup.tar.gz \
-            2>/dev/null ||
-            true
-
-          echo "===== STAGED CHANGES ====="
-
-          git diff --cached --name-status || true
-
-      # ==========================================================
-      # 40. VERIFY STAGED CONTENT
-      # ==========================================================
-      - name: 40. Verify Staged Contents
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
-        run: |
-          set -euo pipefail
+            2>/dev/null || true
 
           if git diff --cached --name-only |
-            grep -E '(^|/)\.env$|(^|/)logs/|\.log$'; then
-
-            echo "ERROR: .env or log file is staged."
+            grep -E '(^|/)\.env$|(^|/)logs/|\.log$|storage\.sqlite-(wal|shm)$'; then
+            echo "ERROR: Secret/log/SQLite sidecar is staged."
             exit 1
           fi
 
-          if git diff --cached --name-only |
-            grep -E '(^|/)storage\.sqlite-(wal|shm)$'; then
-
-            echo "ERROR: SQLite sidecar files are staged."
-            exit 1
-          fi
-
-          echo "Staged security validation passed."
-
-          if git diff --cached --quiet -- "$OMNIROUTE_DB_PATH"; then
-            echo "SQLite database is unchanged from repository HEAD."
-          else
-            echo "SQLite database has changed and is staged."
-          fi
+          git diff --cached --name-status
 
       # ==========================================================
-      # 41. COMMIT
+      # 31. COMMIT
       # ==========================================================
-      - name: 41. Commit Updated OmniRoute Database
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
+      - name: 31. Commit Updated OmniRoute State
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
 
@@ -1670,30 +1399,53 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: persist OmniRoute state"
-
-          echo "Commit created:"
-          git log -1 --oneline
+          git commit -m "chore: persist OmniRoute state and healthy model combos"
 
       # ==========================================================
-      # 42. PUSH
+      # 32. PUSH
       # ==========================================================
-      - name: 42. Push Updated OmniRoute Database
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
+      - name: 32. Push Updated OmniRoute State
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
 
           BRANCH="${GITHUB_REF_NAME:-main}"
 
+          git fetch origin "$BRANCH"
+
+          COUNTS="$(
+            git rev-list \
+              --left-right \
+              --count \
+              "origin/$BRANCH...HEAD"
+          )"
+
+          BEHIND="$(awk '{print $1}' <<< "$COUNTS")"
+          AHEAD="$(awk '{print $2}' <<< "$COUNTS")"
+
+          echo "Behind: $BEHIND"
+          echo "Ahead : $AHEAD"
+
+          test "$BEHIND" -eq 0 || {
+            echo "ERROR: Local branch diverged from origin/$BRANCH."
+            echo "Refusing to overwrite remote history."
+            exit 1
+          }
+
+          if [[ "$AHEAD" -eq 0 ]]; then
+            echo "No new local commit to push."
+            exit 0
+          fi
+
           git push origin "$BRANCH"
 
-          echo "OmniRoute database pushed to GitHub."
+          echo "State pushed to GitHub."
 
       # ==========================================================
-      # 43. FINAL REPOSITORY VALIDATION
+      # 33. FINAL REPOSITORY VALIDATION
       # ==========================================================
-      - name: 43. Final Repository Validation
-        if: ${{ !cancelled() && steps.persistence_gate.outputs.persist == 'true' }}
+      - name: 33. Final Repository Validation
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
 
@@ -1709,8 +1461,6 @@ jobs:
 
           test "$LOCAL_COMMIT" = "$REMOTE_COMMIT"
 
-          echo "===== SQLITE IN GIT ====="
-
           git ls-tree \
             -r \
             --name-only \
@@ -1718,9 +1468,14 @@ jobs:
             "$OMNIROUTE_DB_PATH" |
             grep -Fxq "$OMNIROUTE_DB_PATH"
 
-          echo "SQLite database exists in pushed commit."
-
-          echo "===== WORKFLOW PRESERVATION ====="
+          if git ls-tree \
+            -r \
+            --name-only \
+            HEAD |
+            grep -E '(^|/)\.env$|(^|/)logs/|\.log$|storage\.sqlite-(wal|shm)$'; then
+            echo "ERROR: Forbidden file exists in Git."
+            exit 1
+          fi
 
           WORKFLOW_COUNT="$(
             git ls-tree \
@@ -1731,71 +1486,21 @@ jobs:
               wc -l
           )"
 
-          if [ "$WORKFLOW_COUNT" -eq 0 ]; then
-            echo "ERROR: No GitHub Actions workflow exists in the pushed commit."
-            exit 1
-          fi
+          test "$WORKFLOW_COUNT" -gt 0
 
-          echo "GitHub Actions workflows preserved: $WORKFLOW_COUNT"
-
-          git ls-tree \
-            -r \
-            --name-only \
-            HEAD |
-            grep -E '^\.github/workflows/.*\.ya?ml$'
-
-          echo "===== SECRET FILE CHECK ====="
-
-          if git ls-tree \
-            -r \
-            --name-only \
-            HEAD |
-            grep -E '(^|/)\.env$|(^|/)logs/|\.log$'; then
-
-            echo "ERROR: Secret or log files exist in Git."
-            exit 1
-          fi
-
-          echo "No .env or log files exist in Git."
-
-          echo "===== SQLITE SIDECAR CHECK ====="
-
-          if git ls-tree \
-            -r \
-            --name-only \
-            HEAD |
-            grep -E '(^|/)storage\.sqlite-(wal|shm)$'; then
-
-            echo "ERROR: SQLite WAL/SHM sidecars exist in Git."
-            exit 1
-          fi
-
-          echo "No SQLite sidecars exist in Git."
-
-          echo "===== SERVICE STATE ====="
-
-          if sudo systemctl is-active --quiet omniroute; then
-            echo "ERROR: OmniRoute is still running."
-            exit 1
-          fi
-
-          echo "OmniRoute is STOPPED."
-
-          echo "=============================================="
-          echo "OMNIROUTE PERSISTENCE COMPLETED SUCCESSFULLY"
-          echo "=============================================="
+          echo "Final repository validation passed."
 
       # ==========================================================
-      # 44. PERSISTENCE SKIPPED MESSAGE
+      # 34. FINAL SERVICE STATE
       # ==========================================================
-      - name: 44. Report Persistence Decision
+      - name: 34. Verify OmniRoute Is Stopped
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
 
-          if [ "${{ steps.persistence_gate.outputs.persist }}" = "true" ]; then
-            echo "OmniRoute persistence cycle completed."
-          else
-            echo "OmniRoute persistence was NOT authorized."
-            echo "The previous known-good repository database was preserved."
+          if sudo systemctl is-active --quiet omniroute; then
+            echo "ERROR: OmniRoute is still running after persistence."
+            exit 1
           fi
+
+          echo "OmniRoute is stopped and persistence is complete."
