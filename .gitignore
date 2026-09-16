@@ -7,5 +7,8 @@
 
 # Keep SQLite database snapshots
 !*.sqlite
-!db_backups/
-!db_backups/*.sqlite
+!backup/
+!backup/omniroute/
+!backup/omniroute/*.sqlite
+!backup/omniroute/db_backups/
+!backup/omniroute/db_backups/*.sqlite
