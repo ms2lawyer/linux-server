@@ -5,7 +5,7 @@
 *.sqlite-wal
 *.sqlite-shm
 
-# Explicitly keep SQLite database snapshots
+# Keep SQLite database snapshots
 !*.sqlite
 !db_backups/
 !db_backups/*.sqlite
