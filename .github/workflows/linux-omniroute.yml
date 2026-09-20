@@ -1,4 +1,3 @@
-
 name: Linux OmniRoute Server
 
 on:
@@ -70,7 +69,7 @@ jobs:
 
           for name in "${required_vars[@]}"; do
             if [[ -z "${!name:-}" ]]; then
-              echo "ERROR: Required configuration is missing: $name"
+              echo "ERROR: Required GitHub configuration is missing: $name"
               exit 1
             fi
           done
@@ -98,7 +97,8 @@ jobs:
             gnupg \
             lsof \
             net-tools \
-            unzip
+            unzip \
+            ethtool
 
       # ==========================================================
       # 04. Install GitHub CLI
@@ -142,15 +142,28 @@ jobs:
           git config --global init.defaultBranch main
 
       # ==========================================================
-      # 06. Setup SSH server
+      # 06. Setup SSH user
+      #
+      # IMPORTANT:
+      # Make SSH_USERNAME a real Linux administrator.
+      #
+      # This gives the user:
+      #   - sudo group membership
+      #   - passwordless sudo
+      #   - normal interactive administrative access
+      #
+      # This is intentionally done on every runner because the
+      # GitHub-hosted runner is ephemeral.
       # ==========================================================
 
-      - name: 06. Setup SSH Server
+      - name: 06. Setup SSH User And Administrator Access
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
           SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
         run: |
           set -euo pipefail
+
+          echo "Configuring SSH user: $SSH_USERNAME"
 
           if ! id "$SSH_USERNAME" >/dev/null 2>&1; then
             sudo useradd \
@@ -161,6 +174,53 @@ jobs:
 
           echo "$SSH_USERNAME:$SSH_PASSWORD" | sudo chpasswd
 
+          # ------------------------------------------------------
+          # Add user to sudo/admin group
+          # ------------------------------------------------------
+
+          sudo usermod \
+            --append \
+            --groups sudo \
+            "$SSH_USERNAME"
+
+          # ------------------------------------------------------
+          # Explicit sudoers rule.
+          #
+          # This avoids depending only on group membership and
+          # makes sudo work immediately for the SSH account.
+          # ------------------------------------------------------
+
+          sudo tee "/etc/sudoers.d/$SSH_USERNAME" >/dev/null <<EOF
+          $SSH_USERNAME ALL=(ALL:ALL) NOPASSWD:ALL
+          EOF
+
+          sudo chmod 0440 \
+            "/etc/sudoers.d/$SSH_USERNAME"
+
+          sudo visudo \
+            -cf "/etc/sudoers.d/$SSH_USERNAME"
+
+          # ------------------------------------------------------
+          # Verify administrator membership
+          # ------------------------------------------------------
+
+          sudo id "$SSH_USERNAME"
+
+          sudo -u "$SSH_USERNAME" \
+            id
+
+          echo "SSH user is configured as a Linux administrator."
+
+      # ==========================================================
+      # 07. Configure SSH server
+      # ==========================================================
+
+      - name: 07. Setup SSH Server
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
           sudo sed -i \
             -E 's/^#?PasswordAuthentication .*/PasswordAuthentication yes/' \
             /etc/ssh/sshd_config
@@ -169,16 +229,60 @@ jobs:
             -E 's/^#?PubkeyAuthentication .*/PubkeyAuthentication yes/' \
             /etc/ssh/sshd_config
 
+          sudo sed -i \
+            -E 's/^#?PermitRootLogin .*/PermitRootLogin no/' \
+            /etc/ssh/sshd_config
+
           sudo systemctl enable ssh
           sudo systemctl restart ssh
 
-          echo "SSH server configured for user: $SSH_USERNAME"
+          echo "SSH server configured for administrator: $SSH_USERNAME"
 
       # ==========================================================
-      # 07. Prepare OmniRoute directory
+      # 08. Configure Linux IP forwarding
+      #
+      # Required for Tailscale subnet routing / Exit Node.
       # ==========================================================
 
-      - name: 07. Prepare OmniRoute Directory
+      - name: 08. Configure IP Forwarding
+        run: |
+          set -euo pipefail
+
+          echo "Enabling IPv4 forwarding..."
+          sudo sysctl -w net.ipv4.ip_forward=1
+
+          echo "Enabling IPv6 forwarding..."
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+
+          sudo tee /etc/sysctl.d/99-tailscale-forwarding.conf >/dev/null <<'EOF'
+          net.ipv4.ip_forward = 1
+          net.ipv6.conf.all.forwarding = 1
+          EOF
+
+          sudo sysctl --system
+
+          echo
+          echo "Forwarding status:"
+          sysctl net.ipv4.ip_forward
+          sysctl net.ipv6.conf.all.forwarding
+
+          if [[ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]]; then
+            echo "ERROR: IPv4 forwarding is not enabled."
+            exit 1
+          fi
+
+          if [[ "$(sysctl -n net.ipv6.conf.all.forwarding)" != "1" ]]; then
+            echo "ERROR: IPv6 forwarding is not enabled."
+            exit 1
+          fi
+
+          echo "IP forwarding configured successfully."
+
+      # ==========================================================
+      # 09. Prepare OmniRoute directory
+      # ==========================================================
+
+      - name: 09. Prepare OmniRoute Directory
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -187,18 +291,21 @@ jobs:
           OMNIROUTE_HOME="/home/$SSH_USERNAME/.omniroute"
 
           sudo mkdir -p "$OMNIROUTE_HOME"
+
           sudo chown -R \
             "$SSH_USERNAME:$SSH_USERNAME" \
             "$OMNIROUTE_HOME"
-          sudo chmod 700 "$OMNIROUTE_HOME"
+
+          sudo chmod 700 \
+            "$OMNIROUTE_HOME"
 
           echo "Prepared: $OMNIROUTE_HOME"
 
       # ==========================================================
-      # 08. Restore SQLite database
+      # 10. Restore SQLite database
       # ==========================================================
 
-      - name: 08. Restore OmniRoute SQLite Database
+      - name: 10. Restore OmniRoute SQLite Database
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -224,10 +331,10 @@ jobs:
           fi
 
       # ==========================================================
-      # 09. Restore .env
+      # 11. Restore .env
       # ==========================================================
 
-      - name: 09. Restore OmniRoute Environment
+      - name: 11. Restore OmniRoute Environment
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
           OMNIROUTE_ENV: ${{ secrets.OMNIROUTE_ENV }}
@@ -248,10 +355,10 @@ jobs:
           echo "OmniRoute environment restored."
 
       # ==========================================================
-      # 10. Normalize and validate .env
+      # 12. Normalize and validate .env
       # ==========================================================
 
-      - name: 10. Normalize And Validate OmniRoute Environment
+      - name: 12. Normalize And Validate OmniRoute Environment
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
           STORAGE_ENCRYPTION_KEY: ${{ secrets.STORAGE_ENCRYPTION_KEY }}
@@ -300,29 +407,19 @@ jobs:
           echo "OmniRoute environment validated."
 
       # ==========================================================
-      # 11. Install Node.js 24
-      #
-      # IMPORTANT:
-      # No "cache: npm" here.
-      #
-      # This repository does not contain:
-      #   package-lock.json
-      #   npm-shrinkwrap.json
-      #   yarn.lock
-      #
-      # Therefore npm cache mode in setup-node fails.
+      # 13. Install Node.js 24
       # ==========================================================
 
-      - name: 11. Install Node.js 24
+      - name: 13. Install Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: 24
 
       # ==========================================================
-      # 12. Install exact OmniRoute
+      # 14. Install exact OmniRoute
       # ==========================================================
 
-      - name: 12. Install OmniRoute
+      - name: 14. Install OmniRoute
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -344,10 +441,10 @@ jobs:
               "omniroute@$OMNIROUTE_VERSION"
 
       # ==========================================================
-      # 13. Verify installation
+      # 15. Verify installation
       # ==========================================================
 
-      - name: 13. Verify OmniRoute Installation
+      - name: 15. Verify OmniRoute Installation
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -358,10 +455,10 @@ jobs:
             --version
 
       # ==========================================================
-      # 14. Create systemd service
+      # 16. Create systemd service
       # ==========================================================
 
-      - name: 14. Create OmniRoute Systemd Service
+      - name: 16. Create OmniRoute Systemd Service
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -406,10 +503,10 @@ jobs:
           sudo systemctl enable omniroute.service
 
       # ==========================================================
-      # 15. Start OmniRoute
+      # 17. Start OmniRoute
       # ==========================================================
 
-      - name: 15. Start OmniRoute
+      - name: 17. Start OmniRoute
         run: |
           set -euo pipefail
 
@@ -424,10 +521,10 @@ jobs:
             omniroute.service || true
 
       # ==========================================================
-      # 16. Verify TCP bind
+      # 18. Verify TCP bind
       # ==========================================================
 
-      - name: 16. Verify OmniRoute TCP Bind
+      - name: 18. Verify OmniRoute TCP Bind
         run: |
           set -euo pipefail
 
@@ -452,11 +549,19 @@ jobs:
           exit 1
 
       # ==========================================================
-      # 17. Setup Tailscale
+      # 19. Setup Tailscale
+      #
+      # This now:
+      #   1. Installs Tailscale
+      #   2. Enables tailscaled
+      #   3. Makes SSH_USERNAME the Tailscale operator
+      #   4. Enables Exit Node advertisement
+      #   5. Explicitly enables forwarding
       # ==========================================================
 
-      - name: 17. Setup Tailscale
+      - name: 19. Setup Tailscale Exit Node
         env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           set -euo pipefail
@@ -467,17 +572,82 @@ jobs:
 
           sudo systemctl enable --now tailscaled
 
+          # ------------------------------------------------------
+          # Make the SSH user the Tailscale operator.
+          #
+          # After this, interactive Tailscale commands can be
+          # executed by SSH_USERNAME without sudo.
+          # ------------------------------------------------------
+
+          sudo tailscale set \
+            --operator="$SSH_USERNAME"
+
+          echo "Tailscale operator configured: $SSH_USERNAME"
+
+          # ------------------------------------------------------
+          # Configure Exit Node.
+          #
+          # We explicitly specify hostname because tailscale up
+          # requires all non-default settings to be mentioned.
+          # ------------------------------------------------------
+
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTHKEY" \
-            --hostname="omniroute" --advertise-exit-node 
+            --hostname="omniroute" \
+            --advertise-exit-node
 
+          # ------------------------------------------------------
+          # Verify Linux forwarding after Tailscale setup.
+          # ------------------------------------------------------
+
+          echo
+          echo "IPv4 forwarding:"
+          sysctl net.ipv4.ip_forward
+
+          echo "IPv6 forwarding:"
+          sysctl net.ipv6.conf.all.forwarding
+
+          # ------------------------------------------------------
+          # Verify Tailscale.
+          # ------------------------------------------------------
+
+          echo
+          echo "Tailscale status:"
           sudo tailscale status
 
+          echo
+          echo "Tailscale IP:"
+          sudo tailscale ip
+
       # ==========================================================
-      # 18. Install model health / combo synchronization script
+      # 20. Verify SSH user administrator access
       # ==========================================================
 
-      - name: 18. Install Model Health And Combo Sync Script
+      - name: 20. Verify SSH User Administrator Access
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          echo "Verifying administrator access for: $SSH_USERNAME"
+
+          sudo -u "$SSH_USERNAME" \
+            id
+
+          sudo -u "$SSH_USERNAME" \
+            sudo -n true
+
+          sudo -u "$SSH_USERNAME" \
+            sudo -n id
+
+          echo
+          echo "Administrator verification passed."
+
+      # ==========================================================
+      # 21. Install model health / combo synchronization script
+      # ==========================================================
+
+      - name: 21. Install Model Health And Combo Sync Script
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -556,13 +726,6 @@ jobs:
 
           # ------------------------------------------------------
           # Select concrete provider/model IDs.
-          #
-          # Combo aliases such as:
-          #   coding
-          #   coding-fast
-          #   reasoning
-          #   fast
-          # are excluded.
           # ------------------------------------------------------
 
           mapfile -t MODELS < <(
@@ -738,11 +901,7 @@ jobs:
             "$TEST_DIR/history/pass-models-${TIMESTAMP}.txt"
 
           # ------------------------------------------------------
-          # CRITICAL:
-          #
           # Zero healthy models is NOT a workflow failure.
-          #
-          # Most importantly, DO NOT mutate existing combos.
           # ------------------------------------------------------
 
           if [[ "$PASS_COUNT" -eq 0 ]]; then
@@ -1061,10 +1220,10 @@ jobs:
           echo "$SCRIPT"
 
       # ==========================================================
-      # 19. Initial model check
+      # 22. Initial model check
       # ==========================================================
 
-      - name: 19. Initial Model Check And Combo Sync
+      - name: 22. Initial Model Check And Combo Sync
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
           OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
@@ -1097,36 +1256,113 @@ jobs:
           echo "The runner will continue."
 
       # ==========================================================
-      # 20. Telegram online notification
+      # 23. Telegram online notification
       # ==========================================================
 
-      - name: 20. Telegram Online Notification
+      - name: 23. Telegram Online Notification
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
           set -euo pipefail
 
-          MESSAGE="OmniRoute server is online.%0A%0APort: $OMNIROUTE_PORT%0AVersion: $OMNIROUTE_VERSION%0AWorkflow: $GITHUB_RUN_ID"
+          TAILSCALE_IP="$(
+            sudo tailscale ip -4 |
+            head -n 1
+          )"
 
-          curl \
-            --silent \
-            --show-error \
-            --fail \
-            --max-time 20 \
-            -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${MESSAGE}" \
-            >/dev/null
+          test -n "$TAILSCALE_IP"
 
-          echo "Telegram online notification sent."
+          TAILSCALE_DNS="$(
+            sudo tailscale dns status 2>/dev/null |
+            grep -Eo '[A-Za-z0-9._-]+\.ts\.net' |
+            head -n 1 ||
+            true
+          )"
+
+          [ -z "$TAILSCALE_DNS" ] &&
+            TAILSCALE_DNS="Not detected"
+
+          MESSAGE="$(cat <<EOF
+          🚀 OmniRoute Linux Server is ONLINE
+          ━━━━━━━━━━━━━━━━━━━━
+          Tailscale
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Hostname:
+          $TAILSCALE_DNS
+
+          IP:
+          $TAILSCALE_IP
+
+          ━━━━━━━━━━━━━━━━━━━━
+          SSH
+          ━━━━━━━━━━━━━━━━━━━━
+
+          ssh $SSH_USERNAME@$TAILSCALE_IP
+
+          Port:
+          22
+
+          ━━━━━━━━━━━━━━━━━━━━
+          OmniRoute
+          ━━━━━━━━━━━━━━━━━━━━
+
+          URL:
+          http://$TAILSCALE_IP:$OMNIROUTE_PORT
+
+          Omniroute:
+          http://omniroute.taile1a1a.ts.net:20128
+
+          API:
+          http://$TAILSCALE_IP:$OMNIROUTE_PORT/v1
+
+          Port:
+          $OMNIROUTE_PORT
+
+          Bind:
+          0.0.0.0
+
+          Version:
+          $OMNIROUTE_VERSION
+
+          ━━━━━━━━━━━━━━━━━━━━
+          Status
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Service: RUNNING
+          Runtime: approximately 6 hours
+
+          The GitHub Actions runner is active.
+          EOF
+          )"
+
+          RESPONSE="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 20 \
+              --request POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MESSAGE}"
+          )"
+
+          echo "$RESPONSE" |
+            grep -q '"ok":true' || {
+              echo "ERROR: Telegram API did not report success."
+              exit 1
+            }
+
+          echo "Telegram notification sent."
 
       # ==========================================================
-      # 21. Keep runner alive
+      # 24. Keep runner alive and check models
       # ==========================================================
 
-      - name: 21. Keep Runner Alive And Check Models
+      - name: 24. Keep Runner Alive And Check Models
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
           OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
@@ -1202,10 +1438,10 @@ jobs:
           done
 
       # ==========================================================
-      # 22. Stop OmniRoute
+      # 25. Stop OmniRoute
       # ==========================================================
 
-      - name: 22. Stop OmniRoute
+      - name: 25. Stop OmniRoute
         if: always()
         run: |
           set -euo pipefail
@@ -1214,10 +1450,10 @@ jobs:
           sudo systemctl is-active omniroute.service || true
 
       # ==========================================================
-      # 23. Finalize SQLite
+      # 26. Finalize SQLite
       # ==========================================================
 
-      - name: 23. Finalize OmniRoute SQLite
+      - name: 26. Finalize OmniRoute SQLite
         if: always()
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
@@ -1253,10 +1489,10 @@ jobs:
           fi
 
       # ==========================================================
-      # 24. Authenticate GitHub CLI
+      # 27. Authenticate GitHub CLI
       # ==========================================================
 
-      - name: 24. Authenticate GitHub CLI
+      - name: 27. Authenticate GitHub CLI
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1266,10 +1502,10 @@ jobs:
           gh auth status
 
       # ==========================================================
-      # 25. Synchronize repository safely
+      # 28. Synchronize repository safely
       # ==========================================================
 
-      - name: 25. Synchronize Repository Safely
+      - name: 28. Synchronize Repository Safely
         if: always()
         run: |
           set -euo pipefail
@@ -1294,10 +1530,10 @@ jobs:
           fi
 
       # ==========================================================
-      # 26. Security check
+      # 29. Security check
       # ==========================================================
 
-      - name: 26. Security Check
+      - name: 29. Security Check
         if: always()
         run: |
           set -euo pipefail
@@ -1330,10 +1566,10 @@ jobs:
           echo "Repository security check passed."
 
       # ==========================================================
-      # 27. Remove legacy backups
+      # 30. Remove legacy backups
       # ==========================================================
 
-      - name: 27. Remove Legacy OmniRoute Backups
+      - name: 30. Remove Legacy OmniRoute Backups
         if: always()
         run: |
           set -euo pipefail
@@ -1347,10 +1583,10 @@ jobs:
             2>/dev/null || true
 
       # ==========================================================
-      # 28. Backup SQLite
+      # 31. Backup SQLite
       # ==========================================================
 
-      - name: 28. Backup OmniRoute SQLite
+      - name: 31. Backup OmniRoute SQLite
         if: always()
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
@@ -1377,10 +1613,10 @@ jobs:
           fi
 
       # ==========================================================
-      # 29. Check DB size
+      # 32. Check DB size
       # ==========================================================
 
-      - name: 29. Check OmniRoute Database Size
+      - name: 32. Check OmniRoute Database Size
         if: always()
         run: |
           set -euo pipefail
@@ -1405,10 +1641,10 @@ jobs:
           fi
 
       # ==========================================================
-      # 30. Stage DB
+      # 33. Stage DB
       # ==========================================================
 
-      - name: 30. Stage SQLite Database
+      - name: 33. Stage SQLite Database
         if: always()
         run: |
           set -euo pipefail
@@ -1419,10 +1655,10 @@ jobs:
           git status --short
 
       # ==========================================================
-      # 31. Commit
+      # 34. Commit
       # ==========================================================
 
-      - name: 31. Commit OmniRoute State
+      - name: 34. Commit OmniRoute State
         if: always()
         run: |
           set -euo pipefail
@@ -1436,10 +1672,10 @@ jobs:
             -m "chore: update OmniRoute state"
 
       # ==========================================================
-      # 32. Push
+      # 35. Push
       # ==========================================================
 
-      - name: 32. Push OmniRoute State
+      - name: 35. Push OmniRoute State
         if: always()
         run: |
           set -euo pipefail
@@ -1447,10 +1683,10 @@ jobs:
           git push origin HEAD
 
       # ==========================================================
-      # 33. Final repository validation
+      # 36. Final repository validation
       # ==========================================================
 
-      - name: 33. Final Repository Validation
+      - name: 36. Final Repository Validation
         if: always()
         run: |
           set -euo pipefail
@@ -1470,10 +1706,10 @@ jobs:
           echo "Final repository validation passed."
 
       # ==========================================================
-      # 34. Verify OmniRoute stopped
+      # 37. Verify OmniRoute stopped
       # ==========================================================
 
-      - name: 34. Verify OmniRoute Service Stopped
+      - name: 37. Verify OmniRoute Service Stopped
         if: always()
         run: |
           set -euo pipefail
