@@ -1,0 +1,435 @@
+name: ExitNode
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: permanent-linux-ssh-server
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RUNNER_RUNTIME_MINUTES: '350'
+  HEARTBEAT_INTERVAL_MINUTES: '30'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 380
+
+    steps:
+
+      # ==========================================================
+      # 01. Checkout
+      # ==========================================================
+
+      - name: 01. Checkout Repository
+        uses: actions/checkout@v4
+
+      # ==========================================================
+      # 02. Validate configuration
+      # ==========================================================
+
+      - name: 02. Validate Required GitHub Configuration
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            SSH_USERNAME
+            SSH_PASSWORD
+            TAILSCALE_AUTHKEY
+            TELEGRAM_BOT_TOKEN
+            TELEGRAM_CHAT_ID
+          )
+
+          for name in "${required_vars[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "ERROR: Required GitHub configuration is missing: $name"
+              exit 1
+            fi
+          done
+
+          echo "All required GitHub configuration is present."
+
+      # ==========================================================
+      # 03. Install packages
+      # ==========================================================
+
+      - name: 03. Install Required Packages
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            curl \
+            wget \
+            git \
+            openssh-server \
+            ca-certificates \
+            gnupg \
+            lsof \
+            net-tools \
+            unzip \
+            ethtool
+
+      # ==========================================================
+      # 04. Setup SSH user
+      #
+      # IMPORTANT:
+      # Make SSH_USERNAME a real Linux administrator.
+      #
+      # This gives the user:
+      #   - sudo group membership
+      #   - passwordless sudo
+      #   - normal interactive administrative access
+      #
+      # This is intentionally done on every runner because the
+      # GitHub-hosted runner is ephemeral.
+      # ==========================================================
+
+      - name: 04. Setup SSH User And Administrator Access
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          echo "Configuring SSH user: $SSH_USERNAME"
+
+          if ! id "$SSH_USERNAME" >/dev/null 2>&1; then
+            sudo useradd \
+              --create-home \
+              --shell /bin/bash \
+              "$SSH_USERNAME"
+          fi
+
+          echo "$SSH_USERNAME:$SSH_PASSWORD" | sudo chpasswd
+
+          # ------------------------------------------------------
+          # Add user to sudo/admin group
+          # ------------------------------------------------------
+
+          sudo usermod \
+            --append \
+            --groups sudo \
+            "$SSH_USERNAME"
+
+          # ------------------------------------------------------
+          # Explicit sudoers rule.
+          #
+          # This avoids depending only on group membership and
+          # makes sudo work immediately for the SSH account.
+          # ------------------------------------------------------
+
+          sudo tee "/etc/sudoers.d/$SSH_USERNAME" >/dev/null <<EOF
+          $SSH_USERNAME ALL=(ALL:ALL) NOPASSWD:ALL
+          EOF
+
+          sudo chmod 0440 \
+            "/etc/sudoers.d/$SSH_USERNAME"
+
+          sudo visudo \
+            -cf "/etc/sudoers.d/$SSH_USERNAME"
+
+          # ------------------------------------------------------
+          # Verify administrator membership
+          # ------------------------------------------------------
+
+          sudo id "$SSH_USERNAME"
+
+          sudo -u "$SSH_USERNAME" \
+            id
+
+          echo "SSH user is configured as a Linux administrator."
+
+      # ==========================================================
+      # 05. Configure SSH server
+      # ==========================================================
+
+      - name: 05. Setup SSH Server
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          sudo sed -i \
+            -E 's/^#?PasswordAuthentication .*/PasswordAuthentication yes/' \
+            /etc/ssh/sshd_config
+
+          sudo sed -i \
+            -E 's/^#?PubkeyAuthentication .*/PubkeyAuthentication yes/' \
+            /etc/ssh/sshd_config
+
+          sudo sed -i \
+            -E 's/^#?PermitRootLogin .*/PermitRootLogin no/' \
+            /etc/ssh/sshd_config
+
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+
+          echo "SSH server configured for administrator: $SSH_USERNAME"
+
+      # ==========================================================
+      # 06. Configure Linux IP forwarding
+      #
+      # Required for Tailscale subnet routing / Exit Node.
+      # ==========================================================
+
+      - name: 06. Configure IP Forwarding
+        run: |
+          set -euo pipefail
+
+          echo "Enabling IPv4 forwarding..."
+          sudo sysctl -w net.ipv4.ip_forward=1
+
+          echo "Enabling IPv6 forwarding..."
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+
+          sudo tee /etc/sysctl.d/99-tailscale-forwarding.conf >/dev/null <<'EOF'
+          net.ipv4.ip_forward = 1
+          net.ipv6.conf.all.forwarding = 1
+          EOF
+
+          sudo sysctl --system
+
+          echo
+          echo "Forwarding status:"
+          sysctl net.ipv4.ip_forward
+          sysctl net.ipv6.conf.all.forwarding
+
+          if [[ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]]; then
+            echo "ERROR: IPv4 forwarding is not enabled."
+            exit 1
+          fi
+
+          if [[ "$(sysctl -n net.ipv6.conf.all.forwarding)" != "1" ]]; then
+            echo "ERROR: IPv6 forwarding is not enabled."
+            exit 1
+          fi
+
+          echo "IP forwarding configured successfully."
+
+      # ==========================================================
+      # 07. Setup Tailscale
+      #
+      # This:
+      #   1. Installs Tailscale
+      #   2. Enables tailscaled
+      #   3. Makes SSH_USERNAME the Tailscale operator
+      #   4. Enables Exit Node advertisement
+      #   5. Explicitly enables forwarding
+      # ==========================================================
+
+      - name: 07. Setup Tailscale Exit Node
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            https://tailscale.com/install.sh |
+            sh
+
+          sudo systemctl enable --now tailscaled
+
+          # ------------------------------------------------------
+          # Make the SSH user the Tailscale operator.
+          #
+          # After this, interactive Tailscale commands can be
+          # executed by SSH_USERNAME without sudo.
+          # ------------------------------------------------------
+
+          sudo tailscale set \
+            --operator="$SSH_USERNAME"
+
+          echo "Tailscale operator configured: $SSH_USERNAME"
+
+          # ------------------------------------------------------
+          # Configure Exit Node.
+          #
+          # We explicitly specify hostname because tailscale up
+          # requires all non-default settings to be mentioned.
+          # ------------------------------------------------------
+
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTHKEY" \
+            --hostname="ExitNode" \
+            --advertise-exit-node
+
+          # ------------------------------------------------------
+          # Verify Linux forwarding after Tailscale setup.
+          # ------------------------------------------------------
+
+          echo
+          echo "IPv4 forwarding:"
+          sysctl net.ipv4.ip_forward
+
+          echo "IPv6 forwarding:"
+          sysctl net.ipv6.conf.all.forwarding
+
+          # ------------------------------------------------------
+          # Verify Tailscale.
+          # ------------------------------------------------------
+
+          echo
+          echo "Tailscale status:"
+          sudo tailscale status
+
+          echo
+          echo "Tailscale IP:"
+          sudo tailscale ip
+
+      # ==========================================================
+      # 08. Verify SSH user administrator access
+      # ==========================================================
+
+      - name: 08. Verify SSH User Administrator Access
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          echo "Verifying administrator access for: $SSH_USERNAME"
+
+          sudo -u "$SSH_USERNAME" \
+            id
+
+          sudo -u "$SSH_USERNAME" \
+            sudo -n true
+
+          sudo -u "$SSH_USERNAME" \
+            sudo -n id
+
+          echo
+          echo "Administrator verification passed."
+
+      # ==========================================================
+      # 09. Telegram online notification
+      # ==========================================================
+
+      - name: 09. Telegram Online Notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          TAILSCALE_IP="$(
+            sudo tailscale ip -4 |
+            head -n 1
+          )"
+
+          test -n "$TAILSCALE_IP"
+
+          TAILSCALE_DNS="$(
+            sudo tailscale dns status 2>/dev/null |
+            grep -Eo '[A-Za-z0-9._-]+\.ts\.net' |
+            head -n 1 ||
+            true
+          )"
+
+          [ -z "$TAILSCALE_DNS" ] &&
+            TAILSCALE_DNS="Not detected"
+
+          MESSAGE="$(cat <<EOF
+          🚀 Linux SSH Server is ONLINE
+          ━━━━━━━━━━━━━━━━━━━━
+          Tailscale
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Hostname:
+          $TAILSCALE_DNS
+
+          IP:
+          $TAILSCALE_IP
+
+          ━━━━━━━━━━━━━━━━━━━━
+          SSH
+          ━━━━━━━━━━━━━━━━━━━━
+
+          ssh $SSH_USERNAME@$TAILSCALE_IP
+
+          Port:
+          22
+
+          ━━━━━━━━━━━━━━━━━━━━
+          Status
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Runtime: approximately 6 hours
+
+          The GitHub Actions runner is active.
+          EOF
+          )"
+
+          RESPONSE="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 20 \
+              --request POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MESSAGE}"
+          )"
+
+          echo "$RESPONSE" |
+            grep -q '"ok":true' || {
+              echo "ERROR: Telegram API did not report success."
+              exit 1
+            }
+
+          echo "Telegram notification sent."
+
+      # ==========================================================
+      # 10. Keep runner alive
+      # ==========================================================
+
+      - name: 10. Keep Runner Alive
+        run: |
+          set -euo pipefail
+
+          END_TIME="$(
+            date \
+              -u \
+              -d "+${RUNNER_RUNTIME_MINUTES} minutes" \
+              +%s
+          )"
+
+          echo "Runner will remain alive for approximately ${RUNNER_RUNTIME_MINUTES} minutes."
+
+          while true; do
+            NOW="$(date -u +%s)"
+
+            if [[ "$NOW" -ge "$END_TIME" ]]; then
+              echo "Runtime window completed."
+              break
+            fi
+
+            echo "Heartbeat: $(date -u '+%Y-%m-%dT%H:%M:%SZ') - still running."
+
+            sleep_seconds=$((HEARTBEAT_INTERVAL_MINUTES * 60))
+            remaining=$((END_TIME - NOW))
+
+            if [[ "$sleep_seconds" -gt "$remaining" ]]; then
+              sleep_seconds="$remaining"
+            fi
+
+            if [[ "$sleep_seconds" -gt 0 ]]; then
+              sleep "$sleep_seconds"
+            fi
+          done
