@@ -1,13 +1,9 @@
-name: ExitNode
+name: Tailscale_Exit
 
 on:
   schedule:
     - cron: '0 */6 * * *'
   workflow_dispatch:
-
-concurrency:
-  group: permanent-linux-ssh-server
-  cancel-in-progress: false
 
 permissions:
   contents: read
