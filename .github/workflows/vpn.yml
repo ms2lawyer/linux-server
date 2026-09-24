@@ -217,14 +217,12 @@ jobs:
           echo "IP forwarding configured successfully."
 
       # ==========================================================
-      # 07. Setup Tailscale
+      # 07. Setup Tailscale Exit Node
       #
-      # This:
-      #   1. Installs Tailscale
-      #   2. Enables tailscaled
-      #   3. Makes SSH_USERNAME the Tailscale operator
-      #   4. Enables Exit Node advertisement
-      #   5. Explicitly enables forwarding
+      # The Tailscale auth key MUST be an ephemeral auth key.
+      #
+      # A unique hostname is used for every GitHub Actions run so
+      # concurrent/repeated runs do not collide on "ExitNode".
       # ==========================================================
 
       - name: 07. Setup Tailscale Exit Node
@@ -234,17 +232,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          curl -fsSL \
-            https://tailscale.com/install.sh |
-            sh
+          TAILSCALE_HOSTNAME="exitnode"
+
+          echo "Installing Tailscale..."
+          curl -fsSL https://tailscale.com/install.sh | sh
 
           sudo systemctl enable --now tailscaled
 
           # ------------------------------------------------------
           # Make the SSH user the Tailscale operator.
-          #
-          # After this, interactive Tailscale commands can be
-          # executed by SSH_USERNAME without sudo.
           # ------------------------------------------------------
 
           sudo tailscale set \
@@ -255,13 +251,14 @@ jobs:
           # ------------------------------------------------------
           # Configure Exit Node.
           #
-          # We explicitly specify hostname because tailscale up
-          # requires all non-default settings to be mentioned.
+          # TAILSCALE_AUTHKEY must be an ephemeral auth key.
           # ------------------------------------------------------
+
+          echo "Connecting Tailscale as: $TAILSCALE_HOSTNAME"
 
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTHKEY" \
-            --hostname="ExitNode" \
+            --hostname="$TAILSCALE_HOSTNAME" \
             --advertise-exit-node
 
           # ------------------------------------------------------
@@ -286,6 +283,10 @@ jobs:
           echo
           echo "Tailscale IP:"
           sudo tailscale ip
+
+          echo
+          echo "Tailscale hostname:"
+          echo "$TAILSCALE_HOSTNAME"
 
       # ==========================================================
       # 08. Verify SSH user administrator access
@@ -330,15 +331,22 @@ jobs:
 
           test -n "$TAILSCALE_IP"
 
-          TAILSCALE_DNS="$(
-            sudo tailscale dns status 2>/dev/null |
-            grep -Eo '[A-Za-z0-9._-]+\.ts\.net' |
-            head -n 1 ||
-            true
-          )"
+          TAILSCALE_HOSTNAME="$(
+            sudo tailscale status --self --json |
+            python3 -c '
+          import json
+          import sys
 
-          [ -z "$TAILSCALE_DNS" ] &&
-            TAILSCALE_DNS="Not detected"
+          data = json.load(sys.stdin)
+          self_node = data.get("Self", {})
+
+          print(
+              self_node.get("DNSName")
+              or self_node.get("HostName")
+              or "Not detected"
+          )
+          '
+          )"
 
           MESSAGE="$(cat <<EOF
           🚀 Linux SSH Server is ONLINE
@@ -347,7 +355,7 @@ jobs:
           ━━━━━━━━━━━━━━━━━━━━
 
           Hostname:
-          $TAILSCALE_DNS
+          $TAILSCALE_HOSTNAME
 
           IP:
           $TAILSCALE_IP
@@ -367,7 +375,7 @@ jobs:
 
           Runtime: approximately 6 hours
 
-          The GitHub Actions runner is active.
+          GitHub Actions runner is active.
           EOF
           )"
 
@@ -429,3 +437,38 @@ jobs:
               sleep "$sleep_seconds"
             fi
           done
+
+      # ==========================================================
+      # 11. Disconnect Tailscale
+      #
+      # IMPORTANT:
+      # Always execute this step, even if an earlier step fails.
+      #
+      # The auth key must be ephemeral. tailscale down provides
+      # explicit cleanup before the GitHub runner is destroyed.
+      # ==========================================================
+
+      - name: 11. Disconnect Tailscale
+        if: always()
+        run: |
+          set -euo pipefail
+
+          echo "Checking Tailscale state..."
+
+          if command -v tailscale >/dev/null 2>&1; then
+            echo "Current Tailscale status:"
+            sudo tailscale status || true
+
+            echo
+            echo "Disconnecting Tailscale..."
+
+            sudo tailscale down || true
+
+            echo
+            echo "Tailscale status after disconnect:"
+            sudo tailscale status || true
+          else
+            echo "Tailscale is not installed. Nothing to disconnect."
+          fi
+
+          echo "Tailscale cleanup completed."
