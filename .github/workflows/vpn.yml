@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: permanent-linux-ssh-server
+  group: permanent-TailScale-server
   cancel-in-progress: true
 
 permissions:
