@@ -747,6 +747,46 @@ jobs:
           echo "Telegram notification sent."
 
       # ==========================================================
+      # 10. Keep runner alive
+      # ==========================================================
+
+      - name: 21A. Keep Runner Alive
+        run: |
+          set -euo pipefail
+
+          END_TIME="$(
+            date \
+              -u \
+              -d "+${RUNNER_RUNTIME_MINUTES} minutes" \
+              +%s
+          )"
+
+          echo "Runner will remain alive for approximately ${RUNNER_RUNTIME_MINUTES} minutes."
+
+          while true; do
+            NOW="$(date -u +%s)"
+
+            if [[ "$NOW" -ge "$END_TIME" ]]; then
+              echo "Runtime window completed."
+              break
+            fi
+
+            echo "Heartbeat: $(date -u '+%Y-%m-%dT%H:%M:%SZ') - still running."
+
+            sleep_seconds=$((HEARTBEAT_INTERVAL_MINUTES * 60))
+            remaining=$((END_TIME - NOW))
+
+            if [[ "$sleep_seconds" -gt "$remaining" ]]; then
+              sleep_seconds="$remaining"
+            fi
+
+            if [[ "$sleep_seconds" -gt 0 ]]; then
+              sleep "$sleep_seconds"
+            fi
+          done
+
+
+      # ==========================================================
       # 22. Stop OmniRoute
       # ==========================================================
 
