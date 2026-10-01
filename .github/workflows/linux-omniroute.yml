@@ -643,125 +643,28 @@ jobs:
           echo
           echo "Administrator verification passed."
 
-      # ==========================================================
-      # 21. Telegram online notification
-      # ==========================================================
 
-      - name: 21. Telegram Online Notification
+      - name: 21A. Keep Runner Alive And Check Models
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
+          OMNIROUTE_BASE_URL: ${{ env.OMNIROUTE_BASE_URL }}
+          OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS: ${{ env.OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS }}
+          OMNIROUTE_MODEL_TEST_PARALLELISM: ${{ env.OMNIROUTE_MODEL_TEST_PARALLELISM }}
+          OMNIROUTE_MAX_MODELS_PER_CYCLE: ${{ env.OMNIROUTE_MAX_MODELS_PER_CYCLE }}
         run: |
           set -euo pipefail
 
-          TAILSCALE_IP="$(
-            sudo tailscale ip -4 |
-            head -n 1
-          )"
-
-          test -n "$TAILSCALE_IP"
-
-          TAILSCALE_DNS="$(
-            sudo tailscale dns status 2>/dev/null |
-            grep -Eo '[A-Za-z0-9._-]+\.ts\.net' |
-            head -n 1 ||
-            true
-          )"
-
-          [ -z "$TAILSCALE_DNS" ] &&
-            TAILSCALE_DNS="Not detected"
-
-          MESSAGE="$(cat <<EOF
-          🚀 OmniRoute Linux Server is ONLINE
-          ━━━━━━━━━━━━━━━━━━━━
-          Tailscale
-          ━━━━━━━━━━━━━━━━━━━━
-
-          Hostname:
-          $TAILSCALE_DNS
-
-          IP:
-          $TAILSCALE_IP
-
-          ━━━━━━━━━━━━━━━━━━━━
-          SSH
-          ━━━━━━━━━━━━━━━━━━━━
-
-          ssh $SSH_USERNAME@$TAILSCALE_IP
-
-          Port:
-          22
-
-          ━━━━━━━━━━━━━━━━━━━━
-          OmniRoute
-          ━━━━━━━━━━━━━━━━━━━━
-
-          URL:
-          http://$TAILSCALE_IP:$OMNIROUTE_PORT
-
-          Omniroute:
-          http://omniroute.taile1a1a.ts.net:20128
-
-          API:
-          http://$TAILSCALE_IP:$OMNIROUTE_PORT/v1
-
-          Port:
-          $OMNIROUTE_PORT
-
-          Bind:
-          0.0.0.0
-
-          Version:
-          $OMNIROUTE_VERSION
-
-          ━━━━━━━━━━━━━━━━━━━━
-          Status
-          ━━━━━━━━━━━━━━━━━━━━
-
-          Service: RUNNING
-          Runtime: approximately 6 hours
-
-          The GitHub Actions runner is active.
-          EOF
-          )"
-
-          RESPONSE="$(
-            curl \
-              --silent \
-              --show-error \
-              --fail \
-              --max-time 20 \
-              --request POST \
-              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=${MESSAGE}"
-          )"
-
-          echo "$RESPONSE" |
-            grep -q '"ok":true' || {
-              echo "ERROR: Telegram API did not report success."
-              exit 1
-            }
-
-          echo "Telegram notification sent."
-
-      # ==========================================================
-      # 10. Keep runner alive
-      # ==========================================================
-
-      - name: 21A. Keep Runner Alive
-        run: |
-          set -euo pipefail
+          SCRIPT="/home/$SSH_USERNAME/omniroute-tests/check-and-sync.sh"
 
           END_TIME="$(
             date \
               -u \
-              -d "+${RUNNER_RUNTIME_MINUTES} minutes" \
+              -d "+${OMNIROUTE_RUNTIME_MINUTES} minutes" \
               +%s
           )"
 
-          echo "Runner will remain alive for approximately ${RUNNER_RUNTIME_MINUTES} minutes."
+          echo "Runner will remain alive for approximately ${OMNIROUTE_RUNTIME_MINUTES} minutes."
 
           while true; do
             NOW="$(date -u +%s)"
@@ -771,9 +674,40 @@ jobs:
               break
             fi
 
-            echo "Heartbeat: $(date -u '+%Y-%m-%dT%H:%M:%SZ') - still running."
+            echo
+            echo "=============================================="
+            echo "Periodic OmniRoute model health check"
+            echo "UTC: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "=============================================="
 
-            sleep_seconds=$((HEARTBEAT_INTERVAL_MINUTES * 60))
+            if ! sudo -u "$SSH_USERNAME" \
+              env \
+                HOME="/home/$SSH_USERNAME" \
+                OMNIROUTE_BASE_URL="$OMNIROUTE_BASE_URL" \
+                OMNIROUTE_API_KEY="$OMNIROUTE_API_KEY" \
+                OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS="$OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS" \
+                OMNIROUTE_MODEL_TEST_PARALLELISM="$OMNIROUTE_MODEL_TEST_PARALLELISM" \
+                OMNIROUTE_MAX_MODELS_PER_CYCLE="$OMNIROUTE_MAX_MODELS_PER_CYCLE" \
+              "$SCRIPT"
+            then
+              echo "ERROR: Model health/combo synchronization failed."
+              echo "The failure was not caused merely by zero passing models."
+              exit 1
+            fi
+
+            NOW="$(date -u +%s)"
+
+            if [[ "$NOW" -ge "$END_TIME" ]]; then
+              break
+            fi
+
+            echo
+            echo "Next model health cycle in ${OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES} minutes."
+
+            sleep_seconds=$(
+              ((OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES * 60))
+            )
+
             remaining=$((END_TIME - NOW))
 
             if [[ "$sleep_seconds" -gt "$remaining" ]]; then
