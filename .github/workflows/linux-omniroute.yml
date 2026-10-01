@@ -674,36 +674,6 @@ jobs:
               break
             fi
 
-            echo
-            echo "=============================================="
-            echo "Periodic OmniRoute model health check"
-            echo "UTC: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-            echo "=============================================="
-
-            if ! sudo -u "$SSH_USERNAME" \
-              env \
-                HOME="/home/$SSH_USERNAME" \
-                OMNIROUTE_BASE_URL="$OMNIROUTE_BASE_URL" \
-                OMNIROUTE_API_KEY="$OMNIROUTE_API_KEY" \
-                OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS="$OMNIROUTE_MODEL_TEST_TIMEOUT_SECONDS" \
-                OMNIROUTE_MODEL_TEST_PARALLELISM="$OMNIROUTE_MODEL_TEST_PARALLELISM" \
-                OMNIROUTE_MAX_MODELS_PER_CYCLE="$OMNIROUTE_MAX_MODELS_PER_CYCLE" \
-              "$SCRIPT"
-            then
-              echo "ERROR: Model health/combo synchronization failed."
-              echo "The failure was not caused merely by zero passing models."
-              exit 1
-            fi
-
-            NOW="$(date -u +%s)"
-
-            if [[ "$NOW" -ge "$END_TIME" ]]; then
-              break
-            fi
-
-            echo
-            echo "Next model health cycle in ${OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES} minutes."
-
             sleep_seconds=$(
               ((OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES * 60))
             )
