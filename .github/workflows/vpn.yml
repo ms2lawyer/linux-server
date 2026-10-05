@@ -3,8 +3,7 @@ name: Tailscale_Exit
 on:
   # The workflow starts manually.
   #
-  # After each successful/failed lifecycle, step 12 dispatches
-  # the next run automatically.
+  # After each lifecycle, step 14 starts the next run.
   workflow_dispatch:
 
 # ==============================================================
@@ -26,8 +25,8 @@ permissions:
 env:
   # 350 minutes = 5h 50m.
   #
-  # GitHub job timeout is 360 minutes, leaving ~10 minutes
-  # of safety margin for cleanup + workflow chaining.
+  # GitHub job timeout is 360 minutes, leaving approximately
+  # 10 minutes of safety margin for cleanup + workflow chaining.
   RUNNER_RUNTIME_MINUTES: '350'
 
   HEARTBEAT_INTERVAL_MINUTES: '30'
@@ -36,12 +35,21 @@ env:
   # TAILSCALE MACHINE NAME
   # ============================================================
   #
-  # THIS IS THE ONLY MACHINE NAME WE WANT IN TAILSCALE.
-  #
-  # The workflow removes any existing device whose exact name is
-  # this value before calling "tailscale up".
+  # This workflow owns exactly one canonical machine name.
   #
   TAILSCALE_HOSTNAME: 'exitnode'
+
+  # ============================================================
+  # WORKFLOW TO RESTART
+  # ============================================================
+  #
+  # vpn.yml is the actual workflow file:
+  #
+  # .github/workflows/vpn.yml
+  #
+  # Using the workflow ID avoids filename ambiguity.
+  #
+  TAILSCALE_WORKFLOW_ID: '363966564'
 
 jobs:
 
@@ -256,26 +264,17 @@ jobs:
       # 08. REMOVE EXISTING MACHINE WITH EXACT HOSTNAME
       # ==========================================================
       #
-      # IMPORTANT:
-      #
-      # We intentionally remove ONLY:
+      # Remove ONLY the exact canonical hostname:
       #
       #     exitnode
       #
-      # We do NOT remove:
+      # Do not remove:
       #
       #     exitnode-1
       #     exitnode-2
       #     exitnode-backup
-      #     my-exitnode
       #
-      # This guarantees that this workflow owns exactly one
-      # canonical machine name.
-      #
-      # Tailscale API:
-      #
-      # GET    /api/v2/tailnet/-/devices
-      # DELETE /api/v2/device/<device-id>
+      # This prevents accidental deletion of unrelated machines.
       #
       # ==========================================================
 
@@ -357,10 +356,6 @@ jobs:
 
           fi
 
-          # ------------------------------------------------------
-          # Verify that the exact hostname no longer exists.
-          # ------------------------------------------------------
-
           echo
           echo "Verifying hostname availability..."
 
@@ -408,6 +403,7 @@ jobs:
             echo
             echo "Hostname still exists."
             echo "Waiting 5 seconds before checking again..."
+
             sleep 5
 
           done
@@ -463,11 +459,6 @@ jobs:
           echo "Tailscale hostname:"
           echo "$TAILSCALE_HOSTNAME"
 
-          # ------------------------------------------------------
-          # Verify that Tailscale actually accepted the exact
-          # requested hostname.
-          # ------------------------------------------------------
-
           ACTUAL_HOSTNAME="$(
             sudo tailscale status --self --json |
               jq -r '
@@ -486,6 +477,7 @@ jobs:
           echo "$ACTUAL_HOSTNAME"
 
           if [[ "$ACTUAL_HOSTNAME" != "$TAILSCALE_HOSTNAME" ]]; then
+
             echo
             echo "ERROR: Tailscale did not use the required hostname."
             echo
@@ -500,6 +492,7 @@ jobs:
             sudo tailscale down || true
 
             exit 1
+
           fi
 
           echo
@@ -518,14 +511,11 @@ jobs:
 
           echo "Verifying administrator access for: $SSH_USERNAME"
 
-          sudo -u "$SSH_USERNAME" \
-            id
+          sudo -u "$SSH_USERNAME" id
 
-          sudo -u "$SSH_USERNAME" \
-            sudo -n true
+          sudo -u "$SSH_USERNAME" sudo -n true
 
-          sudo -u "$SSH_USERNAME" \
-            sudo -n id
+          sudo -u "$SSH_USERNAME" sudo -n id
 
           echo
           echo "Administrator verification passed."
@@ -660,7 +650,7 @@ jobs:
       #
       # ALWAYS runs.
       #
-      # This is intentionally BEFORE starting the next workflow.
+      # This happens BEFORE starting the next workflow.
       # ==========================================================
 
       - name: 13. Disconnect Tailscale
@@ -699,14 +689,23 @@ jobs:
       # ==========================================================
       # 14. Start next workflow run
       #
-      # IMPORTANT:
+      # ALWAYS runs.
       #
-      # This runs AFTER Tailscale cleanup.
+      # The actual workflow is:
+      #
+      #     .github/workflows/vpn.yml
+      #
+      # Workflow ID:
+      #
+      #     363966564
       #
       # WORKFLOW_PAT must have:
       #
-      #   Actions: Read and write
+      #     Actions: Read and write
       #
+      # The PAT is intentionally used instead of GITHUB_TOKEN
+      # because workflow chaining through a token requires an
+      # appropriate token with workflow-dispatch capability.
       # ==========================================================
 
       - name: 14. Start Next Workflow Run
@@ -716,6 +715,7 @@ jobs:
           WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT }}
           GH_REPOSITORY: ${{ github.repository }}
           GH_REF: ${{ github.ref_name }}
+          TAILSCALE_WORKFLOW_ID: ${{ env.TAILSCALE_WORKFLOW_ID }}
 
         run: |
           set -euo pipefail
@@ -730,13 +730,20 @@ jobs:
           echo "Branch:"
           echo "$GH_REF"
 
-          RESPONSE="$(
+          echo "Workflow ID:"
+          echo "$TAILSCALE_WORKFLOW_ID"
+
+          echo
+          echo "Dispatching next workflow run..."
+
+          HTTP_STATUS="$(
             curl \
               --silent \
               --show-error \
-              --fail-with-body \
+              --output /tmp/workflow-dispatch-response.txt \
+              --write-out "%{http_code}" \
               --request POST \
-              --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/363966564/dispatches" \
+              --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${TAILSCALE_WORKFLOW_ID}/dispatches" \
               --header "Accept: application/vnd.github+json" \
               --header "Authorization: Bearer ${WORKFLOW_PAT}" \
               --header "X-GitHub-Api-Version: 2026-03-10" \
@@ -745,8 +752,23 @@ jobs:
           )"
 
           echo
-          echo "Next workflow dispatch request completed."
+          echo "GitHub API HTTP status:"
+          echo "$HTTP_STATUS"
 
-          if [[ -n "$RESPONSE" ]]; then
-            echo "$RESPONSE"
+          if [[ -s /tmp/workflow-dispatch-response.txt ]]; then
+            echo
+            echo "GitHub API response:"
+            cat /tmp/workflow-dispatch-response.txt
           fi
+
+          if [[ "$HTTP_STATUS" != "204" ]]; then
+            echo
+            echo "ERROR: GitHub workflow dispatch failed."
+            echo "Expected HTTP status: 204"
+            echo "Actual HTTP status:   $HTTP_STATUS"
+            exit 1
+          fi
+
+          echo
+          echo "Next workflow dispatch completed successfully."
+          echo "The next Tailscale runner should now start."
