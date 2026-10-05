@@ -1,24 +1,54 @@
 name: Tailscale_Exit
 
 on:
-  schedule:
-    - cron: '0 */5 * * *'
+  # The workflow starts manually.
+  #
+  # After each successful/failed lifecycle, step 12 dispatches
+  # the next run automatically.
   workflow_dispatch:
 
+# ==============================================================
+# SINGLE ACTIVE RUN
+# ==============================================================
+#
+# Never allow a second run to cancel the currently active server.
+#
+# If somebody manually starts another run while one is active,
+# GitHub queues it instead of cancelling the active runner.
+#
 concurrency:
   group: permanent-TailScale-server
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 env:
+  # 350 minutes = 5h 50m.
+  #
+  # GitHub job timeout is 360 minutes, leaving ~10 minutes
+  # of safety margin for cleanup + workflow chaining.
   RUNNER_RUNTIME_MINUTES: '350'
+
   HEARTBEAT_INTERVAL_MINUTES: '30'
 
+  # ============================================================
+  # TAILSCALE MACHINE NAME
+  # ============================================================
+  #
+  # THIS IS THE ONLY MACHINE NAME WE WANT IN TAILSCALE.
+  #
+  # The workflow removes any existing device whose exact name is
+  # this value before calling "tailscale up".
+  #
+  TAILSCALE_HOSTNAME: 'exitnode'
+
 jobs:
+
   build:
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 360
 
     steps:
@@ -39,8 +69,11 @@ jobs:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
           SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT }}
+
         run: |
           set -euo pipefail
 
@@ -48,8 +81,10 @@ jobs:
             SSH_USERNAME
             SSH_PASSWORD
             TAILSCALE_AUTHKEY
+            TAILSCALE_API_KEY
             TELEGRAM_BOT_TOKEN
             TELEGRAM_CHAT_ID
+            WORKFLOW_PAT
           )
 
           for name in "${required_vars[@]}"; do
@@ -81,27 +116,18 @@ jobs:
             lsof \
             net-tools \
             unzip \
-            ethtool
+            ethtool \
+            jq
 
       # ==========================================================
       # 04. Setup SSH user
-      #
-      # IMPORTANT:
-      # Make SSH_USERNAME a real Linux administrator.
-      #
-      # This gives the user:
-      #   - sudo group membership
-      #   - passwordless sudo
-      #   - normal interactive administrative access
-      #
-      # This is intentionally done on every runner because the
-      # GitHub-hosted runner is ephemeral.
       # ==========================================================
 
       - name: 04. Setup SSH User And Administrator Access
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
           SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+
         run: |
           set -euo pipefail
 
@@ -116,21 +142,10 @@ jobs:
 
           echo "$SSH_USERNAME:$SSH_PASSWORD" | sudo chpasswd
 
-          # ------------------------------------------------------
-          # Add user to sudo/admin group
-          # ------------------------------------------------------
-
           sudo usermod \
             --append \
             --groups sudo \
             "$SSH_USERNAME"
-
-          # ------------------------------------------------------
-          # Explicit sudoers rule.
-          #
-          # This avoids depending only on group membership and
-          # makes sudo work immediately for the SSH account.
-          # ------------------------------------------------------
 
           sudo tee "/etc/sudoers.d/$SSH_USERNAME" >/dev/null <<EOF
           $SSH_USERNAME ALL=(ALL:ALL) NOPASSWD:ALL
@@ -142,15 +157,15 @@ jobs:
           sudo visudo \
             -cf "/etc/sudoers.d/$SSH_USERNAME"
 
-          # ------------------------------------------------------
-          # Verify administrator membership
-          # ------------------------------------------------------
-
+          echo
+          echo "Administrator identity:"
           sudo id "$SSH_USERNAME"
 
-          sudo -u "$SSH_USERNAME" \
-            id
+          echo
+          echo "User identity:"
+          sudo -u "$SSH_USERNAME" id
 
+          echo
           echo "SSH user is configured as a Linux administrator."
 
       # ==========================================================
@@ -160,6 +175,7 @@ jobs:
       - name: 05. Setup SSH Server
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+
         run: |
           set -euo pipefail
 
@@ -182,8 +198,6 @@ jobs:
 
       # ==========================================================
       # 06. Configure Linux IP forwarding
-      #
-      # Required for Tailscale subnet routing / Exit Node.
       # ==========================================================
 
       - name: 06. Configure IP Forwarding
@@ -221,64 +235,221 @@ jobs:
           echo "IP forwarding configured successfully."
 
       # ==========================================================
-      # 07. Setup Tailscale Exit Node
-      #
-      # The Tailscale auth key MUST be an ephemeral auth key.
-      #
-      # A unique hostname is used for every GitHub Actions run so
-      # concurrent/repeated runs do not collide on "ExitNode".
+      # 07. Install Tailscale
       # ==========================================================
 
-      - name: 07. Setup Tailscale Exit Node
-        env:
-          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      - name: 07. Install Tailscale
         run: |
           set -euo pipefail
 
-          TAILSCALE_HOSTNAME="exitnode"
-
           echo "Installing Tailscale..."
+
           curl -fsSL https://tailscale.com/install.sh | sh
 
           sudo systemctl enable --now tailscaled
 
+          echo
+          echo "Tailscale version:"
+          tailscale version
+
+      # ==========================================================
+      # 08. REMOVE EXISTING MACHINE WITH EXACT HOSTNAME
+      # ==========================================================
+      #
+      # IMPORTANT:
+      #
+      # We intentionally remove ONLY:
+      #
+      #     exitnode
+      #
+      # We do NOT remove:
+      #
+      #     exitnode-1
+      #     exitnode-2
+      #     exitnode-backup
+      #     my-exitnode
+      #
+      # This guarantees that this workflow owns exactly one
+      # canonical machine name.
+      #
+      # Tailscale API:
+      #
+      # GET    /api/v2/tailnet/-/devices
+      # DELETE /api/v2/device/<device-id>
+      #
+      # ==========================================================
+
+      - name: 08. Remove Existing Tailscale Machine
+        env:
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
+        run: |
+          set -euo pipefail
+
+          echo "=================================================="
+          echo "Tailscale hostname cleanup"
+          echo "=================================================="
+
+          echo "Required hostname:"
+          echo "$TAILSCALE_HOSTNAME"
+
+          echo
+          echo "Querying current Tailscale machines..."
+
+          DEVICES_JSON="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 30 \
+              --user "${TAILSCALE_API_KEY}:" \
+              "https://api.tailscale.com/api/v2/tailnet/-/devices"
+          )"
+
+          echo
+          echo "Searching for exact machine name..."
+
+          MATCHING_DEVICE_IDS="$(
+            echo "$DEVICES_JSON" |
+              jq -r \
+                --arg hostname "$TAILSCALE_HOSTNAME" \
+                '
+                  .devices[]
+                  | select(
+                      (.name // "") == $hostname
+                      or (.hostname // "") == $hostname
+                  )
+                  | .id
+                '
+          )"
+
+          if [[ -z "$MATCHING_DEVICE_IDS" ]]; then
+            echo "No existing machine named '$TAILSCALE_HOSTNAME' was found."
+            echo "Nothing to remove."
+          else
+
+            while IFS= read -r DEVICE_ID; do
+
+              [[ -z "$DEVICE_ID" ]] && continue
+
+              echo
+              echo "Found existing machine:"
+              echo "  Name: $TAILSCALE_HOSTNAME"
+              echo "  ID:   $DEVICE_ID"
+
+              echo
+              echo "Removing machine..."
+
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --max-time 30 \
+                --request DELETE \
+                --user "${TAILSCALE_API_KEY}:" \
+                "https://api.tailscale.com/api/v2/device/${DEVICE_ID}"
+
+              echo
+              echo "Machine $DEVICE_ID removed."
+
+            done <<< "$MATCHING_DEVICE_IDS"
+
+          fi
+
           # ------------------------------------------------------
-          # Make the SSH user the Tailscale operator.
+          # Verify that the exact hostname no longer exists.
           # ------------------------------------------------------
+
+          echo
+          echo "Verifying hostname availability..."
+
+          for attempt in {1..10}; do
+
+            VERIFY_JSON="$(
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --max-time 30 \
+                --user "${TAILSCALE_API_KEY}:" \
+                "https://api.tailscale.com/api/v2/tailnet/-/devices"
+            )"
+
+            REMAINING="$(
+              echo "$VERIFY_JSON" |
+                jq -r \
+                  --arg hostname "$TAILSCALE_HOSTNAME" \
+                  '
+                    [
+                      .devices[]
+                      | select(
+                          (.name // "") == $hostname
+                          or (.hostname // "") == $hostname
+                      )
+                    ]
+                    | length
+                  '
+            )"
+
+            if [[ "$REMAINING" == "0" ]]; then
+              echo
+              echo "Hostname '$TAILSCALE_HOSTNAME' is available."
+              break
+            fi
+
+            if [[ "$attempt" -eq 10 ]]; then
+              echo
+              echo "ERROR: Hostname '$TAILSCALE_HOSTNAME' is still present."
+              echo "Refusing to start another machine with a suffixed name."
+              exit 1
+            fi
+
+            echo
+            echo "Hostname still exists."
+            echo "Waiting 5 seconds before checking again..."
+            sleep 5
+
+          done
+
+      # ==========================================================
+      # 09. Setup Tailscale Exit Node
+      # ==========================================================
+
+      - name: 09. Setup Tailscale Exit Node
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
+        run: |
+          set -euo pipefail
+
+          echo "=================================================="
+          echo "Starting Tailscale"
+          echo "=================================================="
+
+          echo "Hostname:"
+          echo "$TAILSCALE_HOSTNAME"
+
+          echo
+          echo "Configuring Tailscale operator..."
 
           sudo tailscale set \
             --operator="$SSH_USERNAME"
 
           echo "Tailscale operator configured: $SSH_USERNAME"
 
-          # ------------------------------------------------------
-          # Configure Exit Node.
-          #
-          # TAILSCALE_AUTHKEY must be an ephemeral auth key.
-          # ------------------------------------------------------
-
-          echo "Connecting Tailscale as: $TAILSCALE_HOSTNAME"
+          echo
+          echo "Connecting Tailscale..."
 
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTHKEY" \
             --hostname="$TAILSCALE_HOSTNAME" \
             --advertise-exit-node
 
-          # ------------------------------------------------------
-          # Verify Linux forwarding after Tailscale setup.
-          # ------------------------------------------------------
-
           echo
-          echo "IPv4 forwarding:"
-          sysctl net.ipv4.ip_forward
-
-          echo "IPv6 forwarding:"
-          sysctl net.ipv6.conf.all.forwarding
-
-          # ------------------------------------------------------
-          # Verify Tailscale.
-          # ------------------------------------------------------
+          echo "Tailscale connection established."
 
           echo
           echo "Tailscale status:"
@@ -292,13 +463,56 @@ jobs:
           echo "Tailscale hostname:"
           echo "$TAILSCALE_HOSTNAME"
 
+          # ------------------------------------------------------
+          # Verify that Tailscale actually accepted the exact
+          # requested hostname.
+          # ------------------------------------------------------
+
+          ACTUAL_HOSTNAME="$(
+            sudo tailscale status --self --json |
+              jq -r '
+                .Self.HostName
+                // .Self.DNSName
+                // empty
+              ' |
+              sed 's/\..*$//'
+          )"
+
+          echo
+          echo "Requested hostname:"
+          echo "$TAILSCALE_HOSTNAME"
+
+          echo "Actual hostname:"
+          echo "$ACTUAL_HOSTNAME"
+
+          if [[ "$ACTUAL_HOSTNAME" != "$TAILSCALE_HOSTNAME" ]]; then
+            echo
+            echo "ERROR: Tailscale did not use the required hostname."
+            echo
+            echo "Expected:"
+            echo "  $TAILSCALE_HOSTNAME"
+            echo
+            echo "Actual:"
+            echo "  $ACTUAL_HOSTNAME"
+            echo
+            echo "The workflow will NOT continue with a suffixed hostname."
+
+            sudo tailscale down || true
+
+            exit 1
+          fi
+
+          echo
+          echo "Exact Tailscale hostname verified successfully."
+
       # ==========================================================
-      # 08. Verify SSH user administrator access
+      # 10. Verify SSH administrator access
       # ==========================================================
 
-      - name: 08. Verify SSH User Administrator Access
+      - name: 10. Verify SSH User Administrator Access
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+
         run: |
           set -euo pipefail
 
@@ -317,14 +531,16 @@ jobs:
           echo "Administrator verification passed."
 
       # ==========================================================
-      # 09. Telegram online notification
+      # 11. Telegram online notification
       # ==========================================================
 
-      - name: 09. Telegram Online Notification
+      - name: 11. Telegram Online Notification
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
         run: |
           set -euo pipefail
 
@@ -335,21 +551,13 @@ jobs:
 
           test -n "$TAILSCALE_IP"
 
-          TAILSCALE_HOSTNAME="$(
+          ACTUAL_HOSTNAME="$(
             sudo tailscale status --self --json |
-            python3 -c '
-          import json
-          import sys
-
-          data = json.load(sys.stdin)
-          self_node = data.get("Self", {})
-
-          print(
-              self_node.get("DNSName")
-              or self_node.get("HostName")
-              or "Not detected"
-          )
-          '
+              jq -r '
+                .Self.DNSName
+                // .Self.HostName
+                // "Not detected"
+              '
           )"
 
           MESSAGE="$(cat <<EOF
@@ -359,7 +567,7 @@ jobs:
           ━━━━━━━━━━━━━━━━━━━━
 
           Hostname:
-          $TAILSCALE_HOSTNAME
+          $ACTUAL_HOSTNAME
 
           IP:
           $TAILSCALE_IP
@@ -404,10 +612,10 @@ jobs:
           echo "Telegram notification sent."
 
       # ==========================================================
-      # 10. Keep runner alive
+      # 12. Keep runner alive
       # ==========================================================
 
-      - name: 10. Keep Runner Alive
+      - name: 12. Keep Runner Alive
         run: |
           set -euo pipefail
 
@@ -418,16 +626,20 @@ jobs:
               +%s
           )"
 
+          echo
           echo "Runner will remain alive for approximately ${RUNNER_RUNTIME_MINUTES} minutes."
 
           while true; do
+
             NOW="$(date -u +%s)"
 
             if [[ "$NOW" -ge "$END_TIME" ]]; then
+              echo
               echo "Runtime window completed."
               break
             fi
 
+            echo
             echo "Heartbeat: $(date -u '+%Y-%m-%dT%H:%M:%SZ') - still running."
 
             sleep_seconds=$((HEARTBEAT_INTERVAL_MINUTES * 60))
@@ -440,26 +652,28 @@ jobs:
             if [[ "$sleep_seconds" -gt 0 ]]; then
               sleep "$sleep_seconds"
             fi
+
           done
 
       # ==========================================================
-      # 11. Disconnect Tailscale
+      # 13. Disconnect Tailscale
       #
-      # IMPORTANT:
-      # Always execute this step, even if an earlier step fails.
+      # ALWAYS runs.
       #
-      # The auth key must be ephemeral. tailscale down provides
-      # explicit cleanup before the GitHub runner is destroyed.
+      # This is intentionally BEFORE starting the next workflow.
       # ==========================================================
 
-      - name: 11. Disconnect Tailscale
+      - name: 13. Disconnect Tailscale
         if: always()
+
         run: |
           set -euo pipefail
 
           echo "Checking Tailscale state..."
 
           if command -v tailscale >/dev/null 2>&1; then
+
+            echo
             echo "Current Tailscale status:"
             sudo tailscale status || true
 
@@ -471,8 +685,68 @@ jobs:
             echo
             echo "Tailscale status after disconnect:"
             sudo tailscale status || true
+
           else
-            echo "Tailscale is not installed. Nothing to disconnect."
+
+            echo "Tailscale is not installed."
+            echo "Nothing to disconnect."
+
           fi
 
+          echo
           echo "Tailscale cleanup completed."
+
+      # ==========================================================
+      # 14. Start next workflow run
+      #
+      # IMPORTANT:
+      #
+      # This runs AFTER Tailscale cleanup.
+      #
+      # WORKFLOW_PAT must have:
+      #
+      #   Actions: Read and write
+      #
+      # ==========================================================
+
+      - name: 14. Start Next Workflow Run
+        if: always()
+
+        env:
+          WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+
+        run: |
+          set -euo pipefail
+
+          echo "=================================================="
+          echo "Starting next Tailscale runner"
+          echo "=================================================="
+
+          echo "Repository:"
+          echo "$GH_REPOSITORY"
+
+          echo "Branch:"
+          echo "$GH_REF"
+
+          RESPONSE="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail-with-body \
+              --request POST \
+              --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/Tailscale_Exit.yml/dispatches" \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${WORKFLOW_PAT}" \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              --header "Content-Type: application/json" \
+              --data "{\"ref\":\"${GH_REF}\"}"
+          )"
+
+          echo
+          echo "Next workflow dispatch request completed."
+
+          if [[ -n "$RESPONSE" ]]; then
+            echo "$RESPONSE"
+          fi
