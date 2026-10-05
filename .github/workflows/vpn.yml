@@ -736,7 +736,7 @@ jobs:
               --show-error \
               --fail-with-body \
               --request POST \
-              --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/Tailscale_Exit.yml/dispatches" \
+              --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/363966564/dispatches" \
               --header "Accept: application/vnd.github+json" \
               --header "Authorization: Bearer ${WORKFLOW_PAT}" \
               --header "X-GitHub-Api-Version: 2026-03-10" \
