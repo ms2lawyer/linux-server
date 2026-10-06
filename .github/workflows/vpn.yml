@@ -9,18 +9,23 @@ on:
 # ==============================================================
 # SINGLE ACTIVE RUN
 # ==============================================================
-#
-# Never allow a second run to cancel the currently active server.
-#
-# If somebody manually starts another run while one is active,
-# GitHub queues it instead of cancelling the active runner.
-#
+
 concurrency:
   group: permanent-TailScale-server
   cancel-in-progress: false
 
+# ==============================================================
+# GITHUB TOKEN PERMISSIONS
+# ==============================================================
+
+# WORKFLOW_PAT is still used for workflow dispatch.
+#
+# Actions: write is also explicitly declared here so the workflow
+# has the required Actions permission if GitHub's GITHUB_TOKEN is
+# ever used by another step.
 permissions:
   contents: read
+  actions: write
 
 env:
   # 350 minutes = 5h 50m.
@@ -34,21 +39,19 @@ env:
   # ============================================================
   # TAILSCALE MACHINE NAME
   # ============================================================
-  #
+
   # This workflow owns exactly one canonical machine name.
-  #
   TAILSCALE_HOSTNAME: 'exitnode'
 
   # ============================================================
   # WORKFLOW TO RESTART
   # ============================================================
-  #
-  # vpn.yml is the actual workflow file:
+
+  # Actual workflow:
   #
   # .github/workflows/vpn.yml
   #
-  # Using the workflow ID avoids filename ambiguity.
-  #
+  # Workflow ID avoids filename ambiguity.
   TAILSCALE_WORKFLOW_ID: '363966564'
 
 jobs:
@@ -263,20 +266,6 @@ jobs:
       # ==========================================================
       # 08. REMOVE EXISTING MACHINE WITH EXACT HOSTNAME
       # ==========================================================
-      #
-      # Remove ONLY the exact canonical hostname:
-      #
-      #     exitnode
-      #
-      # Do not remove:
-      #
-      #     exitnode-1
-      #     exitnode-2
-      #     exitnode-backup
-      #
-      # This prevents accidental deletion of unrelated machines.
-      #
-      # ==========================================================
 
       - name: 08. Remove Existing Tailscale Machine
         env:
@@ -318,7 +307,7 @@ jobs:
                   | select(
                       (.name // "") == $hostname
                       or (.hostname // "") == $hostname
-                  )
+                    )
                   | .id
                 '
           )"
@@ -381,7 +370,7 @@ jobs:
                       | select(
                           (.name // "") == $hostname
                           or (.hostname // "") == $hostname
-                      )
+                        )
                     ]
                     | length
                   '
@@ -480,19 +469,21 @@ jobs:
 
             echo
             echo "ERROR: Tailscale did not use the required hostname."
+
             echo
             echo "Expected:"
             echo "  $TAILSCALE_HOSTNAME"
+
             echo
             echo "Actual:"
             echo "  $ACTUAL_HOSTNAME"
+
             echo
             echo "The workflow will NOT continue with a suffixed hostname."
 
             sudo tailscale down || true
 
             exit 1
-
           fi
 
           echo
@@ -691,50 +682,46 @@ jobs:
       #
       # ALWAYS runs.
       #
-      # The actual workflow is:
+      # IMPORTANT:
       #
-      #     .github/workflows/vpn.yml
-      #
-      # Workflow ID:
-      #
-      #     363966564
+      # GitHub's current REST API returns HTTP 200 for a successful
+      # workflow_dispatch request.
       #
       # WORKFLOW_PAT must have:
       #
       #     Actions: Read and write
       #
-      # The PAT is intentionally used instead of GITHUB_TOKEN
-      # because workflow chaining through a token requires an
-      # appropriate token with workflow-dispatch capability.
+      # for this repository.
       # ==========================================================
 
       - name: 14. Start Next Workflow Run
         if: always()
+
         env:
           WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT }}
           GH_REPOSITORY: ${{ github.repository }}
           GH_REF: ${{ github.ref_name }}
           TAILSCALE_WORKFLOW_ID: ${{ env.TAILSCALE_WORKFLOW_ID }}
-     
+
         run: |
           set -euo pipefail
-     
+
           echo "=================================================="
           echo "Starting next Tailscale runner"
           echo "=================================================="
-     
+
           echo "Repository:"
           echo "$GH_REPOSITORY"
-     
+
           echo "Branch:"
           echo "$GH_REF"
-     
+
           echo "Workflow ID:"
           echo "$TAILSCALE_WORKFLOW_ID"
-     
+
           echo
           echo "Checking PAT access to workflow..."
-     
+
           curl \
             --silent \
             --show-error \
@@ -745,19 +732,22 @@ jobs:
             --header "Authorization: Bearer ${WORKFLOW_PAT}" \
             --header "X-GitHub-Api-Version: 2026-03-10" \
             --output /tmp/workflow-info.json
-     
+
           echo "PAT can access workflow:"
-          jq -r '"  Name: \(.name)\n  Path: \(.path)\n  State: \(.state)"' \
+
+          jq -r \
+            '"  Name: \(.name)\n  Path: \(.path)\n  State: \(.state)"' \
             /tmp/workflow-info.json
-     
+
           echo
           echo "Dispatching next workflow run..."
-     
+
           HTTP_STATUS="$(
             curl \
               --silent \
               --show-error \
               --output /tmp/workflow-dispatch-response.txt \
+              --dump-header /tmp/workflow-dispatch-headers.txt \
               --write-out "%{http_code}" \
               --request POST \
               --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${TAILSCALE_WORKFLOW_ID}/dispatches" \
@@ -767,25 +757,112 @@ jobs:
               --header "Content-Type: application/json" \
               --data "{\"ref\":\"${GH_REF}\"}"
           )"
-     
+
           echo
           echo "GitHub API HTTP status:"
           echo "$HTTP_STATUS"
-     
+
+          echo
+          echo "Accepted GitHub permissions:"
+          grep -i \
+            '^x-accepted-github-permissions:' \
+            /tmp/workflow-dispatch-headers.txt \
+            || echo "  Header not returned."
+
           if [[ -s /tmp/workflow-dispatch-response.txt ]]; then
             echo
             echo "GitHub API response:"
             cat /tmp/workflow-dispatch-response.txt
           fi
-     
-          if [[ "$HTTP_STATUS" != "204" ]]; then
+
+          # ======================================================
+          # GitHub currently returns HTTP 200 for workflow dispatch.
+          # ======================================================
+
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+
             echo
             echo "ERROR: GitHub workflow dispatch failed."
-            echo "Expected HTTP status: 204"
-            echo "Actual HTTP status:   $HTTP_STATUS"
+            echo
+            echo "Expected HTTP status:"
+            echo "  200"
+            echo
+            echo "Actual HTTP status:"
+            echo "  $HTTP_STATUS"
+
+            if [[ "$HTTP_STATUS" == "401" ]]; then
+              echo
+              echo "ERROR TYPE: Unauthorized"
+              echo "The WORKFLOW_PAT is invalid, expired, revoked, or malformed."
+            fi
+
+            if [[ "$HTTP_STATUS" == "403" ]]; then
+              echo
+              echo "ERROR TYPE: Forbidden"
+              echo
+              echo "The PAT can read the workflow but cannot dispatch it."
+              echo
+              echo "Required fine-grained PAT permission:"
+              echo "  Repository permissions"
+              echo "    Actions: Read and write"
+              echo
+              echo "Also verify that the PAT has access to:"
+              echo "  ${GH_REPOSITORY}"
+            fi
+
             exit 1
           fi
-     
+
+          # ======================================================
+          # Extract workflow run information when GitHub returns
+          # the normal JSON response.
+          # ======================================================
+
+          if jq -e '.workflow_run_id' \
+            /tmp/workflow-dispatch-response.txt >/dev/null 2>&1; then
+
+            WORKFLOW_RUN_ID="$(
+              jq -r '.workflow_run_id' \
+                /tmp/workflow-dispatch-response.txt
+            )"
+
+            RUN_URL="$(
+              jq -r '.run_url // empty' \
+                /tmp/workflow-dispatch-response.txt
+            )"
+
+            HTML_URL="$(
+              jq -r '.html_url // empty' \
+                /tmp/workflow-dispatch-response.txt
+            )"
+
+            echo
+            echo "=================================================="
+            echo "Next workflow started successfully."
+            echo "=================================================="
+
+            echo "Workflow run ID:"
+            echo "$WORKFLOW_RUN_ID"
+
+            if [[ -n "$RUN_URL" ]]; then
+              echo
+              echo "API run URL:"
+              echo "$RUN_URL"
+            fi
+
+            if [[ -n "$HTML_URL" ]]; then
+              echo
+              echo "GitHub Actions URL:"
+              echo "$HTML_URL"
+            fi
+
+          else
+
+            echo
+            echo "Workflow dispatch returned HTTP 200."
+            echo "The next workflow should now start."
+
+          fi
+
           echo
-          echo "Next workflow dispatch completed successfully."
-          echo "The next Tailscale runner should now start."
+          echo "Next Tailscale runner dispatch completed successfully."
