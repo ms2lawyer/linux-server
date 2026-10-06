@@ -710,32 +710,49 @@ jobs:
 
       - name: 14. Start Next Workflow Run
         if: always()
-
         env:
           WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT }}
           GH_REPOSITORY: ${{ github.repository }}
           GH_REF: ${{ github.ref_name }}
           TAILSCALE_WORKFLOW_ID: ${{ env.TAILSCALE_WORKFLOW_ID }}
-
+     
         run: |
           set -euo pipefail
-
+     
           echo "=================================================="
           echo "Starting next Tailscale runner"
           echo "=================================================="
-
+     
           echo "Repository:"
           echo "$GH_REPOSITORY"
-
+     
           echo "Branch:"
           echo "$GH_REF"
-
+     
           echo "Workflow ID:"
           echo "$TAILSCALE_WORKFLOW_ID"
-
+     
+          echo
+          echo "Checking PAT access to workflow..."
+     
+          curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --request GET \
+            --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${TAILSCALE_WORKFLOW_ID}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${WORKFLOW_PAT}" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            --output /tmp/workflow-info.json
+     
+          echo "PAT can access workflow:"
+          jq -r '"  Name: \(.name)\n  Path: \(.path)\n  State: \(.state)"' \
+            /tmp/workflow-info.json
+     
           echo
           echo "Dispatching next workflow run..."
-
+     
           HTTP_STATUS="$(
             curl \
               --silent \
@@ -750,17 +767,17 @@ jobs:
               --header "Content-Type: application/json" \
               --data "{\"ref\":\"${GH_REF}\"}"
           )"
-
+     
           echo
           echo "GitHub API HTTP status:"
           echo "$HTTP_STATUS"
-
+     
           if [[ -s /tmp/workflow-dispatch-response.txt ]]; then
             echo
             echo "GitHub API response:"
             cat /tmp/workflow-dispatch-response.txt
           fi
-
+     
           if [[ "$HTTP_STATUS" != "204" ]]; then
             echo
             echo "ERROR: GitHub workflow dispatch failed."
@@ -768,7 +785,7 @@ jobs:
             echo "Actual HTTP status:   $HTTP_STATUS"
             exit 1
           fi
-
+     
           echo
           echo "Next workflow dispatch completed successfully."
           echo "The next Tailscale runner should now start."
