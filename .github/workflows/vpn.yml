@@ -18,11 +18,10 @@ concurrency:
 # GITHUB TOKEN PERMISSIONS
 # ==============================================================
 
-# WORKFLOW_PAT is still used for workflow dispatch.
+# Step 14 dispatches the next run with GitHub's GITHUB_TOKEN.
 #
-# Actions: write is also explicitly declared here so the workflow
-# has the required Actions permission if GitHub's GITHUB_TOKEN is
-# ever used by another step.
+# That token only has the permissions declared here, so Actions
+# write is required for the workflow_dispatch call to succeed.
 permissions:
   contents: read
   actions: write
@@ -83,7 +82,6 @@ jobs:
           TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT }}
 
         run: |
           set -euo pipefail
@@ -95,7 +93,6 @@ jobs:
             TAILSCALE_API_KEY
             TELEGRAM_BOT_TOKEN
             TELEGRAM_CHAT_ID
-            WORKFLOW_PAT
           )
 
           for name in "${required_vars[@]}"; do
@@ -687,18 +684,17 @@ jobs:
       # GitHub's current REST API returns HTTP 200 for a successful
       # workflow_dispatch request.
       #
-      # WORKFLOW_PAT must have:
+      # This step authenticates with GITHUB_TOKEN. The workflow
+      # permissions block must grant:
       #
-      #     Actions: Read and write
-      #
-      # for this repository.
+      #     actions: write
       # ==========================================================
 
       - name: 14. Start Next Workflow Run
         if: always()
 
         env:
-          WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPOSITORY: ${{ github.repository }}
           GH_REF: ${{ github.ref_name }}
           TAILSCALE_WORKFLOW_ID: ${{ env.TAILSCALE_WORKFLOW_ID }}
@@ -720,7 +716,7 @@ jobs:
           echo "$TAILSCALE_WORKFLOW_ID"
 
           echo
-          echo "Checking PAT access to workflow..."
+          echo "Checking token access to workflow..."
 
           curl \
             --silent \
@@ -729,11 +725,11 @@ jobs:
             --request GET \
             --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${TAILSCALE_WORKFLOW_ID}" \
             --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer ${WORKFLOW_PAT}" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
             --header "X-GitHub-Api-Version: 2026-03-10" \
             --output /tmp/workflow-info.json
 
-          echo "PAT can access workflow:"
+          echo "Token can access workflow:"
 
           jq -r \
             '"  Name: \(.name)\n  Path: \(.path)\n  State: \(.state)"' \
@@ -752,7 +748,7 @@ jobs:
               --request POST \
               --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${TAILSCALE_WORKFLOW_ID}/dispatches" \
               --header "Accept: application/vnd.github+json" \
-              --header "Authorization: Bearer ${WORKFLOW_PAT}" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
               --header "X-GitHub-Api-Version: 2026-03-10" \
               --header "Content-Type: application/json" \
               --data "{\"ref\":\"${GH_REF}\"}"
@@ -793,21 +789,17 @@ jobs:
             if [[ "$HTTP_STATUS" == "401" ]]; then
               echo
               echo "ERROR TYPE: Unauthorized"
-              echo "The WORKFLOW_PAT is invalid, expired, revoked, or malformed."
+              echo "GITHUB_TOKEN was rejected."
             fi
 
             if [[ "$HTTP_STATUS" == "403" ]]; then
               echo
               echo "ERROR TYPE: Forbidden"
               echo
-              echo "The PAT can read the workflow but cannot dispatch it."
+              echo "GITHUB_TOKEN can read the workflow but cannot dispatch it."
               echo
-              echo "Required fine-grained PAT permission:"
-              echo "  Repository permissions"
-              echo "    Actions: Read and write"
-              echo
-              echo "Also verify that the PAT has access to:"
-              echo "  ${GH_REPOSITORY}"
+              echo "The workflow permissions block must grant:"
+              echo "  actions: write"
             fi
 
             exit 1
