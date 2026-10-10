@@ -1,16 +1,21 @@
 name: Linux OmniRoute Server
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
+  # The workflow starts manually.
+  #
+  # After each lifecycle, step 25 starts the next run.
   workflow_dispatch:
 
 concurrency:
   group: permanent-omniroute-server
   cancel-in-progress: false
 
+# Step 25 dispatches the next run with GITHUB_TOKEN, which needs
+# Actions: write. workflow_dispatch events sent with GITHUB_TOKEN
+# always create a new run.
 permissions:
   contents: write
+  actions: write
 
 jobs:
   build:
@@ -27,6 +32,9 @@ jobs:
       OMNIROUTE_MAX_MODELS_PER_CYCLE: '100'
       OMNIROUTE_DB_PATH: 'backup/omniroute/storage.sqlite'
       OMNIROUTE_BASE_URL: 'http://127.0.0.1:20128'
+
+      # This workflow owns exactly one canonical machine name.
+      TAILSCALE_HOSTNAME: 'omniroute'
 
     steps:
 
@@ -48,6 +56,7 @@ jobs:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
           SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
           OMNIROUTE_ENV: ${{ secrets.OMNIROUTE_ENV }}
           OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
           STORAGE_ENCRYPTION_KEY: ${{ secrets.STORAGE_ENCRYPTION_KEY }}
@@ -60,6 +69,7 @@ jobs:
             SSH_USERNAME
             SSH_PASSWORD
             TAILSCALE_AUTHKEY
+            TAILSCALE_API_KEY
             OMNIROUTE_ENV
             OMNIROUTE_API_KEY
             STORAGE_ENCRYPTION_KEY
@@ -549,7 +559,144 @@ jobs:
           exit 1
 
       # ==========================================================
-      # 19. Setup Tailscale
+      # 19. REMOVE EXISTING MACHINE WITH EXACT HOSTNAME
+      #
+      # The previous run leaves its device in the tailnet. Removing
+      # it first keeps the new machine from getting a suffixed name.
+      # ==========================================================
+
+      - name: 19. Remove Existing Tailscale Machine
+        env:
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
+        run: |
+          set -euo pipefail
+
+          echo "=================================================="
+          echo "Tailscale hostname cleanup"
+          echo "=================================================="
+
+          echo "Required hostname:"
+          echo "$TAILSCALE_HOSTNAME"
+
+          echo
+          echo "Querying current Tailscale machines..."
+
+          DEVICES_JSON="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 30 \
+              --user "${TAILSCALE_API_KEY}:" \
+              "https://api.tailscale.com/api/v2/tailnet/-/devices"
+          )"
+
+          echo
+          echo "Searching for exact machine name..."
+
+          MATCHING_DEVICE_IDS="$(
+            echo "$DEVICES_JSON" |
+              jq -r \
+                --arg hostname "$TAILSCALE_HOSTNAME" \
+                '
+                  .devices[]
+                  | select(
+                      (.name // "") == $hostname
+                      or (.hostname // "") == $hostname
+                    )
+                  | .id
+                '
+          )"
+
+          if [[ -z "$MATCHING_DEVICE_IDS" ]]; then
+            echo "No existing machine named '$TAILSCALE_HOSTNAME' was found."
+            echo "Nothing to remove."
+          else
+
+            while IFS= read -r DEVICE_ID; do
+
+              [[ -z "$DEVICE_ID" ]] && continue
+
+              echo
+              echo "Found existing machine:"
+              echo "  Name: $TAILSCALE_HOSTNAME"
+              echo "  ID:   $DEVICE_ID"
+
+              echo
+              echo "Removing machine..."
+
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --max-time 30 \
+                --request DELETE \
+                --user "${TAILSCALE_API_KEY}:" \
+                "https://api.tailscale.com/api/v2/device/${DEVICE_ID}"
+
+              echo
+              echo "Machine $DEVICE_ID removed."
+
+            done <<< "$MATCHING_DEVICE_IDS"
+
+          fi
+
+          echo
+          echo "Verifying hostname availability..."
+
+          for attempt in {1..10}; do
+
+            VERIFY_JSON="$(
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --max-time 30 \
+                --user "${TAILSCALE_API_KEY}:" \
+                "https://api.tailscale.com/api/v2/tailnet/-/devices"
+            )"
+
+            REMAINING="$(
+              echo "$VERIFY_JSON" |
+                jq -r \
+                  --arg hostname "$TAILSCALE_HOSTNAME" \
+                  '
+                    [
+                      .devices[]
+                      | select(
+                          (.name // "") == $hostname
+                          or (.hostname // "") == $hostname
+                        )
+                    ]
+                    | length
+                  '
+            )"
+
+            if [[ "$REMAINING" == "0" ]]; then
+              echo
+              echo "Hostname '$TAILSCALE_HOSTNAME' is available."
+              break
+            fi
+
+            if [[ "$attempt" -eq 10 ]]; then
+              echo
+              echo "ERROR: Hostname '$TAILSCALE_HOSTNAME' is still present."
+              echo "Refusing to start another machine with a suffixed name."
+              exit 1
+            fi
+
+            echo
+            echo "Hostname still exists."
+            echo "Waiting 5 seconds before checking again..."
+
+            sleep 5
+
+          done
+
+      # ==========================================================
+      # 20. Setup Tailscale
       #
       # This now:
       #   1. Installs Tailscale
@@ -559,10 +706,11 @@ jobs:
       #   5. Explicitly enables forwarding
       # ==========================================================
 
-      - name: 19. Setup Tailscale Exit Node
+      - name: 20. Setup Tailscale Exit Node
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
         run: |
           set -euo pipefail
 
@@ -593,7 +741,7 @@ jobs:
 
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTHKEY" \
-            --hostname="omniroute" \
+            --hostname="$TAILSCALE_HOSTNAME" \
             --advertise-exit-node
 
           # ------------------------------------------------------
@@ -620,10 +768,10 @@ jobs:
           sudo tailscale ip
 
       # ==========================================================
-      # 20. Verify SSH user administrator access
+      # 21. Verify SSH user administrator access
       # ==========================================================
 
-      - name: 20. Verify SSH User Administrator Access
+      - name: 21. Verify SSH User Administrator Access
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
         run: |
@@ -643,8 +791,11 @@ jobs:
           echo
           echo "Administrator verification passed."
 
+      # ==========================================================
+      # 22. Keep runner alive
+      # ==========================================================
 
-      - name: 21A. Keep Runner Alive And Check Models
+      - name: 22. Keep Runner Alive And Check Models
         env:
           SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
           OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
@@ -674,9 +825,7 @@ jobs:
               break
             fi
 
-            sleep_seconds=$(
-              ((OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES * 60))
-            )
+            sleep_seconds=$((OMNIROUTE_MODEL_CHECK_INTERVAL_MINUTES * 60))
 
             remaining=$((END_TIME - NOW))
 
@@ -689,12 +838,11 @@ jobs:
             fi
           done
 
-
       # ==========================================================
-      # 22. Stop OmniRoute
+      # 23. Stop OmniRoute
       # ==========================================================
 
-      - name: 22. Stop OmniRoute
+      - name: 23. Stop OmniRoute
         if: always()
         run: |
           set -euo pipefail
@@ -703,10 +851,10 @@ jobs:
           sudo systemctl is-active omniroute.service || true
 
       # ==========================================================
-      # 23. Final Tailscale cleanup
+      # 24. Final Tailscale cleanup
       # ==========================================================
 
-      - name: 23. Tailscale Down
+      - name: 24. Tailscale Down
         if: always()
         run: |
           set -euo pipefail
@@ -715,3 +863,172 @@ jobs:
           sudo tailscale down || true
 
           echo "Tailscale is down."
+
+      # ==========================================================
+      # 25. Start next workflow run
+      #
+      # ALWAYS runs.
+      #
+      # IMPORTANT:
+      #
+      # GitHub's current REST API returns HTTP 200 for a successful
+      # workflow_dispatch request.
+      #
+      # This step authenticates with GITHUB_TOKEN. The workflow
+      # permissions block must grant:
+      #
+      #     actions: write
+      # ==========================================================
+
+      - name: 25. Start Next Workflow Run
+        if: always()
+
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+          GH_WORKFLOW_REF: ${{ github.workflow_ref }}
+
+        run: |
+          set -euo pipefail
+
+          # owner/repo/.github/workflows/<file>@refs/heads/<branch>
+          WORKFLOW_FILE="${GH_WORKFLOW_REF%@*}"
+          WORKFLOW_FILE="${WORKFLOW_FILE##*/}"
+
+          echo "=================================================="
+          echo "Starting next OmniRoute runner"
+          echo "=================================================="
+
+          echo "Repository:"
+          echo "$GH_REPOSITORY"
+
+          echo "Branch:"
+          echo "$GH_REF"
+
+          echo "Workflow file:"
+          echo "$WORKFLOW_FILE"
+
+          echo
+          echo "Checking token access to workflow..."
+
+          curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --request GET \
+            --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            --output /tmp/workflow-info.json
+
+          echo "Token can access workflow:"
+
+          jq -r \
+            '"  Name: \(.name)\n  Path: \(.path)\n  State: \(.state)"' \
+            /tmp/workflow-info.json
+
+          echo
+          echo "Dispatching next workflow run..."
+
+          HTTP_STATUS="$(
+            curl \
+              --silent \
+              --show-error \
+              --output /tmp/workflow-dispatch-response.txt \
+              --dump-header /tmp/workflow-dispatch-headers.txt \
+              --write-out "%{http_code}" \
+              --request POST \
+              --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              --header "Content-Type: application/json" \
+              --data "{\"ref\":\"${GH_REF}\"}"
+          )"
+
+          echo
+          echo "GitHub API HTTP status:"
+          echo "$HTTP_STATUS"
+
+          echo
+          echo "Accepted GitHub permissions:"
+          grep -i \
+            '^x-accepted-github-permissions:' \
+            /tmp/workflow-dispatch-headers.txt \
+            || echo "  Header not returned."
+
+          if [[ -s /tmp/workflow-dispatch-response.txt ]]; then
+            echo
+            echo "GitHub API response:"
+            cat /tmp/workflow-dispatch-response.txt
+          fi
+
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+
+            echo
+            echo "ERROR: GitHub workflow dispatch failed."
+            echo
+            echo "Expected HTTP status:"
+            echo "  200"
+            echo
+            echo "Actual HTTP status:"
+            echo "  $HTTP_STATUS"
+
+            if [[ "$HTTP_STATUS" == "401" ]]; then
+              echo
+              echo "ERROR TYPE: Unauthorized"
+              echo "GITHUB_TOKEN was rejected."
+            fi
+
+            if [[ "$HTTP_STATUS" == "403" ]]; then
+              echo
+              echo "ERROR TYPE: Forbidden"
+              echo
+              echo "GITHUB_TOKEN can read the workflow but cannot dispatch it."
+              echo
+              echo "The workflow permissions block must grant:"
+              echo "  actions: write"
+            fi
+
+            exit 1
+          fi
+
+          if jq -e '.workflow_run_id' \
+            /tmp/workflow-dispatch-response.txt >/dev/null 2>&1; then
+
+            WORKFLOW_RUN_ID="$(
+              jq -r '.workflow_run_id' \
+                /tmp/workflow-dispatch-response.txt
+            )"
+
+            HTML_URL="$(
+              jq -r '.html_url // empty' \
+                /tmp/workflow-dispatch-response.txt
+            )"
+
+            echo
+            echo "=================================================="
+            echo "Next workflow started successfully."
+            echo "=================================================="
+
+            echo "Workflow run ID:"
+            echo "$WORKFLOW_RUN_ID"
+
+            if [[ -n "$HTML_URL" ]]; then
+              echo
+              echo "GitHub Actions URL:"
+              echo "$HTML_URL"
+            fi
+
+          else
+
+            echo
+            echo "Workflow dispatch returned HTTP 200."
+            echo "The next workflow should now start."
+
+          fi
+
+          echo
+          echo "Next OmniRoute runner dispatch completed successfully."
