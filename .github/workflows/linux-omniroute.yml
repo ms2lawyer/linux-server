@@ -792,6 +792,87 @@ jobs:
           echo "Administrator verification passed."
 
       # ==========================================================
+      # 11. Telegram online notification
+      # ==========================================================
+
+      - name: 21A. Telegram Online Notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
+        run: |
+          set -euo pipefail
+
+          TAILSCALE_IP="$(
+            sudo tailscale ip -4 |
+            head -n 1
+          )"
+
+          test -n "$TAILSCALE_IP"
+
+          ACTUAL_HOSTNAME="$(
+            sudo tailscale status --self --json |
+              jq -r '
+                .Self.DNSName
+                // .Self.HostName
+                // "Not detected"
+              '
+          )"
+
+          MESSAGE="$(cat <<EOF
+          🚀 Linux SSH Server is ONLINE
+          ━━━━━━━━━━━━━━━━━━━━
+          Tailscale
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Hostname:
+          $ACTUAL_HOSTNAME
+
+          IP:
+          $TAILSCALE_IP
+
+          ━━━━━━━━━━━━━━━━━━━━
+          SSH
+          ━━━━━━━━━━━━━━━━━━━━
+
+          ssh $SSH_USERNAME@$TAILSCALE_IP
+
+          Port:
+          22
+
+          ━━━━━━━━━━━━━━━━━━━━
+          Status
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Runtime: approximately 6 hours
+
+          GitHub Actions runner is active.
+          EOF
+          )"
+
+          RESPONSE="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 20 \
+              --request POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MESSAGE}"
+          )"
+
+          echo "$RESPONSE" |
+            grep -q '"ok":true' || {
+              echo "ERROR: Telegram API did not report success."
+              exit 1
+            }
+
+          echo "Telegram notification sent."
+
+      # ==========================================================
       # 22. Keep runner alive
       # ==========================================================
 
