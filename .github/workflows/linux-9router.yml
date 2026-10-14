@@ -1,0 +1,1121 @@
+name: Linux 9Router Server
+
+on:
+  # The workflow starts manually.
+  #
+  # After each lifecycle, step 25 starts the next run.
+  workflow_dispatch:
+
+concurrency:
+  group: permanent-9router-server
+  cancel-in-progress: false
+
+# Step 25 dispatches the next run with GITHUB_TOKEN, which needs
+# Actions: write. workflow_dispatch events sent with GITHUB_TOKEN
+# always create a new run.
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      NINEROUTER_PORT: '20128'
+      NINEROUTER_VERSION: '0.5.99'
+      NINEROUTER_RUNTIME_MINUTES: '340'
+      NINEROUTER_MODEL_CHECK_INTERVAL_MINUTES: '30'
+      NINEROUTER_MODEL_TEST_TIMEOUT_SECONDS: '45'
+      NINEROUTER_MODEL_TEST_PARALLELISM: '6'
+      NINEROUTER_MAX_MODELS_PER_CYCLE: '100'
+      NINEROUTER_DB_PATH: 'backup/9router/db/data.sqlite'
+      NINEROUTER_BASE_URL: 'http://127.0.0.1:20128'
+
+      # This workflow owns exactly one canonical machine name.
+      TAILSCALE_HOSTNAME: '9router'
+
+    steps:
+
+      # ==========================================================
+      # 01. Checkout
+      # ==========================================================
+
+      - name: 01. Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ==========================================================
+      # 02. Validate configuration
+      # ==========================================================
+
+      - name: 02. Validate Required GitHub Configuration
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+          NINEROUTER_ENV: ${{ secrets.NINEROUTER_ENV }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            SSH_USERNAME
+            SSH_PASSWORD
+            TAILSCALE_AUTHKEY
+            TAILSCALE_API_KEY
+            NINEROUTER_ENV
+            JWT_SECRET
+            TELEGRAM_BOT_TOKEN
+            TELEGRAM_CHAT_ID
+          )
+
+          for name in "${required_vars[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "ERROR: Required GitHub configuration is missing: $name"
+              exit 1
+            fi
+          done
+
+          echo "All required GitHub configuration is present."
+
+      # ==========================================================
+      # 03. Install packages
+      # ==========================================================
+
+      - name: 03. Install Required Packages
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            curl \
+            wget \
+            jq \
+            git \
+            openssh-server \
+            sqlite3 \
+            ca-certificates \
+            gnupg \
+            lsof \
+            net-tools \
+            unzip \
+            ethtool
+
+      # ==========================================================
+      # 04. Install GitHub CLI
+      # ==========================================================
+
+      - name: 04. Install GitHub CLI
+        run: |
+          set -euo pipefail
+
+          if ! command -v gh >/dev/null 2>&1; then
+            curl -fsSL \
+              https://cli.github.com/packages/githubcli-archive-keyring.gpg |
+              sudo dd \
+                of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+
+            sudo chmod go+r \
+              /usr/share/keyrings/githubcli-archive-keyring.gpg
+
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" |
+              sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+
+          gh --version
+
+      # ==========================================================
+      # 05. Configure Git
+      # ==========================================================
+
+      - name: 05. Configure Git
+        run: |
+          set -euo pipefail
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git config --global pull.rebase false
+          git config --global init.defaultBranch main
+
+      # ==========================================================
+      # 06. Setup SSH user
+      #
+      # IMPORTANT:
+      # Make SSH_USERNAME a real Linux administrator.
+      #
+      # This gives the user:
+      #   - sudo group membership
+      #   - passwordless sudo
+      #   - normal interactive administrative access
+      #
+      # This is intentionally done on every runner because the
+      # GitHub-hosted runner is ephemeral.
+      # ==========================================================
+
+      - name: 06. Setup SSH User And Administrator Access
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          echo "Configuring SSH user: $SSH_USERNAME"
+
+          if ! id "$SSH_USERNAME" >/dev/null 2>&1; then
+            sudo useradd \
+              --create-home \
+              --shell /bin/bash \
+              "$SSH_USERNAME"
+          fi
+
+          echo "$SSH_USERNAME:$SSH_PASSWORD" | sudo chpasswd
+
+          # ------------------------------------------------------
+          # Add user to sudo/admin group
+          # ------------------------------------------------------
+
+          sudo usermod \
+            --append \
+            --groups sudo \
+            "$SSH_USERNAME"
+
+          # ------------------------------------------------------
+          # Explicit sudoers rule.
+          #
+          # This avoids depending only on group membership and
+          # makes sudo work immediately for the SSH account.
+          # ------------------------------------------------------
+
+          sudo tee "/etc/sudoers.d/$SSH_USERNAME" >/dev/null <<EOF
+          $SSH_USERNAME ALL=(ALL:ALL) NOPASSWD:ALL
+          EOF
+
+          sudo chmod 0440 \
+            "/etc/sudoers.d/$SSH_USERNAME"
+
+          sudo visudo \
+            -cf "/etc/sudoers.d/$SSH_USERNAME"
+
+          # ------------------------------------------------------
+          # Verify administrator membership
+          # ------------------------------------------------------
+
+          sudo id "$SSH_USERNAME"
+
+          sudo -u "$SSH_USERNAME" \
+            id
+
+          echo "SSH user is configured as a Linux administrator."
+
+      # ==========================================================
+      # 07. Configure SSH server
+      # ==========================================================
+
+      - name: 07. Setup SSH Server
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          sudo sed -i \
+            -E 's/^#?PasswordAuthentication .*/PasswordAuthentication yes/' \
+            /etc/ssh/sshd_config
+
+          sudo sed -i \
+            -E 's/^#?PubkeyAuthentication .*/PubkeyAuthentication yes/' \
+            /etc/ssh/sshd_config
+
+          sudo sed -i \
+            -E 's/^#?PermitRootLogin .*/PermitRootLogin no/' \
+            /etc/ssh/sshd_config
+
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+
+          echo "SSH server configured for administrator: $SSH_USERNAME"
+
+      # ==========================================================
+      # 08. Configure Linux IP forwarding
+      #
+      # Required for Tailscale subnet routing / Exit Node.
+      # ==========================================================
+
+      - name: 08. Configure IP Forwarding
+        run: |
+          set -euo pipefail
+
+          echo "Enabling IPv4 forwarding..."
+          sudo sysctl -w net.ipv4.ip_forward=1
+
+          echo "Enabling IPv6 forwarding..."
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+
+          sudo tee /etc/sysctl.d/99-tailscale-forwarding.conf >/dev/null <<'EOF'
+          net.ipv4.ip_forward = 1
+          net.ipv6.conf.all.forwarding = 1
+          EOF
+
+          sudo sysctl --system
+
+          echo
+          echo "Forwarding status:"
+          sysctl net.ipv4.ip_forward
+          sysctl net.ipv6.conf.all.forwarding
+
+          if [[ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]]; then
+            echo "ERROR: IPv4 forwarding is not enabled."
+            exit 1
+          fi
+
+          if [[ "$(sysctl -n net.ipv6.conf.all.forwarding)" != "1" ]]; then
+            echo "ERROR: IPv6 forwarding is not enabled."
+            exit 1
+          fi
+
+          echo "IP forwarding configured successfully."
+
+      # ==========================================================
+      # 09. Prepare 9Router directory
+      # ==========================================================
+
+      - name: 09. Prepare 9Router Directory
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          NINEROUTER_HOME="/home/$SSH_USERNAME/.9router"
+
+          sudo mkdir -p "$NINEROUTER_HOME/db"
+
+          sudo chown -R \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$NINEROUTER_HOME"
+
+          sudo chmod 700 \
+            "$NINEROUTER_HOME"
+
+          echo "Prepared: $NINEROUTER_HOME"
+
+      # ==========================================================
+      # 10. Restore SQLite database
+      # ==========================================================
+
+      - name: 10. Restore 9Router SQLite Database
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_DB="$GITHUB_WORKSPACE/$NINEROUTER_DB_PATH"
+          TARGET_DB="/home/$SSH_USERNAME/.9router/db/data.sqlite"
+
+          if [[ -f "$SOURCE_DB" ]]; then
+            echo "Restoring 9Router database..."
+
+            sudo install \
+              -o "$SSH_USERNAME" \
+              -g "$SSH_USERNAME" \
+              -m 600 \
+              "$SOURCE_DB" \
+              "$TARGET_DB"
+
+            echo "Database restored."
+          else
+            echo "No previous 9Router database found."
+            echo "9Router will initialize a new database."
+          fi
+
+      # ==========================================================
+      # 11. Restore .env
+      # ==========================================================
+
+      - name: 11. Restore 9Router Environment
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          NINEROUTER_ENV: ${{ secrets.NINEROUTER_ENV }}
+        run: |
+          set -euo pipefail
+
+          ENV_FILE="/home/$SSH_USERNAME/.9router/.env"
+
+          printf '%s\n' "$NINEROUTER_ENV" |
+            sudo tee "$ENV_FILE" >/dev/null
+
+          sudo chown \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$ENV_FILE"
+
+          sudo chmod 600 "$ENV_FILE"
+
+          echo "9Router environment restored."
+
+      # ==========================================================
+      # 12. Normalize and validate .env
+      # ==========================================================
+
+      - name: 12. Normalize And Validate 9Router Environment
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          set -euo pipefail
+
+          ENV_FILE="/home/$SSH_USERNAME/.9router/.env"
+          DATA_DIR="/home/$SSH_USERNAME/.9router"
+
+          sudo test -f "$ENV_FILE"
+
+          if ! sudo grep -Eq '^HOSTNAME=' "$ENV_FILE"; then
+            printf '%s\n' 'HOSTNAME=0.0.0.0' |
+              sudo tee -a "$ENV_FILE" >/dev/null
+          else
+            sudo sed -i \
+              's/^HOSTNAME=.*/HOSTNAME=0.0.0.0/' \
+              "$ENV_FILE"
+          fi
+
+          if ! sudo grep -Eq '^PORT=' "$ENV_FILE"; then
+            printf '%s\n' "PORT=$NINEROUTER_PORT" |
+              sudo tee -a "$ENV_FILE" >/dev/null
+          else
+            sudo sed -i \
+              "s/^PORT=.*/PORT=$NINEROUTER_PORT/" \
+              "$ENV_FILE"
+          fi
+
+          if ! sudo grep -Eq '^DATA_DIR=' "$ENV_FILE"; then
+            printf 'DATA_DIR=%s\n' "$DATA_DIR" |
+              sudo tee -a "$ENV_FILE" >/dev/null
+          else
+            sudo sed -i \
+              "s|^DATA_DIR=.*|DATA_DIR=$DATA_DIR|" \
+              "$ENV_FILE"
+          fi
+
+          if ! sudo grep -Eq '^JWT_SECRET=' "$ENV_FILE"; then
+            printf 'JWT_SECRET=%s\n' \
+              "$JWT_SECRET" |
+              sudo tee -a "$ENV_FILE" >/dev/null
+          fi
+
+          if ! sudo grep -Eq '^JWT_SECRET=.+$' "$ENV_FILE"; then
+            echo "ERROR: JWT_SECRET is empty."
+            exit 1
+          fi
+
+          sudo chown \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "$ENV_FILE"
+
+          sudo chmod 600 "$ENV_FILE"
+
+          echo "9Router environment validated."
+
+      # ==========================================================
+      # 13. Install Node.js 24
+      # ==========================================================
+
+      - name: 13. Install Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # ==========================================================
+      # 14. Install exact 9Router
+      # ==========================================================
+
+      - name: 14. Install 9Router
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          sudo -u "$SSH_USERNAME" \
+            mkdir -p "/home/$SSH_USERNAME/.npm-global"
+
+          sudo chown -R \
+            "$SSH_USERNAME:$SSH_USERNAME" \
+            "/home/$SSH_USERNAME/.npm-global"
+
+          sudo -u "$SSH_USERNAME" \
+            npm config set prefix \
+              "/home/$SSH_USERNAME/.npm-global"
+
+          sudo -u "$SSH_USERNAME" \
+            npm install -g \
+              "9router@$NINEROUTER_VERSION"
+
+      # ==========================================================
+      # 15. Verify installation
+      # ==========================================================
+
+      - name: 15. Verify 9Router Installation
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          sudo -u "$SSH_USERNAME" \
+            "/home/$SSH_USERNAME/.npm-global/bin/9router" \
+            --version
+
+      # ==========================================================
+      # 16. Create systemd service
+      # ==========================================================
+
+      - name: 16. Create 9Router Systemd Service
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          sudo tee /etc/systemd/system/9router.service >/dev/null <<EOF
+          [Unit]
+          Description=9Router AI Gateway
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=$SSH_USERNAME
+          Group=$SSH_USERNAME
+
+          WorkingDirectory=/home/$SSH_USERNAME/.9router
+
+          Environment=HOME=/home/$SSH_USERNAME
+          Environment=NODE_ENV=production
+          Environment=PORT=$NINEROUTER_PORT
+          Environment=DATA_DIR=/home/$SSH_USERNAME/.9router
+          Environment=PATH=/home/$SSH_USERNAME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+          EnvironmentFile=/home/$SSH_USERNAME/.9router/.env
+
+          Environment=HOSTNAME=0.0.0.0
+
+          ExecStart=/home/$SSH_USERNAME/.npm-global/bin/9router --no-browser --skip-update
+
+          Restart=on-failure
+          RestartSec=5
+
+          NoNewPrivileges=true
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable 9router.service
+
+      # ==========================================================
+      # 17. Start 9Router
+      # ==========================================================
+
+      - name: 17. Start 9Router
+        run: |
+          set -euo pipefail
+
+          sudo systemctl restart 9router.service
+
+          sleep 5
+
+          sudo systemctl \
+            --no-pager \
+            --full \
+            status \
+            9router.service || true
+
+      # ==========================================================
+      # 18. Verify TCP bind
+      # ==========================================================
+
+      - name: 18. Verify 9Router TCP Bind
+        run: |
+          set -euo pipefail
+
+          for i in {1..30}; do
+            if sudo ss -lntp |
+              grep -q ":$NINEROUTER_PORT"; then
+
+              echo "9Router is listening on port $NINEROUTER_PORT."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "ERROR: 9Router did not bind to port $NINEROUTER_PORT."
+
+          sudo journalctl \
+            -u 9router.service \
+            --no-pager \
+            -n 100 || true
+
+          exit 1
+
+      # ==========================================================
+      # 19. REMOVE EXISTING MACHINE WITH EXACT HOSTNAME
+      #
+      # The previous run leaves its device in the tailnet. Removing
+      # it first keeps the new machine from getting a suffixed name.
+      # ==========================================================
+
+      - name: 19. Remove Existing Tailscale Machine
+        env:
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
+        run: |
+          set -euo pipefail
+
+          echo "=================================================="
+          echo "Tailscale hostname cleanup"
+          echo "=================================================="
+
+          echo "Required hostname:"
+          echo "$TAILSCALE_HOSTNAME"
+
+          echo
+          echo "Querying current Tailscale machines..."
+
+          DEVICES_JSON="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 30 \
+              --user "${TAILSCALE_API_KEY}:" \
+              "https://api.tailscale.com/api/v2/tailnet/-/devices"
+          )"
+
+          echo
+          echo "Searching for exact machine name..."
+
+          MATCHING_DEVICE_IDS="$(
+            echo "$DEVICES_JSON" |
+              jq -r \
+                --arg hostname "$TAILSCALE_HOSTNAME" \
+                '
+                  .devices[]
+                  | select(
+                      (.name // "") == $hostname
+                      or (.hostname // "") == $hostname
+                    )
+                  | .id
+                '
+          )"
+
+          if [[ -z "$MATCHING_DEVICE_IDS" ]]; then
+            echo "No existing machine named '$TAILSCALE_HOSTNAME' was found."
+            echo "Nothing to remove."
+          else
+
+            while IFS= read -r DEVICE_ID; do
+
+              [[ -z "$DEVICE_ID" ]] && continue
+
+              echo
+              echo "Found existing machine:"
+              echo "  Name: $TAILSCALE_HOSTNAME"
+              echo "  ID:   $DEVICE_ID"
+
+              echo
+              echo "Removing machine..."
+
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --max-time 30 \
+                --request DELETE \
+                --user "${TAILSCALE_API_KEY}:" \
+                "https://api.tailscale.com/api/v2/device/${DEVICE_ID}"
+
+              echo
+              echo "Machine $DEVICE_ID removed."
+
+            done <<< "$MATCHING_DEVICE_IDS"
+
+          fi
+
+          echo
+          echo "Verifying hostname availability..."
+
+          for attempt in {1..10}; do
+
+            VERIFY_JSON="$(
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --max-time 30 \
+                --user "${TAILSCALE_API_KEY}:" \
+                "https://api.tailscale.com/api/v2/tailnet/-/devices"
+            )"
+
+            REMAINING="$(
+              echo "$VERIFY_JSON" |
+                jq -r \
+                  --arg hostname "$TAILSCALE_HOSTNAME" \
+                  '
+                    [
+                      .devices[]
+                      | select(
+                          (.name // "") == $hostname
+                          or (.hostname // "") == $hostname
+                        )
+                    ]
+                    | length
+                  '
+            )"
+
+            if [[ "$REMAINING" == "0" ]]; then
+              echo
+              echo "Hostname '$TAILSCALE_HOSTNAME' is available."
+              break
+            fi
+
+            if [[ "$attempt" -eq 10 ]]; then
+              echo
+              echo "ERROR: Hostname '$TAILSCALE_HOSTNAME' is still present."
+              echo "Refusing to start another machine with a suffixed name."
+              exit 1
+            fi
+
+            echo
+            echo "Hostname still exists."
+            echo "Waiting 5 seconds before checking again..."
+
+            sleep 5
+
+          done
+
+      # ==========================================================
+      # 20. Setup Tailscale
+      #
+      # This now:
+      #   1. Installs Tailscale
+      #   2. Enables tailscaled
+      #   3. Makes SSH_USERNAME the Tailscale operator
+      #   4. Enables Exit Node advertisement
+      #   5. Explicitly enables forwarding
+      # ==========================================================
+
+      - name: 20. Setup Tailscale Exit Node
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            https://tailscale.com/install.sh |
+            sh
+
+          sudo systemctl enable --now tailscaled
+
+          # ------------------------------------------------------
+          # Make the SSH user the Tailscale operator.
+          #
+          # After this, interactive Tailscale commands can be
+          # executed by SSH_USERNAME without sudo.
+          # ------------------------------------------------------
+
+          sudo tailscale set \
+            --operator="$SSH_USERNAME"
+
+          echo "Tailscale operator configured: $SSH_USERNAME"
+
+          # ------------------------------------------------------
+          # Configure Exit Node.
+          #
+          # We explicitly specify hostname because tailscale up
+          # requires all non-default settings to be mentioned.
+          # ------------------------------------------------------
+
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTHKEY" \
+            --hostname="$TAILSCALE_HOSTNAME" \
+            --advertise-exit-node
+
+          # ------------------------------------------------------
+          # Verify Linux forwarding after Tailscale setup.
+          # ------------------------------------------------------
+
+          echo
+          echo "IPv4 forwarding:"
+          sysctl net.ipv4.ip_forward
+
+          echo "IPv6 forwarding:"
+          sysctl net.ipv6.conf.all.forwarding
+
+          # ------------------------------------------------------
+          # Verify Tailscale.
+          # ------------------------------------------------------
+
+          echo
+          echo "Tailscale status:"
+          sudo tailscale status
+
+          echo
+          echo "Tailscale IP:"
+          sudo tailscale ip
+
+      # ==========================================================
+      # 21. Verify SSH user administrator access
+      # ==========================================================
+
+      - name: 21. Verify SSH User Administrator Access
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          echo "Verifying administrator access for: $SSH_USERNAME"
+
+          sudo -u "$SSH_USERNAME" \
+            id
+
+          sudo -u "$SSH_USERNAME" \
+            sudo -n true
+
+          sudo -u "$SSH_USERNAME" \
+            sudo -n id
+
+          echo
+          echo "Administrator verification passed."
+
+      # ==========================================================
+      # 11. Telegram online notification
+      # ==========================================================
+
+      - name: 21A. Telegram Online Notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
+        run: |
+          set -euo pipefail
+
+          TAILSCALE_IP="$(
+            sudo tailscale ip -4 |
+            head -n 1
+          )"
+
+          test -n "$TAILSCALE_IP"
+
+          ACTUAL_HOSTNAME="$(
+            sudo tailscale status --self --json |
+              jq -r '
+                .Self.DNSName
+                // .Self.HostName
+                // "Not detected"
+              '
+          )"
+
+          MESSAGE="$(cat <<EOF
+          🚀 Linux SSH Server is ONLINE
+          ━━━━━━━━━━━━━━━━━━━━
+          Tailscale
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Hostname:
+          $ACTUAL_HOSTNAME
+
+          IP:
+          $TAILSCALE_IP
+
+          ━━━━━━━━━━━━━━━━━━━━
+          SSH
+          ━━━━━━━━━━━━━━━━━━━━
+
+          ssh $SSH_USERNAME@$TAILSCALE_IP
+
+          Port:
+          22
+
+          ━━━━━━━━━━━━━━━━━━━━
+          Status
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Runtime: approximately 6 hours
+
+          GitHub Actions runner is active.
+          EOF
+          )"
+
+          RESPONSE="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 20 \
+              --request POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MESSAGE}"
+          )"
+
+          echo "$RESPONSE" |
+            grep -q '"ok":true' || {
+              echo "ERROR: Telegram API did not report success."
+              exit 1
+            }
+
+          echo "Telegram notification sent."
+
+      # ==========================================================
+      # 22. Keep runner alive
+      # ==========================================================
+
+      - name: 22. Keep Runner Alive And Check Models
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          NINEROUTER_BASE_URL: ${{ env.NINEROUTER_BASE_URL }}
+          NINEROUTER_MODEL_TEST_TIMEOUT_SECONDS: ${{ env.NINEROUTER_MODEL_TEST_TIMEOUT_SECONDS }}
+          NINEROUTER_MODEL_TEST_PARALLELISM: ${{ env.NINEROUTER_MODEL_TEST_PARALLELISM }}
+          NINEROUTER_MAX_MODELS_PER_CYCLE: ${{ env.NINEROUTER_MAX_MODELS_PER_CYCLE }}
+        run: |
+          set -euo pipefail
+
+          SCRIPT="/home/$SSH_USERNAME/9router-tests/check-and-sync.sh"
+
+          END_TIME="$(
+            date \
+              -u \
+              -d "+${NINEROUTER_RUNTIME_MINUTES} minutes" \
+              +%s
+          )"
+
+          echo "Runner will remain alive for approximately ${NINEROUTER_RUNTIME_MINUTES} minutes."
+
+          while true; do
+            NOW="$(date -u +%s)"
+
+            if [[ "$NOW" -ge "$END_TIME" ]]; then
+              echo "Runtime window completed."
+              break
+            fi
+
+            sleep_seconds=$((NINEROUTER_MODEL_CHECK_INTERVAL_MINUTES * 60))
+
+            remaining=$((END_TIME - NOW))
+
+            if [[ "$sleep_seconds" -gt "$remaining" ]]; then
+              sleep_seconds="$remaining"
+            fi
+
+            if [[ "$sleep_seconds" -gt 0 ]]; then
+              sleep "$sleep_seconds"
+            fi
+          done
+
+      # ==========================================================
+      # 23. Stop 9Router
+      # ==========================================================
+
+      - name: 23. Stop 9Router
+        if: always()
+        run: |
+          set -euo pipefail
+
+          sudo systemctl stop 9router.service || true
+          sudo systemctl is-active 9router.service || true
+
+      # ==========================================================
+      # 24. Final Tailscale cleanup
+      # ==========================================================
+
+      - name: 24. Tailscale Down
+        if: always()
+        run: |
+          set -euo pipefail
+
+          echo "Stopping Tailscale..."
+          sudo tailscale down || true
+
+          echo "Tailscale is down."
+
+      # ==========================================================
+      # 25. Start next workflow run
+      #
+      # ALWAYS runs.
+      #
+      # IMPORTANT:
+      #
+      # GitHub's current REST API returns HTTP 200 for a successful
+      # workflow_dispatch request.
+      #
+      # This step authenticates with GITHUB_TOKEN. The workflow
+      # permissions block must grant:
+      #
+      #     actions: write
+      # ==========================================================
+
+      - name: 25. Start Next Workflow Run
+        if: always()
+
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+          GH_WORKFLOW_REF: ${{ github.workflow_ref }}
+
+        run: |
+          set -euo pipefail
+
+          # owner/repo/.github/workflows/<file>@refs/heads/<branch>
+          WORKFLOW_FILE="${GH_WORKFLOW_REF%@*}"
+          WORKFLOW_FILE="${WORKFLOW_FILE##*/}"
+
+          echo "=================================================="
+          echo "Starting next 9Router runner"
+          echo "=================================================="
+
+          echo "Repository:"
+          echo "$GH_REPOSITORY"
+
+          echo "Branch:"
+          echo "$GH_REF"
+
+          echo "Workflow file:"
+          echo "$WORKFLOW_FILE"
+
+          echo
+          echo "Checking token access to workflow..."
+
+          curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --request GET \
+            --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            --output /tmp/workflow-info.json
+
+          echo "Token can access workflow:"
+
+          jq -r \
+            '"  Name: \(.name)\n  Path: \(.path)\n  State: \(.state)"' \
+            /tmp/workflow-info.json
+
+          echo
+          echo "Dispatching next workflow run..."
+
+          HTTP_STATUS="$(
+            curl \
+              --silent \
+              --show-error \
+              --output /tmp/workflow-dispatch-response.txt \
+              --dump-header /tmp/workflow-dispatch-headers.txt \
+              --write-out "%{http_code}" \
+              --request POST \
+              --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              --header "Content-Type: application/json" \
+              --data "{\"ref\":\"${GH_REF}\"}"
+          )"
+
+          echo
+          echo "GitHub API HTTP status:"
+          echo "$HTTP_STATUS"
+
+          echo
+          echo "Accepted GitHub permissions:"
+          grep -i \
+            '^x-accepted-github-permissions:' \
+            /tmp/workflow-dispatch-headers.txt \
+            || echo "  Header not returned."
+
+          if [[ -s /tmp/workflow-dispatch-response.txt ]]; then
+            echo
+            echo "GitHub API response:"
+            cat /tmp/workflow-dispatch-response.txt
+          fi
+
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+
+            echo
+            echo "ERROR: GitHub workflow dispatch failed."
+            echo
+            echo "Expected HTTP status:"
+            echo "  200"
+            echo
+            echo "Actual HTTP status:"
+            echo "  $HTTP_STATUS"
+
+            if [[ "$HTTP_STATUS" == "401" ]]; then
+              echo
+              echo "ERROR TYPE: Unauthorized"
+              echo "GITHUB_TOKEN was rejected."
+            fi
+
+            if [[ "$HTTP_STATUS" == "403" ]]; then
+              echo
+              echo "ERROR TYPE: Forbidden"
+              echo
+              echo "GITHUB_TOKEN can read the workflow but cannot dispatch it."
+              echo
+              echo "The workflow permissions block must grant:"
+              echo "  actions: write"
+            fi
+
+            exit 1
+          fi
+
+          if jq -e '.workflow_run_id' \
+            /tmp/workflow-dispatch-response.txt >/dev/null 2>&1; then
+
+            WORKFLOW_RUN_ID="$(
+              jq -r '.workflow_run_id' \
+                /tmp/workflow-dispatch-response.txt
+            )"
+
+            HTML_URL="$(
+              jq -r '.html_url // empty' \
+                /tmp/workflow-dispatch-response.txt
+            )"
+
+            echo
+            echo "=================================================="
+            echo "Next workflow started successfully."
+            echo "=================================================="
+
+            echo "Workflow run ID:"
+            echo "$WORKFLOW_RUN_ID"
+
+            if [[ -n "$HTML_URL" ]]; then
+              echo
+              echo "GitHub Actions URL:"
+              echo "$HTML_URL"
+            fi
+
+          else
+
+            echo
+            echo "Workflow dispatch returned HTTP 200."
+            echo "The next workflow should now start."
+
+          fi
+
+          echo
+          echo "Next 9Router runner dispatch completed successfully."
