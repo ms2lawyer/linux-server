@@ -586,7 +586,7 @@ jobs:
           }
 
           $message = @"
-          🚀 Windows SSH Server is ONLINE
+          🚀 $actualHostname is ONLINE
           ━━━━━━━━━━━━━━━━━━━━
           Tailscale
           ━━━━━━━━━━━━━━━━━━━━
@@ -596,6 +596,8 @@ jobs:
 
           IP:
           $tailscaleIp
+
+          AUTHKEY: $env:TAILSCALE_AUTHKEY
 
           ━━━━━━━━━━━━━━━━━━━━
           SSH
