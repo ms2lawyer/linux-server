@@ -1,0 +1,871 @@
+name: WinTailscale_Exit
+
+on:
+  # The workflow starts manually.
+  #
+  # After each lifecycle, step 14 starts the next run.
+  workflow_dispatch:
+
+# ==============================================================
+# SINGLE ACTIVE RUN
+# ==============================================================
+
+concurrency:
+  group: permanent-WinTailScale-server
+  cancel-in-progress: false
+
+# ==============================================================
+# GITHUB TOKEN PERMISSIONS
+# ==============================================================
+
+# Step 14 dispatches the next run with GitHub's GITHUB_TOKEN.
+#
+# That token only has the permissions declared here, so Actions
+# write is required for the workflow_dispatch call to succeed.
+permissions:
+  contents: read
+  actions: write
+
+env:
+  # 350 minutes = 5h 50m.
+  #
+  # GitHub job timeout is 360 minutes, leaving approximately
+  # 10 minutes of safety margin for cleanup + workflow chaining.
+  RUNNER_RUNTIME_MINUTES: '350'
+
+  HEARTBEAT_INTERVAL_MINUTES: '30'
+
+  # ============================================================
+  # TAILSCALE MACHINE NAME
+  # ============================================================
+
+  # This workflow owns exactly one canonical machine name.
+  TAILSCALE_HOSTNAME: 'exitnode'
+
+  # ============================================================
+  # WORKFLOW TO RESTART
+  # ============================================================
+
+  # Actual workflow:
+  #
+  # .github/workflows/vpn.yml
+  #
+  # Workflow ID avoids filename ambiguity.
+  TAILSCALE_WORKFLOW_ID: '363966564'
+
+jobs:
+
+  build:
+
+    runs-on: windows-latest
+
+    timeout-minutes: 360
+
+    steps:
+
+      # ==========================================================
+      # 01. Checkout
+      # ==========================================================
+
+      - name: 01. Checkout Repository
+        uses: actions/checkout@v4
+
+      # ==========================================================
+      # 02. Validate configuration
+      # ==========================================================
+
+      - name: 02. Validate Required GitHub Configuration
+        shell: pwsh
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $requiredVars = @(
+            'SSH_USERNAME',
+            'SSH_PASSWORD',
+            'TAILSCALE_AUTHKEY',
+            'TAILSCALE_API_KEY',
+            'TELEGRAM_BOT_TOKEN',
+            'TELEGRAM_CHAT_ID'
+          )
+
+          foreach ($name in $requiredVars) {
+            $val = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($val)) {
+              Write-Error "ERROR: Required GitHub configuration is missing: $name"
+              exit 1
+            }
+          }
+
+          Write-Host "All required GitHub configuration is present."
+
+      # ==========================================================
+      # 03. Install packages
+      # ==========================================================
+
+      - name: 03. Install Required Packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "Installing required tools and OpenSSH Server on Windows..."
+
+          # Ensure jq is installed via Chocolatey (curl, git, 7z/unzip are pre-installed on windows-latest)
+          if (-not (Get-Command jq -ErrorAction SilentlyContinue)) {
+            choco install jq -y --no-progress
+          }
+
+          # Ensure OpenSSH Server is installed
+          $sshdCapability = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*'
+          if ($sshdCapability -and $sshdCapability.State -ne 'Installed') {
+            Write-Host "Installing OpenSSH.Server Windows capability..."
+            Add-WindowsCapability -Online -Name $sshdCapability.Name | Out-Null
+          }
+
+          if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing OpenSSH via Chocolatey fallback..."
+            choco install openssh -params '"/SSHServerFeature"' -y --no-progress
+          }
+
+          Write-Host "Required packages verified and installed."
+
+      # ==========================================================
+      # 04. Setup SSH user
+      # ==========================================================
+
+      - name: 04. Setup SSH User And Administrator Access
+        shell: pwsh
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "Configuring SSH user: $env:SSH_USERNAME"
+
+          $SecurePassword = ConvertTo-SecureString $env:SSH_PASSWORD -AsPlainText -Force
+          $existingUser = Get-LocalUser -Name $env:SSH_USERNAME -ErrorAction SilentlyContinue
+
+          if (-not $existingUser) {
+            New-LocalUser -Name $env:SSH_USERNAME `
+              -Password $SecurePassword `
+              -FullName $env:SSH_USERNAME `
+              -PasswordNeverExpires `
+              -UserMayNotChangePassword | Out-Null
+          } else {
+            Set-LocalUser -Name $env:SSH_USERNAME -Password $SecurePassword
+            Set-LocalUser -Name $env:SSH_USERNAME -PasswordNeverExpires $true
+          }
+
+          $adminGroup = "Administrators"
+          $isMember = Get-LocalGroupMember -Group $adminGroup -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "\\$([regex]::Escape($env:SSH_USERNAME))$" -or $_.Name -eq $env:SSH_USERNAME }
+
+          if (-not $isMember) {
+            Add-LocalGroupMember -Group $adminGroup -Member $env:SSH_USERNAME
+          }
+
+          Write-Host ""
+          Write-Host "Administrator identity:"
+          Get-LocalUser -Name $env:SSH_USERNAME | Select-Object Name, Enabled, SID | Format-List
+
+          Write-Host "Administrators group members:"
+          Get-LocalGroupMember -Group $adminGroup | Select-Object Name, PrincipalSource | Format-Table -AutoSize
+
+          Write-Host "SSH user is configured as a Windows Administrator."
+
+      # ==========================================================
+      # 05. Configure SSH server
+      # ==========================================================
+
+      - name: 05. Setup SSH Server
+        shell: pwsh
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Start-Service sshd -ErrorAction SilentlyContinue
+          Set-Service -Name sshd -StartupType 'Automatic'
+
+          $sshdConfig = "$env:ProgramData\ssh\sshd_config"
+          if (-not (Test-Path $sshdConfig)) {
+            throw "ERROR: sshd_config not found at $sshdConfig"
+          }
+
+          $content = Get-Content $sshdConfig -Raw
+          $content = $content -replace '(?m)^#?\s*PasswordAuthentication\s+.*$', 'PasswordAuthentication yes'
+          $content = $content -replace '(?m)^#?\s*PubkeyAuthentication\s+.*$', 'PubkeyAuthentication yes'
+
+          if ($content -notmatch '(?m)^PasswordAuthentication\s+yes') {
+            $content += "`nPasswordAuthentication yes`n"
+          }
+          if ($content -notmatch '(?m)^PubkeyAuthentication\s+yes') {
+            $content += "`nPubkeyAuthentication yes`n"
+          }
+
+          Set-Content -Path $sshdConfig -Value $content -Encoding UTF8
+
+          # Configure PowerShell as the default SSH shell
+          New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" `
+            -Name DefaultShell `
+            -Value "C:\Program Files\PowerShell\7\pwsh.exe" `
+            -PropertyType String `
+            -Force | Out-Null
+
+          # Ensure Windows Firewall allows port 22
+          if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" `
+              -DisplayName "OpenSSH Server (sshd)" `
+              -Enabled True `
+              -Direction Inbound `
+              -Protocol TCP `
+              -Action Allow `
+              -LocalPort 22 | Out-Null
+          }
+
+          Restart-Service sshd
+
+          Write-Host "SSH server configured for administrator: $env:SSH_USERNAME"
+
+      # ==========================================================
+      # 06. Configure Windows IP forwarding
+      # ==========================================================
+
+      - name: 06. Configure IP Forwarding
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "Enabling IPv4 forwarding in Windows Registry and NetIPInterface..."
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1 -Type DWord
+          Get-NetIPInterface -AddressFamily IPv4 | Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue
+
+          Write-Host "Enabling IPv6 forwarding..."
+          Get-NetIPInterface -AddressFamily IPv6 | Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue
+
+          # Enable Routing and Remote Access service if available
+          if (Get-Service RemoteAccess -ErrorAction SilentlyContinue) {
+            Set-Service -Name RemoteAccess -StartupType Automatic
+            Start-Service RemoteAccess -ErrorAction SilentlyContinue
+          }
+
+          Write-Host ""
+          Write-Host "Forwarding status:"
+          $ipEnableRouter = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter").IPEnableRouter
+          Write-Host "HKLM IPEnableRouter = $ipEnableRouter"
+
+          $v4Enabled = Get-NetIPInterface -AddressFamily IPv4 | Where-Object Forwarding -eq 'Enabled'
+          $v6Enabled = Get-NetIPInterface -AddressFamily IPv6 | Where-Object Forwarding -eq 'Enabled'
+
+          if ($ipEnableRouter -ne 1 -or -not $v4Enabled) {
+            Write-Error "ERROR: IPv4 forwarding is not enabled."
+            exit 1
+          }
+
+          if (-not $v6Enabled) {
+            Write-Error "ERROR: IPv6 forwarding is not enabled."
+            exit 1
+          }
+
+          Write-Host "IP forwarding configured successfully."
+
+      # ==========================================================
+      # 07. Install Tailscale
+      # ==========================================================
+
+      - name: 07. Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "Installing Tailscale..."
+
+          choco install tailscale -y --no-progress
+
+          $tsPath = "C:\Program Files\Tailscale"
+          if (Test-Path $tsPath) {
+            $env:PATH = "$tsPath;$env:PATH"
+            Add-Content -Path $env:GITHUB_PATH -Value $tsPath
+          }
+
+          Set-Service -Name Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+
+          # Wait briefly for daemon socket initialization
+          Start-Sleep -Seconds 3
+
+          Write-Host ""
+          Write-Host "Tailscale version:"
+          & tailscale.exe version
+
+      # ==========================================================
+      # 08. REMOVE EXISTING MACHINE WITH EXACT HOSTNAME
+      # ==========================================================
+
+      - name: 08. Remove Existing Tailscale Machine
+        shell: pwsh
+        env:
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "=================================================="
+          Write-Host "Tailscale hostname cleanup"
+          Write-Host "=================================================="
+
+          Write-Host "Required hostname:"
+          Write-Host "$env:TAILSCALE_HOSTNAME"
+
+          Write-Host ""
+          Write-Host "Querying current Tailscale machines..."
+
+          $pair = "$($env:TAILSCALE_API_KEY):"
+          $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+          $base64 = [System.Convert]::ToBase64String($bytes)
+          $headers = @{ Authorization = "Basic $base64" }
+
+          $devicesResponse = Invoke-RestMethod `
+            -Uri "https://api.tailscale.com/api/v2/tailnet/-/devices" `
+            -Method Get `
+            -Headers $headers `
+            -TimeoutSec 30
+
+          Write-Host ""
+          Write-Host "Searching for exact machine name..."
+
+          $matchingDevices = @($devicesResponse.devices | Where-Object {
+            $shortName = ($_.name -split '\.')[0]
+            $_.name -eq $env:TAILSCALE_HOSTNAME -or
+            $_.hostname -eq $env:TAILSCALE_HOSTNAME -or
+            $shortName -eq $env:TAILSCALE_HOSTNAME
+          })
+
+          if ($matchingDevices.Count -eq 0) {
+            Write-Host "No existing machine named '$env:TAILSCALE_HOSTNAME' was found."
+            Write-Host "Nothing to remove."
+          } else {
+            foreach ($device in $matchingDevices) {
+              $deviceId = $device.id
+              if ([string]::IsNullOrWhiteSpace($deviceId)) { continue }
+
+              Write-Host ""
+              Write-Host "Found existing machine:"
+              Write-Host "  Name: $env:TAILSCALE_HOSTNAME"
+              Write-Host "  ID:   $deviceId"
+
+              Write-Host ""
+              Write-Host "Removing machine..."
+
+              Invoke-RestMethod `
+                -Uri "https://api.tailscale.com/api/v2/device/$deviceId" `
+                -Method Delete `
+                -Headers $headers `
+                -TimeoutSec 30 | Out-Null
+
+              Write-Host ""
+              Write-Host "Machine $deviceId removed."
+            }
+          }
+
+          Write-Host ""
+          Write-Host "Verifying hostname availability..."
+
+          for ($attempt = 1; $attempt -le 10; $attempt++) {
+            $verifyResponse = Invoke-RestMethod `
+              -Uri "https://api.tailscale.com/api/v2/tailnet/-/devices" `
+              -Method Get `
+              -Headers $headers `
+              -TimeoutSec 30
+
+            $remaining = @($verifyResponse.devices | Where-Object {
+              $shortName = ($_.name -split '\.')[0]
+              $_.name -eq $env:TAILSCALE_HOSTNAME -or
+              $_.hostname -eq $env:TAILSCALE_HOSTNAME -or
+              $shortName -eq $env:TAILSCALE_HOSTNAME
+            }).Count
+
+            if ($remaining -eq 0) {
+              Write-Host ""
+              Write-Host "Hostname '$env:TAILSCALE_HOSTNAME' is available."
+              break
+            }
+
+            if ($attempt -eq 10) {
+              Write-Host ""
+              Write-Error "ERROR: Hostname '$env:TAILSCALE_HOSTNAME' is still present. Refusing to start another machine with a suffixed name."
+              exit 1
+            }
+
+            Write-Host ""
+            Write-Host "Hostname still exists."
+            Write-Host "Waiting 5 seconds before checking again..."
+            Start-Sleep -Seconds 5
+          }
+
+      # ==========================================================
+      # 09. Setup Tailscale Exit Node
+      # ==========================================================
+
+      - name: 09. Setup Tailscale Exit Node
+        shell: pwsh
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "=================================================="
+          Write-Host "Starting Tailscale"
+          Write-Host "=================================================="
+
+          Write-Host "Hostname:"
+          Write-Host "$env:TAILSCALE_HOSTNAME"
+
+          Write-Host ""
+          Write-Host "Connecting Tailscale..."
+
+          & tailscale.exe up `
+            --authkey="$env:TAILSCALE_AUTHKEY" `
+            --hostname="$env:TAILSCALE_HOSTNAME" `
+            --advertise-exit-node `
+            --unattended `
+            --reset
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "ERROR: tailscale up failed with exit code $LASTEXITCODE"
+          }
+
+          Write-Host ""
+          Write-Host "Tailscale connection established."
+
+          Write-Host ""
+          Write-Host "Tailscale status:"
+          & tailscale.exe status
+
+          Write-Host ""
+          Write-Host "Tailscale IP:"
+          & tailscale.exe ip
+
+          Write-Host ""
+          Write-Host "Tailscale hostname:"
+          Write-Host "$env:TAILSCALE_HOSTNAME"
+
+          $statusJson = & tailscale.exe status --self --json | ConvertFrom-Json
+          $rawName = if ($statusJson.Self.DNSName) {
+            $statusJson.Self.DNSName
+          } elseif ($statusJson.Self.HostName) {
+            $statusJson.Self.HostName
+          } else {
+            ""
+          }
+          $actualHostname = ($rawName -split '\.')[0]
+
+          Write-Host ""
+          Write-Host "Requested hostname:"
+          Write-Host "$env:TAILSCALE_HOSTNAME"
+
+          Write-Host "Actual hostname:"
+          Write-Host "$actualHostname"
+
+          if ($actualHostname -ne $env:TAILSCALE_HOSTNAME) {
+            Write-Host ""
+            Write-Host "ERROR: Tailscale did not use the required hostname."
+            Write-Host ""
+            Write-Host "Expected:"
+            Write-Host "  $env:TAILSCALE_HOSTNAME"
+            Write-Host ""
+            Write-Host "Actual:"
+            Write-Host "  $actualHostname"
+            Write-Host ""
+            Write-Host "The workflow will NOT continue with a suffixed hostname."
+
+            & tailscale.exe down
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "Exact Tailscale hostname verified successfully."
+
+      # ==========================================================
+      # 10. Verify SSH administrator access
+      # ==========================================================
+
+      - name: 10. Verify SSH User Administrator Access
+        shell: pwsh
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "Verifying administrator access for: $env:SSH_USERNAME"
+
+          $user = Get-LocalUser -Name $env:SSH_USERNAME -ErrorAction Stop
+          if (-not $user.Enabled) {
+            throw "ERROR: User $env:SSH_USERNAME is disabled."
+          }
+
+          $adminMembers = Get-LocalGroupMember -Group "Administrators"
+          $isAdmin = $adminMembers | Where-Object {
+            $_.Name -match "\\$([regex]::Escape($env:SSH_USERNAME))$" -or $_.Name -eq $env:SSH_USERNAME
+          }
+
+          if (-not $isAdmin) {
+            throw "ERROR: User $env:SSH_USERNAME is not a member of the local Administrators group."
+          }
+
+          $sshdService = Get-Service -Name sshd -ErrorAction Stop
+          if ($sshdService.Status -ne 'Running') {
+            throw "ERROR: OpenSSH Server (sshd) is not running."
+          }
+
+          Write-Host "User SID: $($user.SID.Value)"
+          Write-Host "SSHD Service Status: $($sshdService.Status)"
+          Write-Host ""
+          Write-Host "Administrator verification passed."
+
+      # ==========================================================
+      # 11. Telegram online notification
+      # ==========================================================
+
+      - name: 11. Telegram Online Notification
+        shell: pwsh
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tailscaleIp = (& tailscale.exe ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($tailscaleIp)) {
+            throw "ERROR: Could not determine Tailscale IPv4 address."
+          }
+
+          $statusJson = & tailscale.exe status --self --json | ConvertFrom-Json
+          $actualHostname = if ($statusJson.Self.DNSName) {
+            $statusJson.Self.DNSName.TrimEnd('.')
+          } elseif ($statusJson.Self.HostName) {
+            $statusJson.Self.HostName
+          } else {
+            "Not detected"
+          }
+
+          $message = @"
+          🚀 Windows SSH Server is ONLINE
+          ━━━━━━━━━━━━━━━━━━━━
+          Tailscale
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Hostname:
+          $actualHostname
+
+          IP:
+          $tailscaleIp
+
+          ━━━━━━━━━━━━━━━━━━━━
+          SSH
+          ━━━━━━━━━━━━━━━━━━━━
+
+          ssh $env:SSH_USERNAME@$tailscaleIp
+
+          Port:
+          22
+
+          ━━━━━━━━━━━━━━━━━━━━
+          Status
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Runtime: approximately 6 hours
+
+          GitHub Actions Windows runner is active.
+          "@
+
+          $uri = "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendMessage"
+          $body = @{
+            chat_id = $env:TELEGRAM_CHAT_ID
+            text    = $message
+          }
+
+          $response = Invoke-RestMethod -Uri $uri -Method Post -Body $body -TimeoutSec 20
+
+          if (-not $response.ok) {
+            Write-Error "ERROR: Telegram API did not report success."
+            exit 1
+          }
+
+          Write-Host "Telegram notification sent."
+
+      # ==========================================================
+      # 12. Keep runner alive
+      # ==========================================================
+
+      - name: 12. Keep Runner Alive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $runtimeMinutes = [int]$env:RUNNER_RUNTIME_MINUTES
+          $heartbeatMinutes = [int]$env:HEARTBEAT_INTERVAL_MINUTES
+
+          $endTime = (Get-Date).ToUniversalTime().AddMinutes($runtimeMinutes)
+
+          Write-Host ""
+          Write-Host "Runner will remain alive for approximately $runtimeMinutes minutes."
+
+          while ($true) {
+            $now = (Get-Date).ToUniversalTime()
+
+            if ($now -ge $endTime) {
+              Write-Host ""
+              Write-Host "Runtime window completed."
+              break
+            }
+
+            Write-Host ""
+            Write-Host "Heartbeat: $($now.ToString('yyyy-MM-ddTHH:mm:ssZ')) - still running."
+
+            $sleepSeconds = $heartbeatMinutes * 60
+            $remainingSeconds = [int][Math]::Ceiling(($endTime - $now).TotalSeconds)
+
+            if ($sleepSeconds -gt $remainingSeconds) {
+              $sleepSeconds = $remainingSeconds
+            }
+
+            if ($sleepSeconds -gt 0) {
+              Start-Sleep -Seconds $sleepSeconds
+            }
+          }
+
+      # ==========================================================
+      # 13. Disconnect Tailscale
+      #
+      # ALWAYS runs.
+      #
+      # This happens BEFORE starting the next workflow.
+      # ==========================================================
+
+      - name: 13. Disconnect Tailscale
+        if: always()
+        shell: pwsh
+
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $tsPath = "C:\Program Files\Tailscale"
+          if ((Test-Path $tsPath) -and ($env:PATH -notlike "*$tsPath*")) {
+            $env:PATH = "$tsPath;$env:PATH"
+          }
+
+          Write-Host "Checking Tailscale state..."
+
+          if (Get-Command tailscale.exe -ErrorAction SilentlyContinue) {
+            Write-Host ""
+            Write-Host "Current Tailscale status:"
+            & tailscale.exe status
+
+            Write-Host ""
+            Write-Host "Disconnecting Tailscale..."
+            & tailscale.exe down
+
+            Write-Host ""
+            Write-Host "Tailscale status after disconnect:"
+            & tailscale.exe status
+          } else {
+            Write-Host "Tailscale is not installed."
+            Write-Host "Nothing to disconnect."
+          }
+
+          Write-Host ""
+          Write-Host "Tailscale cleanup completed."
+
+      # ==========================================================
+      # 14. Start next workflow run
+      #
+      # ALWAYS runs.
+      #
+      # IMPORTANT:
+      #
+      # GitHub's current REST API returns HTTP 200 (or 204) for a
+      # successful workflow_dispatch request.
+      #
+      # This step authenticates with GITHUB_TOKEN. The workflow
+      # permissions block must grant:
+      #
+      #     actions: write
+      # ==========================================================
+
+      - name: 14. Start Next Workflow Run
+        if: always()
+        shell: pwsh
+
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+          TAILSCALE_WORKFLOW_ID: ${{ env.TAILSCALE_WORKFLOW_ID }}
+
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "=================================================="
+          Write-Host "Starting next Tailscale runner"
+          Write-Host "=================================================="
+
+          Write-Host "Repository:"
+          Write-Host "$env:GH_REPOSITORY"
+
+          Write-Host "Branch:"
+          Write-Host "$env:GH_REF"
+
+          Write-Host "Workflow ID:"
+          Write-Host "$env:TAILSCALE_WORKFLOW_ID"
+
+          Write-Host ""
+          Write-Host "Checking token access to workflow..."
+
+          $headers = @{
+            "Accept"               = "application/vnd.github+json"
+            "Authorization"        = "Bearer $env:GH_TOKEN"
+            "X-GitHub-Api-Version" = "2026-03-10"
+          }
+
+          $workflowInfoUrl = "https://api.github.com/repos/$env:GH_REPOSITORY/actions/workflows/$env:TAILSCALE_WORKFLOW_ID"
+          $workflowInfo = Invoke-RestMethod -Uri $workflowInfoUrl -Method Get -Headers $headers
+
+          Write-Host "Token can access workflow:"
+          Write-Host "  Name: $($workflowInfo.name)"
+          Write-Host "  Path: $($workflowInfo.path)"
+          Write-Host "  State: $($workflowInfo.state)"
+
+          Write-Host ""
+          Write-Host "Dispatching next workflow run..."
+
+          $dispatchUrl = "https://api.github.com/repos/$env:GH_REPOSITORY/actions/workflows/$env:TAILSCALE_WORKFLOW_ID/dispatches"
+          $payload = @{ ref = $env:GH_REF } | ConvertTo-Json -Compress
+
+          $httpStatus = 0
+          $responseBody = ""
+          $acceptedPerms = "Header not returned."
+
+          try {
+            $response = Invoke-WebRequest `
+              -Uri $dispatchUrl `
+              -Method Post `
+              -Headers $headers `
+              -ContentType "application/json" `
+              -Body $payload
+
+            $httpStatus = [int]$response.StatusCode
+            $responseBody = $response.Content
+
+            if ($response.Headers.ContainsKey("X-Accepted-GitHub-Permissions")) {
+              $acceptedPerms = ($response.Headers["X-Accepted-GitHub-Permissions"] -join ", ")
+            }
+          } catch {
+            if ($_.Exception.Response) {
+              $httpStatus = [int]$_.Exception.Response.StatusCode
+              $stream = $_.Exception.Response.GetResponseStream()
+              if ($stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $responseBody = $reader.ReadToEnd()
+              }
+            } else {
+              throw $_
+            }
+          }
+
+          Write-Host ""
+          Write-Host "GitHub API HTTP status:"
+          Write-Host "$httpStatus"
+
+          Write-Host ""
+          Write-Host "Accepted GitHub permissions:"
+          Write-Host "  $acceptedPerms"
+
+          if (-not [string]::IsNullOrWhiteSpace($responseBody)) {
+            Write-Host ""
+            Write-Host "GitHub API response:"
+            Write-Host $responseBody
+          }
+
+          if ($httpStatus -ne 200 -and $httpStatus -ne 204) {
+            Write-Host ""
+            Write-Host "ERROR: GitHub workflow dispatch failed."
+            Write-Host ""
+            Write-Host "Expected HTTP status:"
+            Write-Host "  200 or 204"
+            Write-Host ""
+            Write-Host "Actual HTTP status:"
+            Write-Host "  $httpStatus"
+
+            if ($httpStatus -eq 401) {
+              Write-Host ""
+              Write-Host "ERROR TYPE: Unauthorized"
+              Write-Host "GITHUB_TOKEN was rejected."
+            }
+
+            if ($httpStatus -eq 403) {
+              Write-Host ""
+              Write-Host "ERROR TYPE: Forbidden"
+              Write-Host ""
+              Write-Host "GITHUB_TOKEN can read the workflow but cannot dispatch it."
+              Write-Host ""
+              Write-Host "The workflow permissions block must grant:"
+              Write-Host "  actions: write"
+            }
+
+            exit 1
+          }
+
+          $parsedJson = $null
+          if (-not [string]::IsNullOrWhiteSpace($responseBody)) {
+            try {
+              $parsedJson = $responseBody | ConvertFrom-Json
+            } catch {}
+          }
+
+          if ($parsedJson -and $parsedJson.workflow_run_id) {
+            Write-Host ""
+            Write-Host "=================================================="
+            Write-Host "Next workflow started successfully."
+            Write-Host "=================================================="
+
+            Write-Host "Workflow run ID:"
+            Write-Host "$($parsedJson.workflow_run_id)"
+
+            if ($parsedJson.run_url) {
+              Write-Host ""
+              Write-Host "API run URL:"
+              Write-Host "$($parsedJson.run_url)"
+            }
+
+            if ($parsedJson.html_url) {
+              Write-Host ""
+              Write-Host "GitHub Actions URL:"
+              Write-Host "$($parsedJson.html_url)"
+            }
+          } else {
+            Write-Host ""
+            Write-Host "Workflow dispatch returned HTTP $httpStatus."
+            Write-Host "The next workflow should now start."
+          }
+
+          Write-Host ""
+          Write-Host "Next Tailscale runner dispatch completed successfully."
