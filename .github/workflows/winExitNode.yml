@@ -140,6 +140,10 @@ jobs:
       # 04. Setup SSH user
       # ==========================================================
 
+            # ==========================================================
+      # 04. Setup SSH user
+      # ==========================================================
+
       - name: 04. Setup SSH User And Administrator Access
         shell: pwsh
         env:
@@ -148,6 +152,19 @@ jobs:
 
         run: |
           $ErrorActionPreference = 'Stop'
+
+          Write-Host "Relaxing Windows local password complexity policy (matching Linux chpasswd behavior)..."
+          $secpolCfg = "$env:TEMP\secpol.cfg"
+          $secpolSdb = "$env:TEMP\secpol.sdb"
+
+          secedit /export /cfg $secpolCfg | Out-Null
+          $policyContent = Get-Content $secpolCfg -Raw
+          $policyContent = $policyContent -replace 'PasswordComplexity\s*=\s*1', 'PasswordComplexity = 0'
+          $policyContent = $policyContent -replace 'MinimumPasswordLength\s*=\s*\d+', 'MinimumPasswordLength = 0'
+          Set-Content -Path $secpolCfg -Value $policyContent -Encoding Unicode
+
+          secedit /configure /db $secpolSdb /cfg $secpolCfg /areas SECURITYPOLICY | Out-Null
+          Remove-Item -Path $secpolCfg, $secpolSdb -Force -ErrorAction SilentlyContinue
 
           Write-Host "Configuring SSH user: $env:SSH_USERNAME"
 
@@ -181,6 +198,7 @@ jobs:
           Get-LocalGroupMember -Group $adminGroup | Select-Object Name, PrincipalSource | Format-Table -AutoSize
 
           Write-Host "SSH user is configured as a Windows Administrator."
+
 
       # ==========================================================
       # 05. Configure SSH server
