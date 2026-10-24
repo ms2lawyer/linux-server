@@ -597,8 +597,6 @@ jobs:
           IP:
           $tailscaleIp
 
-          AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-
           ━━━━━━━━━━━━━━━━━━━━
           SSH
           ━━━━━━━━━━━━━━━━━━━━
