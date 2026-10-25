@@ -603,27 +603,96 @@ jobs:
           echo "Creating unlimited VLESS inbound + 3 clients"
           echo "=================================================="
 
-          PANEL_BASE="http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}"
+          # Normalize base path (no leading/trailing slash issues)
+          BASE_PATH="${XUI_WEB_BASE_PATH#/}"
+          BASE_PATH="${BASE_PATH%/}"
+          PANEL_BASE="http://127.0.0.1:${XUI_PANEL_PORT}/${BASE_PATH}"
           COOKIE_JAR="/tmp/xui-cookies.txt"
           rm -f "$COOKIE_JAR"
 
-          # Login and capture session cookie
-          echo "Logging into panel..."
-          LOGIN_RESP="$(
-            curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
-              -X POST "${PANEL_BASE}/login" \
-              -H "Content-Type: application/x-www-form-urlencoded" \
-              --data-urlencode "username=${XUI_USERNAME}" \
-              --data-urlencode "password=${XUI_PASSWORD}"
-          )"
-          echo "Login response: $LOGIN_RESP"
+          echo "Panel base URL: ${PANEL_BASE}"
+          echo "Checking if panel is listening..."
+          for i in {1..30}; do
+            if curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://127.0.0.1:${XUI_PANEL_PORT}/" | grep -qE '200|301|302|401|403|404'; then
+              echo "Panel port is responding."
+              break
+            fi
+            echo "Waiting for panel port ${XUI_PANEL_PORT}... ($i/30)"
+            sleep 2
+          done
 
-          # Check login success
-          if ! echo "$LOGIN_RESP" | grep -q '"success":true'; then
-            echo "ERROR: Panel login failed."
+          # Login with JSON body (official API format) + retries
+          echo "Logging into panel..."
+          LOGIN_OK=0
+          for attempt in {1..10}; do
+            LOGIN_RESP="$(
+              curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+                -X POST "${PANEL_BASE}/login" \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/json" \
+                -d "{\"username\":\"${XUI_USERNAME}\",\"password\":\"${XUI_PASSWORD}\"}" \
+                --connect-timeout 5 \
+                --max-time 15 || true
+            )"
+            echo "Login attempt ${attempt}: ${LOGIN_RESP:-(empty)}"
+
+            if echo "$LOGIN_RESP" | grep -q '"success":\s*true'; then
+              LOGIN_OK=1
+              break
+            fi
+
+            # Fallback: try form-urlencoded (older panels)
+            LOGIN_RESP="$(
+              curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+                -X POST "${PANEL_BASE}/login" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                --data-urlencode "username=${XUI_USERNAME}" \
+                --data-urlencode "password=${XUI_PASSWORD}" \
+                --connect-timeout 5 \
+                --max-time 15 || true
+            )"
+            echo "Login attempt ${attempt} (form): ${LOGIN_RESP:-(empty)}"
+
+            if echo "$LOGIN_RESP" | grep -q '"success":\s*true'; then
+              LOGIN_OK=1
+              break
+            fi
+
+            # Also try without web base path (some installs put login at root)
+            LOGIN_RESP="$(
+              curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+                -X POST "http://127.0.0.1:${XUI_PANEL_PORT}/login" \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/json" \
+                -d "{\"username\":\"${XUI_USERNAME}\",\"password\":\"${XUI_PASSWORD}\"}" \
+                --connect-timeout 5 \
+                --max-time 15 || true
+            )"
+            echo "Login attempt ${attempt} (root /login): ${LOGIN_RESP:-(empty)}"
+
+            if echo "$LOGIN_RESP" | grep -q '"success":\s*true'; then
+              PANEL_BASE="http://127.0.0.1:${XUI_PANEL_PORT}"
+              LOGIN_OK=1
+              break
+            fi
+
+            sleep 3
+          done
+
+          if [[ "$LOGIN_OK" != "1" ]]; then
+            echo "ERROR: Panel login failed after retries."
+            echo "Debug info:"
+            echo "  ss -tlnp | grep ${XUI_PANEL_PORT} || true"
+            ss -tlnp | grep "${XUI_PANEL_PORT}" || true
+            echo "  systemctl status x-ui --no-pager || true"
+            systemctl status x-ui --no-pager || true
+            if [[ -f /etc/x-ui/install-result.env ]]; then
+              echo "  install-result.env:"
+              cat /etc/x-ui/install-result.env || true
+            fi
             exit 1
           fi
-          echo "Login successful."
+          echo "Login successful. Using PANEL_BASE=${PANEL_BASE}"
 
           # Generate UUIDs for clients
           UUID1="$(uuidgen)"
