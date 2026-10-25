@@ -627,20 +627,20 @@ jobs:
           echo "Creating unlimited VLESS inbound + 3 clients"
           echo "=================================================="
 
-          # Re-apply fixed credentials (in case previous step was skipped / partial)
+          # Force fixed credentials / port / path
           sudo /usr/local/x-ui/x-ui setting \
             -username "${XUI_USERNAME}" \
             -password "${XUI_PASSWORD}" \
             -port "${XUI_PANEL_PORT}" \
             -webBasePath "${XUI_WEB_BASE_PATH}" || true
           sudo systemctl restart x-ui
-          sleep 4
+          sleep 5
 
-          # Discover actual webBasePath from settings / install-result / CLI
           REAL_USER="${XUI_USERNAME}"
           REAL_PASS="${XUI_PASSWORD}"
           REAL_PORT="${XUI_PANEL_PORT}"
           REAL_PATH="${XUI_WEB_BASE_PATH}"
+          API_TOKEN=""
 
           if sudo test -f /etc/x-ui/install-result.env; then
             echo "Reading /etc/x-ui/install-result.env ..."
@@ -650,206 +650,137 @@ jobs:
             REAL_PASS="${XUI_PASSWORD:-$REAL_PASS}"
             REAL_PORT="${XUI_PANEL_PORT:-$REAL_PORT}"
             REAL_PATH="${XUI_WEB_BASE_PATH:-$REAL_PATH}"
+            API_TOKEN="${XUI_API_TOKEN:-}"
           fi
 
-          # Parse CLI show output if available
-          SHOW_OUT="$(sudo /usr/local/x-ui/x-ui setting -show 2>/dev/null || sudo x-ui setting -show 2>/dev/null || true)"
           echo "CLI settings:"
-          echo "$SHOW_OUT"
+          sudo /usr/local/x-ui/x-ui setting -show 2>/dev/null || true
 
-          # Normalize path: strip leading/trailing slashes for URL building
+          # Normalize path (webBasePath is stored as /panel/)
           REAL_PATH="${REAL_PATH#/}"
           REAL_PATH="${REAL_PATH%/}"
+          if [[ -z "$REAL_PATH" ]]; then
+            PANEL_ROOT="http://127.0.0.1:${REAL_PORT}"
+          else
+            PANEL_ROOT="http://127.0.0.1:${REAL_PORT}/${REAL_PATH}"
+          fi
 
-          # Candidate bases to try (most specific first)
-          CANDIDATES=(
-            "http://127.0.0.1:${REAL_PORT}/${REAL_PATH}"
-            "http://127.0.0.1:${REAL_PORT}/panel"
-            "http://127.0.0.1:${REAL_PORT}"
-            "http://[::1]:${REAL_PORT}/${REAL_PATH}"
-            "http://[::1]:${REAL_PORT}"
-          )
+          # API base is always PANEL_ROOT + /panel/api  (webBasePath + fixed /panel/api)
+          API_BASE="${PANEL_ROOT}/panel/api"
 
-          COOKIE_JAR="/tmp/xui-cookies.txt"
-          rm -f "$COOKIE_JAR"
-          PANEL_BASE=""
-          LOGIN_OK=0
+          echo "PANEL_ROOT=${PANEL_ROOT}"
+          echo "API_BASE=${API_BASE}"
+          echo "API_TOKEN set: $([[ -n "$API_TOKEN" ]] && echo yes || echo no)"
 
-          echo "Waiting for panel port ${REAL_PORT}..."
+          # Wait until panel UI responds
           for i in {1..30}; do
-            CODE="$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://127.0.0.1:${REAL_PORT}/" || echo 000)"
-            if [[ "$CODE" != "000" ]]; then
-              echo "Panel port responding (HTTP $CODE)."
+            CODE="$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "${PANEL_ROOT}/" || echo 000)"
+            if [[ "$CODE" == "200" || "$CODE" == "301" || "$CODE" == "302" ]]; then
+              echo "Panel UI responding (HTTP $CODE)."
               break
             fi
+            echo "Waiting for panel UI... ($i) HTTP=$CODE"
             sleep 2
           done
 
-          echo "Attempting login with user=${REAL_USER} ..."
-          for base in "${CANDIDATES[@]}"; do
-            for attempt in 1 2 3; do
-              rm -f "$COOKIE_JAR"
-              # JSON login
-              HTTP_CODE="$(
-                curl -s -o /tmp/xui-login-body.txt -w "%{http_code}" \
-                  -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
-                  -X POST "${base}/login" \
-                  -H "Content-Type: application/json" \
-                  -H "Accept: application/json" \
-                  -d "{\"username\":\"${REAL_USER}\",\"password\":\"${REAL_PASS}\"}" \
-                  --connect-timeout 5 --max-time 15 || echo 000
-              )"
-              BODY="$(cat /tmp/xui-login-body.txt 2>/dev/null || true)"
-              echo "  ${base}/login  attempt=${attempt}  http=${HTTP_CODE}  body=${BODY:-(empty)}"
-
-              if echo "$BODY" | grep -qE '"success"[[:space:]]*:[[:space:]]*true'; then
-                PANEL_BASE="$base"
-                LOGIN_OK=1
-                break 2
-              fi
-
-              # form fallback
-              HTTP_CODE="$(
-                curl -s -o /tmp/xui-login-body.txt -w "%{http_code}" \
-                  -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
-                  -X POST "${base}/login" \
-                  -H "Content-Type: application/x-www-form-urlencoded" \
-                  --data-urlencode "username=${REAL_USER}" \
-                  --data-urlencode "password=${REAL_PASS}" \
-                  --connect-timeout 5 --max-time 15 || echo 000
-              )"
-              BODY="$(cat /tmp/xui-login-body.txt 2>/dev/null || true)"
-              echo "  ${base}/login (form) attempt=${attempt} http=${HTTP_CODE} body=${BODY:-(empty)}"
-
-              if echo "$BODY" | grep -qE '"success"[[:space:]]*:[[:space:]]*true'; then
-                PANEL_BASE="$base"
-                LOGIN_OK=1
-                break 2
-              fi
-              sleep 1
-            done
-          done
-
-          if [[ "$LOGIN_OK" != "1" ]]; then
-            echo "ERROR: Panel login failed after all candidates."
-            echo "Debug:"
-            ss -tlnp | grep -E "${REAL_PORT}|x-ui" || true
-            systemctl status x-ui --no-pager || true
-            sudo journalctl -u x-ui -n 30 --no-pager || true
-            if sudo test -f /etc/x-ui/install-result.env; then
-              sudo cat /etc/x-ui/install-result.env || true
+          AUTH_HEADER=()
+          if [[ -n "$API_TOKEN" ]]; then
+            AUTH_HEADER=(-H "Authorization: Bearer ${API_TOKEN}")
+            echo "Using Bearer API token (skip cookie login)."
+            # Smoke-test token
+            LIST_RESP="$(curl -s "${AUTH_HEADER[@]}" -H "Accept: application/json" \
+              "${API_BASE}/inbounds/list" --connect-timeout 5 --max-time 15 || true)"
+            echo "inbounds/list probe: ${LIST_RESP:0:200}"
+            if ! echo "$LIST_RESP" | grep -qE '"success"[[:space:]]*:[[:space:]]*true'; then
+              echo "WARNING: API token probe failed; will still try create."
             fi
-            # Dump a few GET responses for path discovery
-            for p in "/" "/panel/" "/panel/login" "/login"; do
-              echo "GET http://127.0.0.1:${REAL_PORT}${p} -> $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${REAL_PORT}${p}" || echo fail)"
+          else
+            echo "No API token; attempting cookie login (may fail on CSRF)..."
+            COOKIE_JAR="/tmp/xui-cookies.txt"
+            rm -f "$COOKIE_JAR"
+            LOGIN_OK=0
+            for path in "/login" "/panel/login"; do
+              BODY="$(curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+                -X POST "${PANEL_ROOT}${path}" \
+                -H "Content-Type: application/json" -H "Accept: application/json" \
+                -d "{\"username\":\"${REAL_USER}\",\"password\":\"${REAL_PASS}\"}" || true)"
+              echo "login ${path}: ${BODY:-(empty)}"
+              if echo "$BODY" | grep -qE '"success"[[:space:]]*:[[:space:]]*true'; then
+                LOGIN_OK=1
+                break
+              fi
             done
-            exit 1
+            if [[ "$LOGIN_OK" != "1" ]]; then
+              echo "ERROR: No API token and cookie login failed."
+              exit 1
+            fi
+            AUTH_HEADER=(-b "$COOKIE_JAR" -c "$COOKIE_JAR")
           fi
-          echo "Login successful. Using PANEL_BASE=${PANEL_BASE}"
-          # Persist real values for Telegram step
-          echo "REAL_PANEL_BASE=${PANEL_BASE}" > /tmp/xui-panel.env
-          echo "REAL_USER=${REAL_USER}" >> /tmp/xui-panel.env
-          echo "REAL_PASS=${REAL_PASS}" >> /tmp/xui-panel.env
-          echo "REAL_PORT=${REAL_PORT}" >> /tmp/xui-panel.env
-          echo "REAL_PATH=${REAL_PATH}" >> /tmp/xui-panel.env
 
-          # Generate UUIDs for clients
+          # Generate client IDs
           UUID1="$(uuidgen)"
           UUID2="$(uuidgen)"
           UUID3="$(uuidgen)"
           SUB1="$(openssl rand -hex 8)"
           SUB2="$(openssl rand -hex 8)"
           SUB3="$(openssl rand -hex 8)"
-
-          # Create a simple unlimited VLESS TCP inbound on port 8443
-          # (no TLS - user said SSL not important)
           INBOUND_PORT=8443
           INBOUND_TAG="vless-unlimited"
 
-          # Build clients JSON (unlimited: totalGB=0, expiryTime=0, limitIp=0)
-          CLIENTS_JSON=$(cat <<EOF
-          [
-            {
-              "id": "${UUID1}",
-              "flow": "",
-              "email": "${CLIENT1_EMAIL}",
-              "limitIp": 0,
-              "totalGB": 0,
-              "expiryTime": 0,
-              "enable": true,
-              "tgId": "",
-              "subId": "${SUB1}",
-              "reset": 0,
-              "comment": "client1 fixed"
-            },
-            {
-              "id": "${UUID2}",
-              "flow": "",
-              "email": "${CLIENT2_EMAIL}",
-              "limitIp": 0,
-              "totalGB": 0,
-              "expiryTime": 0,
-              "enable": true,
-              "tgId": "",
-              "subId": "${SUB2}",
-              "reset": 0,
-              "comment": "client2 fixed"
-            },
-            {
-              "id": "${UUID3}",
-              "flow": "",
-              "email": "${CLIENT3_EMAIL}",
-              "limitIp": 0,
-              "totalGB": 0,
-              "expiryTime": 0,
-              "enable": true,
-              "tgId": "",
-              "subId": "${SUB3}",
-              "reset": 0,
-              "comment": "client3 fixed"
-            }
-          ]
-          EOF
-          )
+          CLIENTS_JSON=$(jq -n \
+            --arg u1 "$UUID1" --arg e1 "$CLIENT1_EMAIL" --arg s1 "$SUB1" \
+            --arg u2 "$UUID2" --arg e2 "$CLIENT2_EMAIL" --arg s2 "$SUB2" \
+            --arg u3 "$UUID3" --arg e3 "$CLIENT3_EMAIL" --arg s3 "$SUB3" \
+            '[
+              {"id":$u1,"flow":"","email":$e1,"limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":"","subId":$s1,"reset":0},
+              {"id":$u2,"flow":"","email":$e2,"limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":"","subId":$s2,"reset":0},
+              {"id":$u3,"flow":"","email":$e3,"limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":"","subId":$s3,"reset":0}
+            ]')
 
-          SETTINGS_JSON=$(jq -n --argjson clients "$CLIENTS_JSON" '{
-            clients: $clients,
-            decryption: "none",
-            fallbacks: []
-          }')
+          SETTINGS_OBJ=$(jq -n --argjson clients "$CLIENTS_JSON" \
+            '{clients:$clients, decryption:"none", fallbacks:[]}')
+          STREAM_OBJ='{"network":"tcp","security":"none","tcpSettings":{"header":{"type":"none"}},"externalProxy":[]}'
+          SNIFF_OBJ='{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
 
-          STREAM_SETTINGS='{"network":"tcp","security":"none","tcpSettings":{"header":{"type":"none"}},"externalProxy":[]}'
-          SNIFFING='{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
+          # Build request body: settings/streamSettings/sniffing must be JSON *strings* for this API
+          PAYLOAD=$(jq -n \
+            --arg remark "$INBOUND_TAG" \
+            --argjson port "$INBOUND_PORT" \
+            --arg settings "$(echo "$SETTINGS_OBJ" | jq -c .)" \
+            --arg stream "$STREAM_OBJ" \
+            --arg sniff "$SNIFF_OBJ" \
+            '{
+              up:0, down:0, total:0,
+              remark:$remark,
+              enable:true,
+              expiryTime:0,
+              listen:"",
+              port:$port,
+              protocol:"vless",
+              settings:$settings,
+              streamSettings:$stream,
+              sniffing:$sniff,
+              allocate:{strategy:"always", refresh:5, concurrency:3}
+            }')
 
-          # Add inbound via API
           echo "Creating VLESS inbound on port ${INBOUND_PORT}..."
           ADD_RESP="$(
-            curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
-              -X POST "${PANEL_BASE}/panel/api/inbounds/add" \
+            curl -s "${AUTH_HEADER[@]}" \
+              -X POST "${API_BASE}/inbounds/add" \
               -H "Content-Type: application/json" \
-              -d "{
-                \"up\": 0,
-                \"down\": 0,
-                \"total\": 0,
-                \"remark\": \"${INBOUND_TAG}\",
-                \"enable\": true,
-                \"expiryTime\": 0,
-                \"listen\": \"\",
-                \"port\": ${INBOUND_PORT},
-                \"protocol\": \"vless\",
-                \"settings\": $(echo "$SETTINGS_JSON" | jq -c . | jq -R .),
-                \"streamSettings\": $(echo "$STREAM_SETTINGS" | jq -R .),
-                \"sniffing\": $(echo "$SNIFFING" | jq -R .),
-                \"allocate\": {\"strategy\": \"always\", \"refresh\": 5, \"concurrency\": 3}
-              }"
+              -H "Accept: application/json" \
+              -d "$PAYLOAD" \
+              --connect-timeout 10 --max-time 30 || true
           )"
           echo "Add inbound response: $ADD_RESP"
 
-          if ! echo "$ADD_RESP" | grep -q '"success":true'; then
-            echo "WARNING: Inbound creation may have failed (or already exists). Continuing..."
+          if ! echo "$ADD_RESP" | grep -qE '"success"[[:space:]]*:[[:space:]]*true'; then
+            echo "WARNING: inbound add did not report success; listing inbounds..."
+            curl -s "${AUTH_HEADER[@]}" -H "Accept: application/json" \
+              "${API_BASE}/inbounds/list" | head -c 500 || true
+            echo
           fi
 
-          # Save client details for Telegram and later use
           cat > /tmp/xui-clients.env <<EOF
           UUID1=${UUID1}
           UUID2=${UUID2}
@@ -860,22 +791,26 @@ jobs:
           INBOUND_PORT=${INBOUND_PORT}
           EOF
 
+          cat > /tmp/xui-panel.env <<EOF
+          REAL_PANEL_BASE=${PANEL_ROOT}
+          REAL_USER=${REAL_USER}
+          REAL_PASS=${REAL_PASS}
+          REAL_PORT=${REAL_PORT}
+          REAL_PATH=${REAL_PATH}
+          API_TOKEN=${API_TOKEN}
+          EOF
+
           echo
-          echo "Clients created (or already present):"
+          echo "Clients:"
           echo "  ${CLIENT1_EMAIL}  UUID=${UUID1}  subId=${SUB1}"
           echo "  ${CLIENT2_EMAIL}  UUID=${UUID2}  subId=${SUB2}"
           echo "  ${CLIENT3_EMAIL}  UUID=${UUID3}  subId=${SUB3}"
 
-          # Restart xray via panel to apply changes
-          curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
-            -X POST "${PANEL_BASE}/panel/api/server/restartXrayService" || true
-
-          sleep 3
+          curl -s "${AUTH_HEADER[@]}" -X POST "${API_BASE}/server/restartXrayService" \
+            -H "Accept: application/json" || true
+          sleep 2
           echo "Inbound and clients setup finished."
 
-      # ==========================================================
-      # 13. Telegram online notification (SSH + 3x-ui + clients)
-      # ==========================================================
 
       - name: 13. Telegram Online Notification
         env:
