@@ -1,0 +1,144 @@
+name: V2Ray Runner Smoke Test
+
+on:
+  # Run manually from the Actions tab. This workflow validates Xray locally;
+  # it does not publish a customer-facing proxy service.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v2ray-runner-smoke-test
+  cancel-in-progress: true
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates jq unzip
+
+      - name: Download Xray and test a localhost-only SOCKS proxy
+        id: smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          workdir="${RUNNER_TEMP}/xray-smoke-test"
+          mkdir -p "$workdir"
+          cd "$workdir"
+
+          echo "Fetching the latest Xray-core Linux x64 release metadata..."
+          release_json="$(curl -fsSL --retry 3 --max-time 30 \
+            https://api.github.com/repos/XTLS/Xray-core/releases/latest)"
+          download_url="$(jq -r '.assets[] | select(.name == "Xray-linux-64.zip") | .browser_download_url' <<< "$release_json" | head -n 1)"
+          if [[ -z "$download_url" || "$download_url" == "null" ]]; then
+            echo "Could not find the Xray-linux-64.zip asset in the latest release."
+            exit 1
+          fi
+
+          curl -fsSL --retry 3 --max-time 120 "$download_url" -o xray.zip
+          unzip -q xray.zip -d xray-package
+          test -x xray-package/xray
+
+          cat > config.json <<'JSON'
+          {
+            "log": { "loglevel": "warning" },
+            "inbounds": [
+              {
+                "listen": "127.0.0.1",
+                "port": 10086,
+                "protocol": "socks",
+                "settings": {
+                  "auth": "password",
+                  "accounts": [
+                    { "user": "ci-test-user", "pass": "ci-test-password" }
+                  ],
+                  "udp": false
+                },
+                "tag": "ci-local-socks"
+              }
+            ],
+            "outbounds": [
+              { "protocol": "freedom", "tag": "direct" }
+            ]
+          }
+          JSON
+
+          echo "Validating Xray config..."
+          ./xray-package/xray run -test -config config.json
+
+          echo "Starting the test proxy on 127.0.0.1 only..."
+          ./xray-package/xray run -config config.json > xray.log 2>&1 &
+          xray_pid=$!
+          cleanup() {
+            kill "$xray_pid" 2>/dev/null || true
+            wait "$xray_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          egress_ip=""
+          for attempt in $(seq 1 15); do
+            if egress_ip="$(curl -fsS --max-time 8 \
+              --socks5-hostname 127.0.0.1:10086 \
+              --proxy-user 'ci-test-user:ci-test-password' \
+              https://api.ipify.org 2>/dev/null)" && [[ -n "$egress_ip" ]]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ -z "$egress_ip" ]]; then
+            echo "Xray localhost proxy test failed. Xray log follows:"
+            cat xray.log || true
+            exit 1
+          fi
+
+          echo "Xray localhost proxy test passed."
+          echo "Observed outbound egress IP: $egress_ip"
+          echo "egress_ip=$egress_ip" >> "$GITHUB_OUTPUT"
+
+      - name: Send test result to Telegram
+        if: always()
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_OUTCOME: ${{ steps.smoke.outcome }}
+          EGRESS_IP: ${{ steps.smoke.outputs.egress_ip }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+            echo "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in repository Actions secrets."
+            exit 1
+          fi
+
+          message="$(cat <<EOF_MSG
+          Xray Runner Smoke Test
+          ======================
+          Result: ${TEST_OUTCOME:-unknown}
+          Runner egress IP (outbound only; not a server address): ${EGRESS_IP:-not available}
+          Mode: local-only SOCKS test bound to 127.0.0.1
+          Customer endpoint: not created
+          Customer credentials/subscription links: not created
+          Run: ${RUN_URL}
+          EOF_MSG
+          )"
+
+          response="$(curl -fsS --max-time 20 \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${message}")"
+
+          jq -e '.ok == true' <<< "$response" >/dev/null
+          echo "Telegram test notification sent."
