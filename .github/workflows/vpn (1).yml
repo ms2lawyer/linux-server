@@ -1,4 +1,4 @@
-name: Tailscale_Exit
+name: Tailscale_Exit_v2r@y
 
 on:
   # The workflow starts manually.
@@ -11,7 +11,7 @@ on:
 # ==============================================================
 
 concurrency:
-  group: permanent-TailScale-server
+  group: v2r@y-TailScale-server
   cancel-in-progress: false
 
 # ==============================================================
