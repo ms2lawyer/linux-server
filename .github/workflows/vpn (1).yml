@@ -1,4 +1,4 @@
-name: Tailscale_Exit_vpn
+name: Tailscale_Exit
 
 on:
   # The workflow starts manually.
@@ -11,7 +11,7 @@ on:
 # ==============================================================
 
 concurrency:
-  group: Vpn-TailScale-server
+  group: permanent-TailScale-server
   cancel-in-progress: false
 
 # ==============================================================
@@ -544,6 +544,7 @@ jobs:
           echo "=================================================="
 
           # Unattended install with fixed credentials, no SSL, fixed port & path
+          # Must run as root; use sudo -E to preserve environment variables
           export XUI_NONINTERACTIVE=1
           export XUI_USERNAME
           export XUI_PASSWORD
@@ -552,8 +553,10 @@ jobs:
           export XUI_SSL_MODE=none
           export XUI_DB_TYPE=sqlite
 
-          # Install latest stable
-          bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+          # Download and install latest stable as root
+          curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o /tmp/3xui-install.sh
+          sudo -E bash /tmp/3xui-install.sh
+          rm -f /tmp/3xui-install.sh
 
           echo
           echo "Waiting for x-ui service to become active..."
