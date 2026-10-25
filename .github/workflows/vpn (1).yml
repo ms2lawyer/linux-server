@@ -1,0 +1,1165 @@
+name: Tailscale_Exit
+
+on:
+  # The workflow starts manually.
+  #
+  # After each lifecycle, step 16 starts the next run.
+  workflow_dispatch:
+
+# ==============================================================
+# SINGLE ACTIVE RUN
+# ==============================================================
+
+concurrency:
+  group: permanent-TailScale-server
+  cancel-in-progress: false
+
+# ==============================================================
+# GITHUB TOKEN PERMISSIONS
+# ==============================================================
+
+# Step 16 dispatches the next run with GitHub's GITHUB_TOKEN.
+#
+# That token only has the permissions declared here, so Actions
+# write is required for the workflow_dispatch call to succeed.
+permissions:
+  contents: read
+  actions: write
+
+env:
+  # 350 minutes = 5h 50m.
+  #
+  # GitHub job timeout is 360 minutes, leaving approximately
+  # 10 minutes of safety margin for cleanup + workflow chaining.
+  RUNNER_RUNTIME_MINUTES: '350'
+
+  HEARTBEAT_INTERVAL_MINUTES: '30'
+
+  # ============================================================
+  # TAILSCALE MACHINE NAME
+  # ============================================================
+
+  # This workflow owns exactly one canonical machine name.
+  TAILSCALE_HOSTNAME: 'exitnode'
+
+  # ============================================================
+  # WORKFLOW TO RESTART
+  # ============================================================
+
+  # Actual workflow:
+  #
+  # .github/workflows/vpn.yml
+  #
+  # Workflow ID avoids filename ambiguity.
+  TAILSCALE_WORKFLOW_ID: '363966564'
+
+  # ============================================================
+  # 3X-UI PANEL (fixed credentials for this runner-only setup)
+  # ============================================================
+  XUI_USERNAME: 'admin'
+  XUI_PASSWORD: 'Admin@123456'
+  XUI_PANEL_PORT: '2053'
+  XUI_WEB_BASE_PATH: 'panel'
+  # Clients (fixed username/password style identifiers)
+  CLIENT1_EMAIL: 'client1'
+  CLIENT1_PASS: 'Client1@123'
+  CLIENT2_EMAIL: 'client2'
+  CLIENT2_PASS: 'Client2@123'
+  CLIENT3_EMAIL: 'client3'
+  CLIENT3_PASS: 'Client3@123'
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 360
+
+    steps:
+
+      # ==========================================================
+      # 01. Checkout
+      # ==========================================================
+
+      - name: 01. Checkout Repository
+        uses: actions/checkout@v4
+
+      # ==========================================================
+      # 02. Validate configuration
+      # ==========================================================
+
+      - name: 02. Validate Required GitHub Configuration
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            SSH_USERNAME
+            SSH_PASSWORD
+            TAILSCALE_AUTHKEY
+            TAILSCALE_API_KEY
+            TELEGRAM_BOT_TOKEN
+            TELEGRAM_CHAT_ID
+          )
+
+          for name in "${required_vars[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "ERROR: Required GitHub configuration is missing: $name"
+              exit 1
+            fi
+          done
+
+          echo "All required GitHub configuration is present."
+
+      # ==========================================================
+      # 03. Install packages
+      # ==========================================================
+
+      - name: 03. Install Required Packages
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            curl \
+            wget \
+            git \
+            openssh-server \
+            ca-certificates \
+            gnupg \
+            lsof \
+            net-tools \
+            unzip \
+            ethtool \
+            jq \
+            sqlite3 \
+            uuid-runtime
+
+      # ==========================================================
+      # 04. Setup SSH user
+      # ==========================================================
+
+      - name: 04. Setup SSH User And Administrator Access
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+
+        run: |
+          set -euo pipefail
+
+          echo "Configuring SSH user: $SSH_USERNAME"
+
+          if ! id "$SSH_USERNAME" >/dev/null 2>&1; then
+            sudo useradd \
+              --create-home \
+              --shell /bin/bash \
+              "$SSH_USERNAME"
+          fi
+
+          echo "$SSH_USERNAME:$SSH_PASSWORD" | sudo chpasswd
+
+          sudo usermod \
+            --append \
+            --groups sudo \
+            "$SSH_USERNAME"
+
+          sudo tee "/etc/sudoers.d/$SSH_USERNAME" >/dev/null <<EOF
+          $SSH_USERNAME ALL=(ALL:ALL) NOPASSWD:ALL
+          EOF
+
+          sudo chmod 0440 \
+            "/etc/sudoers.d/$SSH_USERNAME"
+
+          sudo visudo \
+            -cf "/etc/sudoers.d/$SSH_USERNAME"
+
+          echo
+          echo "Administrator identity:"
+          sudo id "$SSH_USERNAME"
+
+          echo
+          echo "User identity:"
+          sudo -u "$SSH_USERNAME" id
+
+          echo
+          echo "SSH user is configured as a Linux administrator."
+
+      # ==========================================================
+      # 05. Configure SSH server
+      # ==========================================================
+
+      - name: 05. Setup SSH Server
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+
+        run: |
+          set -euo pipefail
+
+          sudo sed -i \
+            -E 's/^#?PasswordAuthentication .*/PasswordAuthentication yes/' \
+            /etc/ssh/sshd_config
+
+          sudo sed -i \
+            -E 's/^#?PubkeyAuthentication .*/PubkeyAuthentication yes/' \
+            /etc/ssh/sshd_config
+
+          sudo sed -i \
+            -E 's/^#?PermitRootLogin .*/PermitRootLogin no/' \
+            /etc/ssh/sshd_config
+
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+
+          echo "SSH server configured for administrator: $SSH_USERNAME"
+
+      # ==========================================================
+      # 06. Configure Linux IP forwarding
+      # ==========================================================
+
+      - name: 06. Configure IP Forwarding
+        run: |
+          set -euo pipefail
+
+          echo "Enabling IPv4 forwarding..."
+          sudo sysctl -w net.ipv4.ip_forward=1
+
+          echo "Enabling IPv6 forwarding..."
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+
+          sudo tee /etc/sysctl.d/99-tailscale-forwarding.conf >/dev/null <<'EOF'
+          net.ipv4.ip_forward = 1
+          net.ipv6.conf.all.forwarding = 1
+          EOF
+
+          sudo sysctl --system
+
+          echo
+          echo "Forwarding status:"
+          sysctl net.ipv4.ip_forward
+          sysctl net.ipv6.conf.all.forwarding
+
+          if [[ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]]; then
+            echo "ERROR: IPv4 forwarding is not enabled."
+            exit 1
+          fi
+
+          if [[ "$(sysctl -n net.ipv6.conf.all.forwarding)" != "1" ]]; then
+            echo "ERROR: IPv6 forwarding is not enabled."
+            exit 1
+          fi
+
+          echo "IP forwarding configured successfully."
+
+      # ==========================================================
+      # 07. Install Tailscale
+      # ==========================================================
+
+      - name: 07. Install Tailscale
+        run: |
+          set -euo pipefail
+
+          echo "Installing Tailscale..."
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          sudo systemctl enable --now tailscaled
+
+          echo
+          echo "Tailscale version:"
+          tailscale version
+
+      # ==========================================================
+      # 08. REMOVE EXISTING MACHINE WITH EXACT HOSTNAME
+      # ==========================================================
+
+      - name: 08. Remove Existing Tailscale Machine
+        env:
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
+        run: |
+          set -euo pipefail
+
+          echo "=================================================="
+          echo "Tailscale hostname cleanup"
+          echo "=================================================="
+
+          echo "Required hostname:"
+          echo "$TAILSCALE_HOSTNAME"
+
+          echo
+          echo "Querying current Tailscale machines..."
+
+          DEVICES_JSON="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 30 \
+              --user "${TAILSCALE_API_KEY}:" \
+              "https://api.tailscale.com/api/v2/tailnet/-/devices"
+          )"
+
+          echo
+          echo "Searching for exact machine name..."
+
+          MATCHING_DEVICE_IDS="$(
+            echo "$DEVICES_JSON" |
+              jq -r \
+                --arg hostname "$TAILSCALE_HOSTNAME" \
+                '
+                  .devices[]
+                  | select(
+                      (.name // "") == $hostname
+                      or (.hostname // "") == $hostname
+                    )
+                  | .id
+                '
+          )"
+
+          if [[ -z "$MATCHING_DEVICE_IDS" ]]; then
+            echo "No existing machine named '$TAILSCALE_HOSTNAME' was found."
+            echo "Nothing to remove."
+          else
+
+            while IFS= read -r DEVICE_ID; do
+
+              [[ -z "$DEVICE_ID" ]] && continue
+
+              echo
+              echo "Found existing machine:"
+              echo "  Name: $TAILSCALE_HOSTNAME"
+              echo "  ID:   $DEVICE_ID"
+
+              echo
+              echo "Removing machine..."
+
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --max-time 30 \
+                --request DELETE \
+                --user "${TAILSCALE_API_KEY}:" \
+                "https://api.tailscale.com/api/v2/device/${DEVICE_ID}"
+
+              echo
+              echo "Machine $DEVICE_ID removed."
+
+            done <<< "$MATCHING_DEVICE_IDS"
+
+          fi
+
+          echo
+          echo "Verifying hostname availability..."
+
+          for attempt in {1..10}; do
+
+            VERIFY_JSON="$(
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --max-time 30 \
+                --user "${TAILSCALE_API_KEY}:" \
+                "https://api.tailscale.com/api/v2/tailnet/-/devices"
+            )"
+
+            REMAINING="$(
+              echo "$VERIFY_JSON" |
+                jq -r \
+                  --arg hostname "$TAILSCALE_HOSTNAME" \
+                  '
+                    [
+                      .devices[]
+                      | select(
+                          (.name // "") == $hostname
+                          or (.hostname // "") == $hostname
+                        )
+                    ]
+                    | length
+                  '
+            )"
+
+            if [[ "$REMAINING" == "0" ]]; then
+              echo
+              echo "Hostname '$TAILSCALE_HOSTNAME' is available."
+              break
+            fi
+
+            if [[ "$attempt" -eq 10 ]]; then
+              echo
+              echo "ERROR: Hostname '$TAILSCALE_HOSTNAME' is still present."
+              echo "Refusing to start another machine with a suffixed name."
+              exit 1
+            fi
+
+            echo
+            echo "Hostname still exists."
+            echo "Waiting 5 seconds before checking again..."
+
+            sleep 5
+
+          done
+
+      # ==========================================================
+      # 09. Setup Tailscale Exit Node
+      # ==========================================================
+
+      - name: 09. Setup Tailscale Exit Node
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+
+        run: |
+          set -euo pipefail
+
+          echo "=================================================="
+          echo "Starting Tailscale"
+          echo "=================================================="
+
+          echo "Hostname:"
+          echo "$TAILSCALE_HOSTNAME"
+
+          echo
+          echo "Configuring Tailscale operator..."
+
+          sudo tailscale set \
+            --operator="$SSH_USERNAME"
+
+          echo "Tailscale operator configured: $SSH_USERNAME"
+
+          echo
+          echo "Connecting Tailscale..."
+
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTHKEY" \
+            --hostname="$TAILSCALE_HOSTNAME" \
+            --advertise-exit-node
+
+          echo
+          echo "Tailscale connection established."
+
+          echo
+          echo "Tailscale status:"
+          sudo tailscale status
+
+          echo
+          echo "Tailscale IP:"
+          sudo tailscale ip
+
+          echo
+          echo "Tailscale hostname:"
+          echo "$TAILSCALE_HOSTNAME"
+
+          ACTUAL_HOSTNAME="$(
+            sudo tailscale status --self --json |
+              jq -r '
+                .Self.HostName
+                // .Self.DNSName
+                // empty
+              ' |
+              sed 's/\..*$//'
+          )"
+
+          echo
+          echo "Requested hostname:"
+          echo "$TAILSCALE_HOSTNAME"
+
+          echo "Actual hostname:"
+          echo "$ACTUAL_HOSTNAME"
+
+          if [[ "$ACTUAL_HOSTNAME" != "$TAILSCALE_HOSTNAME" ]]; then
+
+            echo
+            echo "ERROR: Tailscale did not use the required hostname."
+
+            echo
+            echo "Expected:"
+            echo "  $TAILSCALE_HOSTNAME"
+
+            echo
+            echo "Actual:"
+            echo "  $ACTUAL_HOSTNAME"
+
+            echo
+            echo "The workflow will NOT continue with a suffixed hostname."
+
+            sudo tailscale down || true
+
+            exit 1
+          fi
+
+          echo
+          echo "Exact Tailscale hostname verified successfully."
+
+      # ==========================================================
+      # 10. Verify SSH administrator access
+      # ==========================================================
+
+      - name: 10. Verify SSH User Administrator Access
+        env:
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+
+        run: |
+          set -euo pipefail
+
+          echo "Verifying administrator access for: $SSH_USERNAME"
+
+          sudo -u "$SSH_USERNAME" id
+
+          sudo -u "$SSH_USERNAME" sudo -n true
+
+          sudo -u "$SSH_USERNAME" sudo -n id
+
+          echo
+          echo "Administrator verification passed."
+
+      # ==========================================================
+      # 11. Install 3x-ui (non-interactive, defaults + fixed admin)
+      # ==========================================================
+
+      - name: 11. Install 3x-ui Panel (non-interactive)
+        env:
+          XUI_USERNAME: ${{ env.XUI_USERNAME }}
+          XUI_PASSWORD: ${{ env.XUI_PASSWORD }}
+          XUI_PANEL_PORT: ${{ env.XUI_PANEL_PORT }}
+          XUI_WEB_BASE_PATH: ${{ env.XUI_WEB_BASE_PATH }}
+
+        run: |
+          set -euo pipefail
+
+          echo "=================================================="
+          echo "Installing 3x-ui (non-interactive)"
+          echo "=================================================="
+
+          # Unattended install with fixed credentials, no SSL, fixed port & path
+          export XUI_NONINTERACTIVE=1
+          export XUI_USERNAME
+          export XUI_PASSWORD
+          export XUI_PANEL_PORT
+          export XUI_WEB_BASE_PATH
+          export XUI_SSL_MODE=none
+          export XUI_DB_TYPE=sqlite
+
+          # Install latest stable
+          bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+
+          echo
+          echo "Waiting for x-ui service to become active..."
+          for i in {1..30}; do
+            if systemctl is-active --quiet x-ui; then
+              echo "x-ui is active."
+              break
+            fi
+            sleep 2
+          done
+
+          systemctl status x-ui --no-pager || true
+
+          if [[ -f /etc/x-ui/install-result.env ]]; then
+            echo
+            echo "Install result:"
+            cat /etc/x-ui/install-result.env
+          fi
+
+          echo
+          echo "3x-ui installation completed."
+
+      # ==========================================================
+      # 12. Create unlimited VLESS inbound + 3 clients via API
+      # ==========================================================
+
+      - name: 12. Create Default Inbound and Clients
+        env:
+          XUI_USERNAME: ${{ env.XUI_USERNAME }}
+          XUI_PASSWORD: ${{ env.XUI_PASSWORD }}
+          XUI_PANEL_PORT: ${{ env.XUI_PANEL_PORT }}
+          XUI_WEB_BASE_PATH: ${{ env.XUI_WEB_BASE_PATH }}
+          CLIENT1_EMAIL: ${{ env.CLIENT1_EMAIL }}
+          CLIENT1_PASS: ${{ env.CLIENT1_PASS }}
+          CLIENT2_EMAIL: ${{ env.CLIENT2_EMAIL }}
+          CLIENT2_PASS: ${{ env.CLIENT2_PASS }}
+          CLIENT3_EMAIL: ${{ env.CLIENT3_EMAIL }}
+          CLIENT3_PASS: ${{ env.CLIENT3_PASS }}
+
+        run: |
+          set -euo pipefail
+
+          echo "=================================================="
+          echo "Creating unlimited VLESS inbound + 3 clients"
+          echo "=================================================="
+
+          PANEL_BASE="http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}"
+          COOKIE_JAR="/tmp/xui-cookies.txt"
+          rm -f "$COOKIE_JAR"
+
+          # Login and capture session cookie
+          echo "Logging into panel..."
+          LOGIN_RESP="$(
+            curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+              -X POST "${PANEL_BASE}/login" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "username=${XUI_USERNAME}" \
+              --data-urlencode "password=${XUI_PASSWORD}"
+          )"
+          echo "Login response: $LOGIN_RESP"
+
+          # Check login success
+          if ! echo "$LOGIN_RESP" | grep -q '"success":true'; then
+            echo "ERROR: Panel login failed."
+            exit 1
+          fi
+          echo "Login successful."
+
+          # Generate UUIDs for clients
+          UUID1="$(uuidgen)"
+          UUID2="$(uuidgen)"
+          UUID3="$(uuidgen)"
+          SUB1="$(openssl rand -hex 8)"
+          SUB2="$(openssl rand -hex 8)"
+          SUB3="$(openssl rand -hex 8)"
+
+          # Create a simple unlimited VLESS TCP inbound on port 8443
+          # (no TLS - user said SSL not important)
+          INBOUND_PORT=8443
+          INBOUND_TAG="vless-unlimited"
+
+          # Build clients JSON (unlimited: totalGB=0, expiryTime=0, limitIp=0)
+          CLIENTS_JSON=$(cat <<EOF
+          [
+            {
+              "id": "${UUID1}",
+              "flow": "",
+              "email": "${CLIENT1_EMAIL}",
+              "limitIp": 0,
+              "totalGB": 0,
+              "expiryTime": 0,
+              "enable": true,
+              "tgId": "",
+              "subId": "${SUB1}",
+              "reset": 0,
+              "comment": "client1 fixed"
+            },
+            {
+              "id": "${UUID2}",
+              "flow": "",
+              "email": "${CLIENT2_EMAIL}",
+              "limitIp": 0,
+              "totalGB": 0,
+              "expiryTime": 0,
+              "enable": true,
+              "tgId": "",
+              "subId": "${SUB2}",
+              "reset": 0,
+              "comment": "client2 fixed"
+            },
+            {
+              "id": "${UUID3}",
+              "flow": "",
+              "email": "${CLIENT3_EMAIL}",
+              "limitIp": 0,
+              "totalGB": 0,
+              "expiryTime": 0,
+              "enable": true,
+              "tgId": "",
+              "subId": "${SUB3}",
+              "reset": 0,
+              "comment": "client3 fixed"
+            }
+          ]
+          EOF
+          )
+
+          SETTINGS_JSON=$(jq -n --argjson clients "$CLIENTS_JSON" '{
+            clients: $clients,
+            decryption: "none",
+            fallbacks: []
+          }')
+
+          STREAM_SETTINGS='{"network":"tcp","security":"none","tcpSettings":{"header":{"type":"none"}},"externalProxy":[]}'
+          SNIFFING='{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
+
+          # Add inbound via API
+          echo "Creating VLESS inbound on port ${INBOUND_PORT}..."
+          ADD_RESP="$(
+            curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+              -X POST "${PANEL_BASE}/panel/api/inbounds/add" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"up\": 0,
+                \"down\": 0,
+                \"total\": 0,
+                \"remark\": \"${INBOUND_TAG}\",
+                \"enable\": true,
+                \"expiryTime\": 0,
+                \"listen\": \"\",
+                \"port\": ${INBOUND_PORT},
+                \"protocol\": \"vless\",
+                \"settings\": $(echo "$SETTINGS_JSON" | jq -c . | jq -R .),
+                \"streamSettings\": $(echo "$STREAM_SETTINGS" | jq -R .),
+                \"sniffing\": $(echo "$SNIFFING" | jq -R .),
+                \"allocate\": {\"strategy\": \"always\", \"refresh\": 5, \"concurrency\": 3}
+              }"
+          )"
+          echo "Add inbound response: $ADD_RESP"
+
+          if ! echo "$ADD_RESP" | grep -q '"success":true'; then
+            echo "WARNING: Inbound creation may have failed (or already exists). Continuing..."
+          fi
+
+          # Save client details for Telegram and later use
+          cat > /tmp/xui-clients.env <<EOF
+          UUID1=${UUID1}
+          UUID2=${UUID2}
+          UUID3=${UUID3}
+          SUB1=${SUB1}
+          SUB2=${SUB2}
+          SUB3=${SUB3}
+          INBOUND_PORT=${INBOUND_PORT}
+          EOF
+
+          echo
+          echo "Clients created (or already present):"
+          echo "  ${CLIENT1_EMAIL}  UUID=${UUID1}  subId=${SUB1}"
+          echo "  ${CLIENT2_EMAIL}  UUID=${UUID2}  subId=${SUB2}"
+          echo "  ${CLIENT3_EMAIL}  UUID=${UUID3}  subId=${SUB3}"
+
+          # Restart xray via panel to apply changes
+          curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+            -X POST "${PANEL_BASE}/panel/api/server/restartXrayService" || true
+
+          sleep 3
+          echo "Inbound and clients setup finished."
+
+      # ==========================================================
+      # 13. Telegram online notification (SSH + 3x-ui + clients)
+      # ==========================================================
+
+      - name: 13. Telegram Online Notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SSH_USERNAME: ${{ vars.SSH_USERNAME || secrets.SSH_USERNAME }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+          XUI_USERNAME: ${{ env.XUI_USERNAME }}
+          XUI_PASSWORD: ${{ env.XUI_PASSWORD }}
+          XUI_PANEL_PORT: ${{ env.XUI_PANEL_PORT }}
+          XUI_WEB_BASE_PATH: ${{ env.XUI_WEB_BASE_PATH }}
+          CLIENT1_EMAIL: ${{ env.CLIENT1_EMAIL }}
+          CLIENT1_PASS: ${{ env.CLIENT1_PASS }}
+          CLIENT2_EMAIL: ${{ env.CLIENT2_EMAIL }}
+          CLIENT2_PASS: ${{ env.CLIENT2_PASS }}
+          CLIENT3_EMAIL: ${{ env.CLIENT3_EMAIL }}
+          CLIENT3_PASS: ${{ env.CLIENT3_PASS }}
+
+        run: |
+          set -euo pipefail
+
+          TAILSCALE_IP="$(
+            sudo tailscale ip -4 |
+            head -n 1
+          )"
+
+          test -n "$TAILSCALE_IP"
+
+          ACTUAL_HOSTNAME="$(
+            sudo tailscale status --self --json |
+              jq -r '
+                .Self.DNSName
+                // .Self.HostName
+                // "Not detected"
+              '
+          )"
+
+          # Load client UUIDs / subIds if available
+          if [[ -f /tmp/xui-clients.env ]]; then
+            source /tmp/xui-clients.env
+          else
+            UUID1="(not set)"
+            UUID2="(not set)"
+            UUID3="(not set)"
+            SUB1="(not set)"
+            SUB2="(not set)"
+            SUB3="(not set)"
+            INBOUND_PORT="8443"
+          fi
+
+          PANEL_URL="http://${TAILSCALE_IP}:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}"
+          # Simple VLESS links (no TLS, TCP) - usable on Tailscale network
+          VLESS1="vless://${UUID1}@${TAILSCALE_IP}:${INBOUND_PORT}?type=tcp&security=none#${CLIENT1_EMAIL}"
+          VLESS2="vless://${UUID2}@${TAILSCALE_IP}:${INBOUND_PORT}?type=tcp&security=none#${CLIENT2_EMAIL}"
+          VLESS3="vless://${UUID3}@${TAILSCALE_IP}:${INBOUND_PORT}?type=tcp&security=none#${CLIENT3_EMAIL}"
+
+          MESSAGE="$(cat <<EOF
+          🚀 Linux SSH + 3x-ui Panel is ONLINE
+          ━━━━━━━━━━━━━━━━━━━━
+          Tailscale
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Hostname:
+          $ACTUAL_HOSTNAME
+
+          IP:
+          $TAILSCALE_IP
+
+          ━━━━━━━━━━━━━━━━━━━━
+          SSH
+          ━━━━━━━━━━━━━━━━━━━━
+
+          ssh $SSH_USERNAME@$TAILSCALE_IP
+
+          Port: 22
+
+          ━━━━━━━━━━━━━━━━━━━━
+          3x-ui Panel (Admin)
+          ━━━━━━━━━━━━━━━━━━━━
+
+          URL:
+          $PANEL_URL
+
+          Username: $XUI_USERNAME
+          Password: $XUI_PASSWORD
+
+          Port: $XUI_PANEL_PORT
+          Path: /$XUI_WEB_BASE_PATH
+          SSL: none (HTTP only)
+
+          ━━━━━━━━━━━━━━━━━━━━
+          Clients (unlimited)
+          ━━━━━━━━━━━━━━━━━━━━
+
+          1) $CLIENT1_EMAIL
+             Pass/ID: $CLIENT1_PASS
+             UUID: $UUID1
+             subId: $SUB1
+             Link:
+             $VLESS1
+
+          2) $CLIENT2_EMAIL
+             Pass/ID: $CLIENT2_PASS
+             UUID: $UUID2
+             subId: $SUB2
+             Link:
+             $VLESS2
+
+          3) $CLIENT3_EMAIL
+             Pass/ID: $CLIENT3_PASS
+             UUID: $UUID3
+             subId: $SUB3
+             Link:
+             $VLESS3
+
+          Inbound port: $INBOUND_PORT (VLESS TCP, no TLS)
+          All clients: no traffic limit, no expiry, no IP limit
+
+          ━━━━━━━━━━━━━━━━━━━━
+          Status
+          ━━━━━━━━━━━━━━━━━━━━
+
+          Runtime: approximately 6 hours
+
+          GitHub Actions runner is active.
+          All info is for THIS runner only (not a real VPS).
+          EOF
+          )"
+
+          RESPONSE="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --max-time 20 \
+              --request POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MESSAGE}"
+          )"
+
+          echo "$RESPONSE" |
+            grep -q '"ok":true' || {
+              echo "ERROR: Telegram API did not report success."
+              exit 1
+            }
+
+          echo "Telegram notification sent (SSH + 3x-ui + clients)."
+
+      # ==========================================================
+      # 14. Keep runner alive
+      # ==========================================================
+
+      - name: 14. Keep Runner Alive
+        run: |
+          set -euo pipefail
+
+          END_TIME="$(
+            date \
+              -u \
+              -d "+${RUNNER_RUNTIME_MINUTES} minutes" \
+              +%s
+          )"
+
+          echo
+          echo "Runner will remain alive for approximately ${RUNNER_RUNTIME_MINUTES} minutes."
+
+          while true; do
+
+            NOW="$(date -u +%s)"
+
+            if [[ "$NOW" -ge "$END_TIME" ]]; then
+              echo
+              echo "Runtime window completed."
+              break
+            fi
+
+            echo
+            echo "Heartbeat: $(date -u '+%Y-%m-%dT%H:%M:%SZ') - still running."
+
+            sleep_seconds=$((HEARTBEAT_INTERVAL_MINUTES * 60))
+            remaining=$((END_TIME - NOW))
+
+            if [[ "$sleep_seconds" -gt "$remaining" ]]; then
+              sleep_seconds="$remaining"
+            fi
+
+            if [[ "$sleep_seconds" -gt 0 ]]; then
+              sleep "$sleep_seconds"
+            fi
+
+          done
+
+      # ==========================================================
+      # 15. Disconnect Tailscale
+      #
+      # ALWAYS runs.
+      #
+      # This happens BEFORE starting the next workflow.
+      # ==========================================================
+
+      - name: 15. Disconnect Tailscale
+        if: always()
+
+        run: |
+          set -euo pipefail
+
+          echo "Checking Tailscale state..."
+
+          if command -v tailscale >/dev/null 2>&1; then
+
+            echo
+            echo "Current Tailscale status:"
+            sudo tailscale status || true
+
+            echo
+            echo "Disconnecting Tailscale..."
+
+            sudo tailscale down || true
+
+            echo
+            echo "Tailscale status after disconnect:"
+            sudo tailscale status || true
+
+          else
+
+            echo "Tailscale is not installed."
+            echo "Nothing to disconnect."
+
+          fi
+
+          echo
+          echo "Tailscale cleanup completed."
+
+      # ==========================================================
+      # 16. Start next workflow run
+      #
+      # ALWAYS runs.
+      #
+      # IMPORTANT:
+      #
+      # GitHub's current REST API returns HTTP 200/204 for a successful
+      # workflow_dispatch request.
+      #
+      # This step authenticates with GITHUB_TOKEN. The workflow
+      # permissions block must grant:
+      #
+      #     actions: write
+      # ==========================================================
+
+      - name: 16. Start Next Workflow Run
+        if: always()
+
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+          TAILSCALE_WORKFLOW_ID: ${{ env.TAILSCALE_WORKFLOW_ID }}
+
+        run: |
+          set -euo pipefail
+
+          echo "=================================================="
+          echo "Starting next Tailscale runner"
+          echo "=================================================="
+
+          echo "Repository:"
+          echo "$GH_REPOSITORY"
+
+          echo "Branch:"
+          echo "$GH_REF"
+
+          echo "Workflow ID:"
+          echo "$TAILSCALE_WORKFLOW_ID"
+
+          echo
+          echo "Checking token access to workflow..."
+
+          curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --request GET \
+            --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${TAILSCALE_WORKFLOW_ID}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --output /tmp/workflow-info.json
+
+          echo "Token can access workflow:"
+
+          jq -r \
+            '"  Name: \(.name)\n  Path: \(.path)\n  State: \(.state)"' \
+            /tmp/workflow-info.json
+
+          echo
+          echo "Dispatching next workflow run..."
+
+          HTTP_STATUS="$(
+            curl \
+              --silent \
+              --show-error \
+              --output /tmp/workflow-dispatch-response.txt \
+              --dump-header /tmp/workflow-dispatch-headers.txt \
+              --write-out "%{http_code}" \
+              --request POST \
+              --url "https://api.github.com/repos/${GH_REPOSITORY}/actions/workflows/${TAILSCALE_WORKFLOW_ID}/dispatches" \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --header "Content-Type: application/json" \
+              --data "{\"ref\":\"${GH_REF}\"}"
+          )"
+
+          echo
+          echo "GitHub API HTTP status:"
+          echo "$HTTP_STATUS"
+
+          echo
+          echo "Accepted GitHub permissions:"
+          grep -i \
+            '^x-accepted-github-permissions:' \
+            /tmp/workflow-dispatch-headers.txt \
+            || echo "  Header not returned."
+
+          if [[ -s /tmp/workflow-dispatch-response.txt ]]; then
+            echo
+            echo "GitHub API response:"
+            cat /tmp/workflow-dispatch-response.txt
+          fi
+
+          # ======================================================
+          # GitHub currently returns HTTP 200 or 204 for workflow dispatch.
+          # ======================================================
+
+          if [[ "$HTTP_STATUS" != "200" && "$HTTP_STATUS" != "204" ]]; then
+
+            echo
+            echo "ERROR: GitHub workflow dispatch failed."
+            echo
+            echo "Expected HTTP status:"
+            echo "  200 or 204"
+            echo
+            echo "Actual HTTP status:"
+            echo "  $HTTP_STATUS"
+
+            if [[ "$HTTP_STATUS" == "401" ]]; then
+              echo
+              echo "ERROR TYPE: Unauthorized"
+              echo "GITHUB_TOKEN was rejected."
+            fi
+
+            if [[ "$HTTP_STATUS" == "403" ]]; then
+              echo
+              echo "ERROR TYPE: Forbidden"
+              echo
+              echo "GITHUB_TOKEN can read the workflow but cannot dispatch it."
+              echo
+              echo "The workflow permissions block must grant:"
+              echo "  actions: write"
+            fi
+
+            exit 1
+          fi
+
+          # ======================================================
+          # Extract workflow run information when GitHub returns
+          # the normal JSON response.
+          # ======================================================
+
+          if jq -e '.workflow_run_id' \
+            /tmp/workflow-dispatch-response.txt >/dev/null 2>&1; then
+
+            WORKFLOW_RUN_ID="$(
+              jq -r '.workflow_run_id' \
+                /tmp/workflow-dispatch-response.txt
+            )"
+
+            RUN_URL="$(
+              jq -r '.run_url // empty' \
+                /tmp/workflow-dispatch-response.txt
+            )"
+
+            HTML_URL="$(
+              jq -r '.html_url // empty' \
+                /tmp/workflow-dispatch-response.txt
+            )"
+
+            echo
+            echo "=================================================="
+            echo "Next workflow started successfully."
+            echo "=================================================="
+
+            echo "Workflow run ID:"
+            echo "$WORKFLOW_RUN_ID"
+
+            if [[ -n "$RUN_URL" ]]; then
+              echo
+              echo "API run URL:"
+              echo "$RUN_URL"
+            fi
+
+            if [[ -n "$HTML_URL" ]]; then
+              echo
+              echo "GitHub Actions URL:"
+              echo "$HTML_URL"
+            fi
+
+          else
+
+            echo
+            echo "Workflow dispatch returned HTTP $HTTP_STATUS."
+            echo "The next workflow should now start."
+
+          fi
+
+          echo
+          echo "Next Tailscale runner dispatch completed successfully."
