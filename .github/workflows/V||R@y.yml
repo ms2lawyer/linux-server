@@ -568,12 +568,36 @@ jobs:
             sleep 2
           done
 
+          # Force fixed credentials / port / path (env vars are not always applied by installer)
+          echo
+          echo "Forcing panel username, password, port and webBasePath..."
+          sudo /usr/local/x-ui/x-ui setting \
+            -username "${XUI_USERNAME}" \
+            -password "${XUI_PASSWORD}" \
+            -port "${XUI_PANEL_PORT}" \
+            -webBasePath "${XUI_WEB_BASE_PATH}" || true
+
+          sudo systemctl restart x-ui
+          sleep 3
+
+          for i in {1..20}; do
+            if systemctl is-active --quiet x-ui; then
+              echo "x-ui restarted and active."
+              break
+            fi
+            sleep 2
+          done
+
           systemctl status x-ui --no-pager || true
 
-          if [[ -f /etc/x-ui/install-result.env ]]; then
+          echo
+          echo "Current panel settings (CLI):"
+          sudo /usr/local/x-ui/x-ui setting -show 2>/dev/null || sudo x-ui setting -show 2>/dev/null || true
+
+          if sudo test -f /etc/x-ui/install-result.env; then
             echo
             echo "Install result:"
-            cat /etc/x-ui/install-result.env
+            sudo cat /etc/x-ui/install-result.env || true
           fi
 
           echo
@@ -603,96 +627,131 @@ jobs:
           echo "Creating unlimited VLESS inbound + 3 clients"
           echo "=================================================="
 
-          # Normalize base path (no leading/trailing slash issues)
-          BASE_PATH="${XUI_WEB_BASE_PATH#/}"
-          BASE_PATH="${BASE_PATH%/}"
-          PANEL_BASE="http://127.0.0.1:${XUI_PANEL_PORT}/${BASE_PATH}"
+          # Re-apply fixed credentials (in case previous step was skipped / partial)
+          sudo /usr/local/x-ui/x-ui setting \
+            -username "${XUI_USERNAME}" \
+            -password "${XUI_PASSWORD}" \
+            -port "${XUI_PANEL_PORT}" \
+            -webBasePath "${XUI_WEB_BASE_PATH}" || true
+          sudo systemctl restart x-ui
+          sleep 4
+
+          # Discover actual webBasePath from settings / install-result / CLI
+          REAL_USER="${XUI_USERNAME}"
+          REAL_PASS="${XUI_PASSWORD}"
+          REAL_PORT="${XUI_PANEL_PORT}"
+          REAL_PATH="${XUI_WEB_BASE_PATH}"
+
+          if sudo test -f /etc/x-ui/install-result.env; then
+            echo "Reading /etc/x-ui/install-result.env ..."
+            # shellcheck disable=SC1091
+            source <(sudo cat /etc/x-ui/install-result.env | sed 's/\r$//')
+            REAL_USER="${XUI_USERNAME:-$REAL_USER}"
+            REAL_PASS="${XUI_PASSWORD:-$REAL_PASS}"
+            REAL_PORT="${XUI_PANEL_PORT:-$REAL_PORT}"
+            REAL_PATH="${XUI_WEB_BASE_PATH:-$REAL_PATH}"
+          fi
+
+          # Parse CLI show output if available
+          SHOW_OUT="$(sudo /usr/local/x-ui/x-ui setting -show 2>/dev/null || sudo x-ui setting -show 2>/dev/null || true)"
+          echo "CLI settings:"
+          echo "$SHOW_OUT"
+
+          # Normalize path: strip leading/trailing slashes for URL building
+          REAL_PATH="${REAL_PATH#/}"
+          REAL_PATH="${REAL_PATH%/}"
+
+          # Candidate bases to try (most specific first)
+          CANDIDATES=(
+            "http://127.0.0.1:${REAL_PORT}/${REAL_PATH}"
+            "http://127.0.0.1:${REAL_PORT}/panel"
+            "http://127.0.0.1:${REAL_PORT}"
+            "http://[::1]:${REAL_PORT}/${REAL_PATH}"
+            "http://[::1]:${REAL_PORT}"
+          )
+
           COOKIE_JAR="/tmp/xui-cookies.txt"
           rm -f "$COOKIE_JAR"
+          PANEL_BASE=""
+          LOGIN_OK=0
 
-          echo "Panel base URL: ${PANEL_BASE}"
-          echo "Checking if panel is listening..."
+          echo "Waiting for panel port ${REAL_PORT}..."
           for i in {1..30}; do
-            if curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://127.0.0.1:${XUI_PANEL_PORT}/" | grep -qE '200|301|302|401|403|404'; then
-              echo "Panel port is responding."
+            CODE="$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://127.0.0.1:${REAL_PORT}/" || echo 000)"
+            if [[ "$CODE" != "000" ]]; then
+              echo "Panel port responding (HTTP $CODE)."
               break
             fi
-            echo "Waiting for panel port ${XUI_PANEL_PORT}... ($i/30)"
             sleep 2
           done
 
-          # Login with JSON body (official API format) + retries
-          echo "Logging into panel..."
-          LOGIN_OK=0
-          for attempt in {1..10}; do
-            LOGIN_RESP="$(
-              curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
-                -X POST "${PANEL_BASE}/login" \
-                -H "Content-Type: application/json" \
-                -H "Accept: application/json" \
-                -d "{\"username\":\"${XUI_USERNAME}\",\"password\":\"${XUI_PASSWORD}\"}" \
-                --connect-timeout 5 \
-                --max-time 15 || true
-            )"
-            echo "Login attempt ${attempt}: ${LOGIN_RESP:-(empty)}"
+          echo "Attempting login with user=${REAL_USER} ..."
+          for base in "${CANDIDATES[@]}"; do
+            for attempt in 1 2 3; do
+              rm -f "$COOKIE_JAR"
+              # JSON login
+              HTTP_CODE="$(
+                curl -s -o /tmp/xui-login-body.txt -w "%{http_code}" \
+                  -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+                  -X POST "${base}/login" \
+                  -H "Content-Type: application/json" \
+                  -H "Accept: application/json" \
+                  -d "{\"username\":\"${REAL_USER}\",\"password\":\"${REAL_PASS}\"}" \
+                  --connect-timeout 5 --max-time 15 || echo 000
+              )"
+              BODY="$(cat /tmp/xui-login-body.txt 2>/dev/null || true)"
+              echo "  ${base}/login  attempt=${attempt}  http=${HTTP_CODE}  body=${BODY:-(empty)}"
 
-            if echo "$LOGIN_RESP" | grep -q '"success":\s*true'; then
-              LOGIN_OK=1
-              break
-            fi
+              if echo "$BODY" | grep -qE '"success"[[:space:]]*:[[:space:]]*true'; then
+                PANEL_BASE="$base"
+                LOGIN_OK=1
+                break 2
+              fi
 
-            # Fallback: try form-urlencoded (older panels)
-            LOGIN_RESP="$(
-              curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
-                -X POST "${PANEL_BASE}/login" \
-                -H "Content-Type: application/x-www-form-urlencoded" \
-                --data-urlencode "username=${XUI_USERNAME}" \
-                --data-urlencode "password=${XUI_PASSWORD}" \
-                --connect-timeout 5 \
-                --max-time 15 || true
-            )"
-            echo "Login attempt ${attempt} (form): ${LOGIN_RESP:-(empty)}"
+              # form fallback
+              HTTP_CODE="$(
+                curl -s -o /tmp/xui-login-body.txt -w "%{http_code}" \
+                  -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+                  -X POST "${base}/login" \
+                  -H "Content-Type: application/x-www-form-urlencoded" \
+                  --data-urlencode "username=${REAL_USER}" \
+                  --data-urlencode "password=${REAL_PASS}" \
+                  --connect-timeout 5 --max-time 15 || echo 000
+              )"
+              BODY="$(cat /tmp/xui-login-body.txt 2>/dev/null || true)"
+              echo "  ${base}/login (form) attempt=${attempt} http=${HTTP_CODE} body=${BODY:-(empty)}"
 
-            if echo "$LOGIN_RESP" | grep -q '"success":\s*true'; then
-              LOGIN_OK=1
-              break
-            fi
-
-            # Also try without web base path (some installs put login at root)
-            LOGIN_RESP="$(
-              curl -s -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
-                -X POST "http://127.0.0.1:${XUI_PANEL_PORT}/login" \
-                -H "Content-Type: application/json" \
-                -H "Accept: application/json" \
-                -d "{\"username\":\"${XUI_USERNAME}\",\"password\":\"${XUI_PASSWORD}\"}" \
-                --connect-timeout 5 \
-                --max-time 15 || true
-            )"
-            echo "Login attempt ${attempt} (root /login): ${LOGIN_RESP:-(empty)}"
-
-            if echo "$LOGIN_RESP" | grep -q '"success":\s*true'; then
-              PANEL_BASE="http://127.0.0.1:${XUI_PANEL_PORT}"
-              LOGIN_OK=1
-              break
-            fi
-
-            sleep 3
+              if echo "$BODY" | grep -qE '"success"[[:space:]]*:[[:space:]]*true'; then
+                PANEL_BASE="$base"
+                LOGIN_OK=1
+                break 2
+              fi
+              sleep 1
+            done
           done
 
           if [[ "$LOGIN_OK" != "1" ]]; then
-            echo "ERROR: Panel login failed after retries."
-            echo "Debug info:"
-            echo "  ss -tlnp | grep ${XUI_PANEL_PORT} || true"
-            ss -tlnp | grep "${XUI_PANEL_PORT}" || true
-            echo "  systemctl status x-ui --no-pager || true"
+            echo "ERROR: Panel login failed after all candidates."
+            echo "Debug:"
+            ss -tlnp | grep -E "${REAL_PORT}|x-ui" || true
             systemctl status x-ui --no-pager || true
-            if [[ -f /etc/x-ui/install-result.env ]]; then
-              echo "  install-result.env:"
-              cat /etc/x-ui/install-result.env || true
+            sudo journalctl -u x-ui -n 30 --no-pager || true
+            if sudo test -f /etc/x-ui/install-result.env; then
+              sudo cat /etc/x-ui/install-result.env || true
             fi
+            # Dump a few GET responses for path discovery
+            for p in "/" "/panel/" "/panel/login" "/login"; do
+              echo "GET http://127.0.0.1:${REAL_PORT}${p} -> $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${REAL_PORT}${p}" || echo fail)"
+            done
             exit 1
           fi
           echo "Login successful. Using PANEL_BASE=${PANEL_BASE}"
+          # Persist real values for Telegram step
+          echo "REAL_PANEL_BASE=${PANEL_BASE}" > /tmp/xui-panel.env
+          echo "REAL_USER=${REAL_USER}" >> /tmp/xui-panel.env
+          echo "REAL_PASS=${REAL_PASS}" >> /tmp/xui-panel.env
+          echo "REAL_PORT=${REAL_PORT}" >> /tmp/xui-panel.env
+          echo "REAL_PATH=${REAL_PATH}" >> /tmp/xui-panel.env
 
           # Generate UUIDs for clients
           UUID1="$(uuidgen)"
@@ -856,6 +915,7 @@ jobs:
 
           # Load client UUIDs / subIds if available
           if [[ -f /tmp/xui-clients.env ]]; then
+            # shellcheck disable=SC1091
             source /tmp/xui-clients.env
           else
             UUID1="(not set)"
@@ -867,7 +927,27 @@ jobs:
             INBOUND_PORT="8443"
           fi
 
-          PANEL_URL="http://${TAILSCALE_IP}:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}"
+          # Prefer real panel values discovered at login time
+          PANEL_USER="${XUI_USERNAME}"
+          PANEL_PASS="${XUI_PASSWORD}"
+          PANEL_PORT="${XUI_PANEL_PORT}"
+          PANEL_PATH="${XUI_WEB_BASE_PATH}"
+          if [[ -f /tmp/xui-panel.env ]]; then
+            # shellcheck disable=SC1091
+            source /tmp/xui-panel.env
+            PANEL_USER="${REAL_USER:-$PANEL_USER}"
+            PANEL_PASS="${REAL_PASS:-$PANEL_PASS}"
+            PANEL_PORT="${REAL_PORT:-$PANEL_PORT}"
+            PANEL_PATH="${REAL_PATH:-$PANEL_PATH}"
+          fi
+          PANEL_PATH="${PANEL_PATH#/}"
+          PANEL_PATH="${PANEL_PATH%/}"
+          if [[ -n "$PANEL_PATH" ]]; then
+            PANEL_URL="http://${TAILSCALE_IP}:${PANEL_PORT}/${PANEL_PATH}"
+          else
+            PANEL_URL="http://${TAILSCALE_IP}:${PANEL_PORT}"
+          fi
+
           # Simple VLESS links (no TLS, TCP) - usable on Tailscale network
           VLESS1="vless://${UUID1}@${TAILSCALE_IP}:${INBOUND_PORT}?type=tcp&security=none#${CLIENT1_EMAIL}"
           VLESS2="vless://${UUID2}@${TAILSCALE_IP}:${INBOUND_PORT}?type=tcp&security=none#${CLIENT2_EMAIL}"
@@ -900,11 +980,11 @@ jobs:
           URL:
           $PANEL_URL
 
-          Username: $XUI_USERNAME
-          Password: $XUI_PASSWORD
+          Username: $PANEL_USER
+          Password: $PANEL_PASS
 
-          Port: $XUI_PANEL_PORT
-          Path: /$XUI_WEB_BASE_PATH
+          Port: $PANEL_PORT
+          Path: /$PANEL_PATH
           SSL: none (HTTP only)
 
           ━━━━━━━━━━━━━━━━━━━━
