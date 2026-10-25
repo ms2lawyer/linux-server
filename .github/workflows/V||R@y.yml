@@ -40,7 +40,7 @@ env:
   # ============================================================
 
   # This workflow owns exactly one canonical machine name.
-  TAILSCALE_HOSTNAME: 'exitnode'
+  TAILSCALE_HOSTNAME: 'v2ray'
 
   # ============================================================
   # WORKFLOW TO RESTART
