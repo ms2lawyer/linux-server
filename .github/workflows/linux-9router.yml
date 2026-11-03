@@ -880,6 +880,254 @@ jobs:
           echo "Telegram notification sent."
 
       # ==========================================================
+      # OLLAMA STEPS
+      #
+      # Paste this whole block between step "21A. Telegram Online
+      # Notification" and step "22. Keep Runner Alive And Check Models".
+      #
+      # Required edits elsewhere in the workflow:
+      #   1) job: timeout-minutes: 350  ->  360
+      #   2) job env: add
+      #        OLLAMA_PORT: '11434'
+      #        OLLAMA_MODEL: 'qwen2.5-coder:14b'
+      #        OLLAMA_CONTEXT_LENGTH: '8192'
+      #   3) step 23: add   sudo systemctl stop ollama.service || true
+      #
+      # All Ollama steps use continue-on-error, so a problem here can
+      # never break 9Router, SSH, Tailscale or the self-restart chain.
+      # ==========================================================
+
+      # ==========================================================
+      # 21B. Install Ollama and expose its port
+      #
+      # Ollama installs as a systemd service. A drop-in override makes
+      # it listen on all interfaces (0.0.0.0) instead of 127.0.0.1, so
+      # it is reachable through the Tailscale IP, exactly like 9Router.
+      # ==========================================================
+
+      - name: 21B. Install Ollama And Expose Port
+        id: ollama_install
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          echo "Runner resources:"
+          free -h
+          df -h /
+
+          TOTAL_RAM_MB="$(free -m | awk '/^Mem:/ {print $2}')"
+
+          if [[ "$TOTAL_RAM_MB" -lt 12000 ]]; then
+            echo "::warning::Runner has only ${TOTAL_RAM_MB} MB RAM. $OLLAMA_MODEL needs roughly 10 GB or more."
+          fi
+
+          # Ollama (~4 GB) + model (~9 GB) need free disk space.
+          AVAILABLE_GB="$(df --output=avail -BG / | tail -n 1 | tr -dc '0-9')"
+
+          if [[ "$AVAILABLE_GB" -lt 20 ]]; then
+            echo "Only ${AVAILABLE_GB} GB free. Removing unused preinstalled toolchains..."
+
+            sudo rm -rf \
+              /usr/share/dotnet \
+              /opt/ghc \
+              /usr/local/lib/android \
+              /opt/hostedtoolcache/CodeQL
+
+            df -h /
+          fi
+
+          # The Ollama installer extracts a .tar.zst archive.
+          sudo apt-get install -y zstd
+
+          curl -fsSL \
+            https://ollama.com/install.sh |
+            sh
+
+          # ------------------------------------------------------
+          # Listen on all interfaces and keep the model loaded.
+          # ------------------------------------------------------
+
+          sudo mkdir -p /etc/systemd/system/ollama.service.d
+
+          sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null <<EOF
+          [Service]
+          Environment="OLLAMA_HOST=0.0.0.0:$OLLAMA_PORT"
+          Environment="OLLAMA_KEEP_ALIVE=-1"
+          Environment="OLLAMA_CONTEXT_LENGTH=$OLLAMA_CONTEXT_LENGTH"
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable ollama.service
+          sudo systemctl restart ollama.service
+
+          for i in {1..30}; do
+            if curl -fsS --max-time 5 \
+              "http://127.0.0.1:$OLLAMA_PORT/api/version" >/dev/null 2>&1; then
+
+              echo "Ollama API is up."
+              break
+            fi
+
+            if [[ "$i" -eq 30 ]]; then
+              echo "ERROR: Ollama API did not start."
+
+              sudo journalctl \
+                -u ollama.service \
+                --no-pager \
+                -n 100 || true
+
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          if ! sudo ss -lnt |
+            grep -E "(0\.0\.0\.0|\*|\[::\]):$OLLAMA_PORT" ; then
+
+            echo "ERROR: Ollama is not listening on all interfaces."
+            exit 1
+          fi
+
+          ollama --version
+
+      # ==========================================================
+      # 21C. Pull Qwen2.5-Coder 14B
+      # ==========================================================
+
+      - name: 21C. Pull Qwen2.5-Coder 14B
+        id: ollama_pull
+        if: steps.ollama_install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          export OLLAMA_HOST="127.0.0.1:$OLLAMA_PORT"
+
+          for attempt in 1 2 3; do
+            echo "Pulling $OLLAMA_MODEL (attempt $attempt/3)..."
+
+            if ollama pull "$OLLAMA_MODEL" 2>&1 |
+              tr '\r' '\n' |
+              awk '/success|error|verifying|writing/ || NR % 40 == 1'; then
+
+              break
+            fi
+
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "ERROR: Failed to pull $OLLAMA_MODEL."
+              exit 1
+            fi
+
+            sleep 15
+          done
+
+          echo
+          ollama list
+
+          echo
+          df -h /
+
+      # ==========================================================
+      # 21D. Load the model and verify the API
+      #
+      # Sends one tiny request so the model is already in memory
+      # when your first real request arrives.
+      # ==========================================================
+
+      - name: 21D. Load Model And Verify Ollama API
+        id: ollama_verify
+        if: steps.ollama_pull.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          echo "Loading $OLLAMA_MODEL into memory..."
+
+          RESPONSE="$(
+            curl -fsS \
+              --max-time 600 \
+              "http://127.0.0.1:$OLLAMA_PORT/api/generate" \
+              -d "$(
+                jq -n \
+                  --arg model "$OLLAMA_MODEL" \
+                  '{
+                    model: $model,
+                    prompt: "Reply with the single word: ready",
+                    stream: false,
+                    keep_alive: -1,
+                    options: { num_predict: 8 }
+                  }'
+              )"
+          )"
+
+          echo "$RESPONSE" |
+            jq -r '"Model reply: \(.response)"'
+
+          echo
+          echo "Models loaded in memory:"
+
+          curl -fsS \
+            "http://127.0.0.1:$OLLAMA_PORT/api/ps" |
+            jq -r '.models[].name'
+
+          # Check that the port answers on the Tailscale interface too.
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+
+          if curl -fsS --max-time 10 \
+            "http://$TAILSCALE_IP:$OLLAMA_PORT/api/tags" >/dev/null; then
+
+            echo "Ollama is reachable on http://$TAILSCALE_IP:$OLLAMA_PORT"
+          else
+            echo "::warning::Ollama did not answer on the Tailscale IP $TAILSCALE_IP."
+          fi
+
+      # ==========================================================
+      # 21E. Telegram Ollama notification
+      # ==========================================================
+
+      - name: 21E. Telegram Ollama Notification
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OLLAMA_OUTCOME: ${{ steps.ollama_verify.outcome }}
+        run: |
+          set -euo pipefail
+
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+
+          if [[ "$OLLAMA_OUTCOME" == "success" ]]; then
+            MESSAGE="$(printf '%s\n' \
+              '🦙 Ollama is READY' \
+              '━━━━━━━━━━━━━━━━━━━━' \
+              '' \
+              'Model:' \
+              "$OLLAMA_MODEL" \
+              '' \
+              'API (via Tailscale):' \
+              "http://$TAILSCALE_IP:$OLLAMA_PORT" \
+              '' \
+              'OpenAI-compatible endpoint:' \
+              "http://$TAILSCALE_IP:$OLLAMA_PORT/v1" \
+            )"
+          else
+            MESSAGE="⚠️ Ollama setup did not complete (status: $OLLAMA_OUTCOME). 9Router and SSH are not affected. Check the GitHub Actions log."
+          fi
+
+          curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 20 \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" >/dev/null
+
+          echo "Telegram Ollama notification sent."
+      
+      # ==========================================================
       # 22. Keep runner alive
       # ==========================================================
 
